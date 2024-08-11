@@ -5,21 +5,20 @@ import sys
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from sqlite3 import connect
 from typing import Self, final
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
-    QHBoxLayout,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 from peewee import CharField, FloatField, IntegerField, Model, SqliteDatabase
 from xdg_base_dirs import xdg_config_home
 
-from src.ui.clickable_label import ClickableImageLabel
+from src.ui.clickable_label import ClickableImageLabel, ImagePairLayout
 
 # TODO make configurable
 # temperature for image selection
@@ -31,6 +30,14 @@ RANKS_DB = xdg_config_home() / "image_ranks.db"
 DB = SqliteDatabase(RANKS_DB)
 
 
+class PathField(CharField):
+    def db_value(self, value: Path) -> str:
+        return str(value.absolute())
+
+    def python_value(self, value: str) -> Path:
+        return Path(value).absolute()
+
+
 @final
 class ImgWrapper(Model):
     class Meta:
@@ -38,14 +45,14 @@ class ImgWrapper(Model):
         table_name = "image_scores"
 
     checksum = CharField(primary_key=True)
-    path = CharField()
+    path = PathField()
     score = FloatField(default=0.0)
     rotation = IntegerField(default=0)
 
     @classmethod
     def from_path(cls, path: Path) -> Self:
         checksum = sha256(path.read_bytes()).hexdigest()
-        return cls.get_or_create(checksum=checksum, path=str(path.absolute()))[0]
+        return cls.get_or_create(checksum=checksum, path=path.absolute())[0]
 
     @property
     def sample_weight(self) -> float:
@@ -65,32 +72,71 @@ class ImgWrapper(Model):
 @final
 @dataclass
 class DuelingPair:
-    fst: ImgWrapper
-    snd: ImgWrapper
+    left: ImgWrapper
+    right: ImgWrapper
 
-    def update_ratings_inplace(self, *, fst_won: bool):
+    def update_ratings_inplace(self, *, left_won: bool):
         """
         Updates the ratings of the images in the pair in place.
         """
-        r1 = 10**self.fst.score
-        r2 = 10**self.snd.score
+        r1 = 10**self.left.score
+        r2 = 10**self.right.score
         e1 = r1 / (r1 + r2)
         e2 = r2 / (r1 + r2)
 
-        if fst_won:
-            self.fst.score += ELO_K * (1 - e1)
-            self.snd.score += ELO_K * (0 - e2)
+        if left_won:
+            self.left.score += ELO_K * (1 - e1)
+            self.right.score += ELO_K * (0 - e2)
         else:
-            self.fst.score += ELO_K * (0 - e1)
-            self.snd.score += ELO_K * (1 - e2)
+            self.left.score += ELO_K * (0 - e1)
+            self.right.score += ELO_K * (1 - e2)
+
+        self.left.save()
+        self.right.save()
+
+
+@dataclass
+class ImgWithLabel:
+    label: ClickableImageLabel
+    img: ImgWrapper
 
 
 # noinspection PyPropertyAccess
 class ImageRanker(QWidget):
+    @staticmethod
+    def get_main_stylesheet() -> str:
+        return """
+        QMainWindow {
+            background-color: #111;
+        }
+        ClickableImageLabel {
+            background-color: #111;
+        }
+        """
+
+    @property
+    def left(self) -> ImgWithLabel:
+        return ImgWithLabel(self.pair_layout.im_left, self.cur_pair.left)
+
+    @property
+    def right(self) -> ImgWithLabel:
+        return ImgWithLabel(self.pair_layout.im_right, self.cur_pair.right)
+
+    @property
+    def hovered(self) -> ImgWithLabel | None:
+        if self.left.label.is_hovered:
+            return self.left
+        elif self.right.label.is_hovered:
+            return self.right
+        else:
+            return None
+
     def __init__(self):
         super().__init__()
+        self.setStyleSheet(self.get_main_stylesheet())
         self.init_db()
         self.images: list[ImgWrapper] = []
+        self.pair_layout = ImagePairLayout(self)
         self.init_ui()
         self.load_images()
         self.cur_pair = self.sample_pair(self.images)
@@ -99,40 +145,28 @@ class ImageRanker(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_R:
-            if self.img1_label.is_hovered:
-                self.img1_label.rotate_image()
-                self.cur_pair.fst.rotation = (self.cur_pair.fst.rotation + 90) % 360
-            elif self.img2_label.is_hovered:
-                self.img2_label.rotate_image()
-                self.cur_pair.snd.rotation = (self.cur_pair.snd.rotation + 90) % 360
+            self.hovered.label.rotate_image()
+            self.hovered.img.rotation = self.hovered.label.rotation
+            self.hovered.img.save()
         # ctrl+d deletes hovered image
         elif event.key() == Qt.Key_Delete:
             self.delete_hovered_image()
 
-    @property
-    def hovered_image(self) -> ImgWrapper | None:
-        if self.img1_label.is_hovered:
-            return self.cur_pair.fst
-        elif self.img2_label.is_hovered:
-            return self.cur_pair.snd
-        else:
-            return None
-
     def delete_hovered_image(self):
-        img_to_delete = self.hovered_image
-        if not img_to_delete:
+        hovered = self.hovered
+        if not hovered:
             return
-        logging.info(f"Deleting image {img_to_delete}")
-        with connect(RANKS_DB) as conn:
-            conn.execute(
-                "DELETE FROM image_scores WHERE checksum = ?", (img_to_delete.checksum,)
+        hovered.img.delete_instance()
+        self.images.remove(hovered.img)
+        hovered.img.path.unlink()
+        if self.hovered.img is self.cur_pair.left:
+            self.cur_pair = DuelingPair(
+                self.sample_one(self.images), self.cur_pair.right
             )
-        self.images.remove(img_to_delete)
-        img_to_delete.path.unlink()
-        if self.hovered_image is self.cur_pair.fst:
-            self.cur_pair = DuelingPair(self.sample_one(self.images), self.cur_pair.snd)
-        elif self.hovered_image is self.cur_pair.snd:
-            self.cur_pair = DuelingPair(self.cur_pair.fst, self.sample_one(self.images))
+        elif self.hovered.img is self.cur_pair.right:
+            self.cur_pair = DuelingPair(
+                self.cur_pair.left, self.sample_one(self.images)
+            )
         self.draw_cur_pair()
 
     @staticmethod
@@ -147,17 +181,13 @@ class ImageRanker(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("Image Ranker")
-        self.setGeometry(100, 100, 1920, 1080)
+        w, h = 1920, 1080
+        self.setGeometry(100, 100, w, h)
+        self.setMaximumSize(w, h)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
 
         main_layout = QVBoxLayout()
-        image_layout = QHBoxLayout()
-
-        self.img1_label = ClickableImageLabel(self, align_left=False)
-        self.img2_label = ClickableImageLabel(self, align_left=True)
-        image_layout.addWidget(self.img1_label)
-        image_layout.addWidget(self.img2_label)
-
-        main_layout.addLayout(image_layout)
+        main_layout.addLayout(self.pair_layout)
         self.setLayout(main_layout)
 
         # TODO store paths in config
@@ -192,23 +222,20 @@ class ImageRanker(QWidget):
         return DuelingPair(fst, snd)
 
     def draw_cur_pair(self) -> None:
-        for img, label in zip(
-            [self.cur_pair.fst, self.cur_pair.snd], [self.img1_label, self.img2_label]
-        ):
-            label.change_image_to(img.path)
-            label.rotate_image(img.rotation)
+        self.pair_layout.set_images(
+            self.cur_pair.left.path,
+            self.cur_pair.left.rotation,
+            self.cur_pair.right.path,
+            self.cur_pair.right.rotation,
+        )
 
     def sample_and_draw_pair(self):
         self.cur_pair = self.sample_pair(self.images)
         self.draw_cur_pair()
 
-    def image_clicked(self, label):
-        self.cur_pair.update_ratings_inplace(fst_won=label == self.img1_label)
+    def image_clicked(self, label: ClickableImageLabel):
+        self.cur_pair.update_ratings_inplace(left_won=label == self.left.label)
         self.sample_and_draw_pair()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.draw_cur_pair()
 
 
 if __name__ == "__main__":
