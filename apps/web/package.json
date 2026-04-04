@@ -1,0 +1,14 @@
+{
+  "name": "picmash-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "generate:types": "cargo run -q -p picmash-app --bin export-ts -- src/generated",
+    "build": "npm run generate:types && tsc --noEmit && vite build"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
+  }
+}
