@@ -1,0 +1,65 @@
+[workspace]
+members = ["crates/picmash-app"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -2 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -3 }
+
+expect_used = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+needless_pass_by_value = "allow"
+struct_field_names = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+float_cmp = "allow"
+future_not_send = "allow"
+missing_const_for_fn = "allow"
+must_use_candidate = "allow"
+needless_raw_string_hashes = "allow"
+redundant_closure_for_method_calls = "allow"
+significant_drop_tightening = "allow"
+suboptimal_flops = "allow"
+unnecessary_wraps = "allow"
+unused_async = "allow"
+
+[workspace.metadata.rust-starter]
+format_command = ["cargo", "fmt", "--all", "--check"]
+clippy_command = [
+  "cargo",
+  "clippy",
+  "--workspace",
+  "--all-targets",
+  "--all-features",
+  "--message-format=json",
+]
+test_command = ["cargo", "test", "--workspace", "--all-targets", "--all-features"]
+install_command = [
+  "cargo",
+  "install",
+  "--path",
+  "crates/picmash-app",
+  "--bin",
+  "picmash",
+  "--locked",
+]
+
+[workspace.metadata.rust-starter.source_files]
+max_lines = 2500
