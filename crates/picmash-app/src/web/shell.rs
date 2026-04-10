@@ -431,6 +431,7 @@ pub(super) fn script_block() -> Markup {
                   const currentVetoThreadForms = () =>
                     Array.from(currentLayer?.querySelectorAll(".arena-veto-thread-form") ?? []);
                   const arenaAdvancePolicy = (form) => form.dataset.arenaAdvance || "";
+                  const arenaRootHref = () => "/arena";
                   const currentPairHref = () => currentLayer?.dataset.href || window.location.pathname;
                   const telemetryInteractionId = (prefix) =>
                     telemetry?.nextInteractionId?.(prefix || "arena") || "";
@@ -557,26 +558,33 @@ pub(super) fn script_block() -> Markup {
                     image.style.transform = `translate(-50%, -50%) rotate(${geometry.turns * 90}deg)`;
                   };
 
-                  const revealLayer = (layer) => {
+                  const revealLayer = (layer, options = {}) => {
+                    const progressive = options.progressive === true;
                     const images = layerImages(layer);
-                    if (
-                      !images.length ||
-                      !images.every(
-                        (image) =>
-                          image.dataset.settled === "1" && image.dataset.failed !== "1",
-                      )
-                    ) {
+                    if (!images.length) {
+                      return false;
+                    }
+                    const settledImages = images.filter(
+                      (image) =>
+                        image.dataset.settled === "1" && image.dataset.failed !== "1",
+                    );
+                    if (!settledImages.length) {
+                      return false;
+                    }
+                    const complete = settledImages.length === images.length;
+                    if (!progressive && !complete) {
                       return false;
                     }
                     applyArenaSplit(layer);
-                    for (const image of images) {
+                    for (const image of settledImages) {
                       fitArenaImage(image);
                       image.classList.add("is-ready");
                     }
-                    return true;
+                    return complete || progressive;
                   };
 
-                  const primeLayer = (layer) => {
+                  const primeLayer = (layer, options = {}) => {
+                    const progressive = options.progressive === true;
                     const images = layerImages(layer);
                     if (!layer || !images.length) return Promise.resolve(false);
                     const pending = [];
@@ -596,7 +604,7 @@ pub(super) fn script_block() -> Markup {
                       pending.push(image);
                     }
                     if (!pending.length) {
-                      return Promise.resolve(revealLayer(layer));
+                      return Promise.resolve(revealLayer(layer, { progressive }));
                     }
                     return new Promise((resolve) => {
                       let remaining = pending.length;
@@ -606,14 +614,15 @@ pub(super) fn script_block() -> Markup {
                         image.dataset.failed = "";
                         image.dataset.settled = "1";
                         remaining -= 1;
-                        const revealed = revealLayer(layer);
-                        if (remaining <= 0) resolve(revealed && !failed);
+                        const revealed = revealLayer(layer, { progressive });
+                        if (remaining <= 0) resolve(progressive ? revealed : revealed && !failed);
                       };
                       const onError = (image) => {
                         if (image.dataset.settled === "1") return;
                         image.dataset.failed = "1";
                         image.dataset.settled = "1";
                         image.classList.remove("is-ready");
+                        revealLayer(layer, { progressive });
                         reportArenaAnomaly("arena_image_error", {
                           layer_role: layerRole(layer),
                           image_src: image.currentSrc || image.getAttribute("src") || "",
@@ -687,13 +696,16 @@ pub(super) fn script_block() -> Markup {
                     layer.dataset.localAnchor = payload.localAnchor || "";
                     layer.dataset.localAnchorVisualKey = payload.localAnchorVisualKey || "";
                     layer.dataset.visualKeys = payloadVisualKeys(payload).join(",");
-                    return primeLayer(layer);
+                    return primeLayer(layer, {
+                      progressive: options.progressive === true,
+                    });
                   };
 
                   const refreshCurrentLayer = async (payload) => {
                     if (!currentLayer || !payload?.href || !payload?.html) return false;
                     const refreshed = await seedPreparedLayer(currentLayer, payload, {
                       preserveImagesFromLayer: currentLayer,
+                      progressive: true,
                     });
                     if (!refreshed) {
                       reportArenaAnomaly("arena_refresh_current_failed", {
@@ -1407,12 +1419,12 @@ pub(super) fn script_block() -> Markup {
                     });
                   }
 
-                  primeLayer(currentLayer).then((primed) => {
+                  primeLayer(currentLayer, { progressive: true }).then((primed) => {
                     if (!primed) {
                       reportArenaAnomaly("arena_current_layer_empty", {
                         layer_role: "current",
                       });
-                      window.location.assign(currentLayer?.dataset.href || window.location.pathname);
+                      window.location.assign(arenaRootHref());
                       return;
                     }
                     void bootLookahead();
