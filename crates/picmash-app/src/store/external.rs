@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ExternalItemWarmState {
@@ -26,6 +26,13 @@ pub enum ExternalIdentityDisposition {
     Active,
     Tombstoned,
     Resolved(AssetId),
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertedExternalStreamBatchEntry {
+    pub stream_id: i64,
+    pub blocked: bool,
+    pub item_ids: HashMap<i64, RemoteItemId>,
 }
 
 impl Store {
@@ -541,6 +548,164 @@ impl Store {
         drop(upsert);
         tx.commit()?;
         Ok(item_ids)
+    }
+
+    pub fn upsert_external_streams_batch(
+        &mut self,
+        source_key: &str,
+        streams: &[RemoteStreamSnapshot],
+    ) -> anyhow::Result<Vec<UpsertedExternalStreamBatchEntry>> {
+        let tx = self.conn.transaction()?;
+        let mut upsert_stream = tx.prepare(
+            r"
+            INSERT INTO external_streams (
+                source_key,
+                thread_no,
+                title,
+                semantic_slug,
+                last_modified,
+                reply_count,
+                image_count,
+                active,
+                blocked,
+                last_seen_at,
+                last_scanned_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, ?8, ?8, ?8)
+            ON CONFLICT(source_key, thread_no) DO UPDATE SET
+                title = excluded.title,
+                semantic_slug = excluded.semantic_slug,
+                last_modified = excluded.last_modified,
+                reply_count = excluded.reply_count,
+                image_count = excluded.image_count,
+                active = 1,
+                last_seen_at = excluded.last_seen_at,
+                last_scanned_at = excluded.last_scanned_at,
+                updated_at = excluded.updated_at
+            ",
+        )?;
+        let mut fetch_stream = tx.prepare(
+            r"
+            SELECT id, blocked
+            FROM external_streams
+            WHERE source_key = ?1 AND thread_no = ?2
+            ",
+        )?;
+        let mut upsert_item = tx.prepare(
+            r"
+            INSERT INTO external_items (
+                source_key,
+                stream_id,
+                thread_no,
+                post_no,
+                stream_title,
+                title,
+                image_url,
+                thumb_url,
+                ext,
+                md5,
+                width,
+                height,
+                cached_path,
+                rotation_quarters,
+                hidden,
+                imported_asset_id,
+                last_seen_at,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, 0, NULL, ?14, ?14, ?14)
+            ON CONFLICT(source_key, post_no) DO UPDATE SET
+                stream_id = excluded.stream_id,
+                thread_no = excluded.thread_no,
+                stream_title = excluded.stream_title,
+                title = excluded.title,
+                image_url = excluded.image_url,
+                thumb_url = excluded.thumb_url,
+                ext = excluded.ext,
+                md5 = excluded.md5,
+                width = excluded.width,
+                height = excluded.height,
+                cached_path = COALESCE(excluded.cached_path, external_items.cached_path),
+                last_seen_at = excluded.last_seen_at,
+                updated_at = excluded.updated_at
+            ",
+        )?;
+        let mut fetch_stream_items = tx.prepare(
+            r"
+            SELECT id, post_no
+            FROM external_items
+            WHERE source_key = ?1 AND stream_id = ?2
+            ",
+        )?;
+        let now = now_ts();
+        let mut outcomes = Vec::with_capacity(streams.len());
+        for stream in streams {
+            upsert_stream.execute(params![
+                source_key,
+                stream.thread_no,
+                stream.title,
+                stream.semantic_slug,
+                stream.last_modified,
+                i64::from(stream.reply_count),
+                i64::from(stream.image_count),
+                now,
+            ])?;
+            let (stream_id, blocked) = fetch_stream
+                .query_row(params![source_key, stream.thread_no], |row| {
+                    Ok((row.get(0)?, row.get::<_, i64>(1)? != 0))
+                })?;
+            if blocked {
+                outcomes.push(UpsertedExternalStreamBatchEntry {
+                    stream_id,
+                    blocked: true,
+                    item_ids: HashMap::new(),
+                });
+                continue;
+            }
+            for item in &stream.items {
+                upsert_item.execute(params![
+                    source_key,
+                    stream_id,
+                    item.thread_no,
+                    item.post_no,
+                    stream.title,
+                    item.title,
+                    item.image_url,
+                    item.thumb_url,
+                    item.ext,
+                    item.md5,
+                    i64::from(item.width),
+                    i64::from(item.height),
+                    item.materialized_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    now,
+                ])?;
+            }
+            let live_post_nos = stream
+                .items
+                .iter()
+                .map(|item| item.post_no)
+                .collect::<HashSet<_>>();
+            let item_ids = fetch_stream_items
+                .query_map(params![source_key, stream_id], |row| {
+                    Ok((row.get::<_, i64>(1)?, RemoteItemId(row.get::<_, i64>(0)?)))
+                })?
+                .filter_map(Result::ok)
+                .filter(|(post_no, _)| live_post_nos.contains(post_no))
+                .collect::<HashMap<_, _>>();
+            outcomes.push(UpsertedExternalStreamBatchEntry {
+                stream_id,
+                blocked: false,
+                item_ids,
+            });
+        }
+        drop(fetch_stream_items);
+        drop(upsert_item);
+        drop(fetch_stream);
+        drop(upsert_stream);
+        tx.commit()?;
+        Ok(outcomes)
     }
 
     pub fn external_item_embedding(

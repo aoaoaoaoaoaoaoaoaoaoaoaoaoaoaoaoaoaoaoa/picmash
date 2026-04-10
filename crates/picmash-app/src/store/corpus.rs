@@ -64,7 +64,7 @@ impl Store {
         let mut ingested = 0usize;
         let mut unchanged = 0usize;
         let mut embed_count = 0usize;
-        let log_interval = (total / 20).max(50);
+        let log_interval = (total / 4).max(500);
 
         for path in image_paths {
             let bytes = fs::read(&path)

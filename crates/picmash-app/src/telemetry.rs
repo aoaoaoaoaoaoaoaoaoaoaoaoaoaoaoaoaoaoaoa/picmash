@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower_http::classify::ServerErrorsFailureClass;
-use tracing::{Span, field, info_span, warn};
+use tracing::{Span, debug_span, field, info_span, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
     EnvFilter,
@@ -165,19 +165,35 @@ pub fn http_request_span<B>(request: &Request<B>) -> Span {
         .get::<MatchedPath>()
         .map(MatchedPath::as_str)
         .unwrap_or_else(|| request.uri().path());
-    info_span!(
-        "http.request",
-        boot_id = %boot_id(),
-        request_id = %request_id(headers).unwrap_or(""),
-        method = %request.method(),
-        matched_route = %matched_route,
-        uri_path = %request.uri().path(),
-        page_id = %header_text(headers, PAGE_ID_HEADER).unwrap_or(""),
-        interaction_id = %header_text(headers, INTERACTION_ID_HEADER).unwrap_or(""),
-        arena_epoch = %header_text(headers, ARENA_EPOCH_HEADER).unwrap_or(""),
-        status = field::Empty,
-        latency_ms = field::Empty,
-    )
+    if matches!(matched_route, "/__status" | "/api/client-event") {
+        debug_span!(
+            "http.request",
+            boot_id = %boot_id(),
+            request_id = %request_id(headers).unwrap_or(""),
+            method = %request.method(),
+            matched_route = %matched_route,
+            uri_path = %request.uri().path(),
+            page_id = %header_text(headers, PAGE_ID_HEADER).unwrap_or(""),
+            interaction_id = %header_text(headers, INTERACTION_ID_HEADER).unwrap_or(""),
+            arena_epoch = %header_text(headers, ARENA_EPOCH_HEADER).unwrap_or(""),
+            status = field::Empty,
+            latency_ms = field::Empty,
+        )
+    } else {
+        info_span!(
+            "http.request",
+            boot_id = %boot_id(),
+            request_id = %request_id(headers).unwrap_or(""),
+            method = %request.method(),
+            matched_route = %matched_route,
+            uri_path = %request.uri().path(),
+            page_id = %header_text(headers, PAGE_ID_HEADER).unwrap_or(""),
+            interaction_id = %header_text(headers, INTERACTION_ID_HEADER).unwrap_or(""),
+            arena_epoch = %header_text(headers, ARENA_EPOCH_HEADER).unwrap_or(""),
+            status = field::Empty,
+            latency_ms = field::Empty,
+        )
+    }
 }
 
 pub fn record_http_response<B>(response: &Response<B>, latency: Duration, span: &Span) {

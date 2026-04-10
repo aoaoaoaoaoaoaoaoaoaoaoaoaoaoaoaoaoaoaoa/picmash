@@ -11,7 +11,7 @@ use picmash_app::{
     telemetry, web,
 };
 use tokio::net::TcpListener;
-use tracing::{Instrument, error, info, info_span};
+use tracing::{Instrument, debug_span, error, info, info_span};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -127,7 +127,7 @@ fn spawn_background_maintenance_loop(state: Arc<AppState>) {
         loop {
             let worker = state.clone();
             match tokio::task::spawn_blocking(move || worker.devour_one_maintenance_job())
-                .instrument(info_span!("maintenance.loop.tick"))
+                .instrument(debug_span!("maintenance.loop.tick"))
                 .await
             {
                 Ok(Ok(true)) => continue,
@@ -151,7 +151,7 @@ fn spawn_external_source_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
         let initial = state.clone();
         match tokio::task::spawn_blocking(move || initial.refresh_external_sources_if_due(false))
-            .instrument(info_span!("external.refresh.loop.initial"))
+            .instrument(debug_span!("external.refresh.loop.initial"))
             .await
         {
             Ok(Ok(())) => {}
@@ -167,7 +167,7 @@ fn spawn_external_source_loop(state: Arc<AppState>) {
             tokio::time::sleep(StdDuration::from_secs(pulse)).await;
             let state = state.clone();
             match tokio::task::spawn_blocking(move || state.refresh_external_sources_if_due(false))
-                .instrument(info_span!("external.refresh.loop.tick"))
+                .instrument(debug_span!("external.refresh.loop.tick"))
                 .await
             {
                 Ok(Ok(())) => {}
@@ -189,7 +189,7 @@ fn spawn_config_reload_loop(state: Arc<AppState>) {
             tokio::time::sleep(StdDuration::from_secs(pulse)).await;
             let state = state.clone();
             match tokio::task::spawn_blocking(move || state.reload_config_if_changed())
-                .instrument(info_span!("config.reload.tick"))
+                .instrument(debug_span!("config.reload.tick"))
                 .await
             {
                 Ok(Ok(())) => {}

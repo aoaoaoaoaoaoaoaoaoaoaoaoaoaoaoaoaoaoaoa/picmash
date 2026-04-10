@@ -5,13 +5,23 @@ use std::{
     sync::mpsc::{self, Receiver, SyncSender},
     time::Instant,
 };
-use tracing::{Span, field, info_span, warn};
+use tracing::{Span, debug_span, field, warn};
 
-const SLOW_WRITER_COMMAND_MS: u128 = 25;
+const DEFAULT_SLOW_WRITER_COMMAND_MS: u128 = 50;
+const BULK_SLOW_WRITER_COMMAND_MS: u128 = 100;
 
 trait ErasedWriterCommand: Send {
     fn label(&self) -> &'static str;
     fn apply_box(self: Box<Self>, store: &mut Store) -> anyhow::Result<Box<dyn Any + Send>>;
+}
+
+fn slow_writer_threshold_ms(label: &str) -> u128 {
+    match label {
+        "upsert_external_stream_batch" | "bootstrap_maintenance_batch" => {
+            BULK_SLOW_WRITER_COMMAND_MS
+        }
+        _ => DEFAULT_SLOW_WRITER_COMMAND_MS,
+    }
 }
 
 struct ClosureCommand<T, F> {
@@ -155,7 +165,7 @@ fn drain_writer_loop(store: &mut Store, rx: Receiver<WriterMessage>) {
                 } = request;
                 let label = command.label();
                 let started = Instant::now();
-                let span = info_span!(
+                let span = debug_span!(
                     parent: &parent_span,
                     "writer.commit",
                     writer_cmd_id = %command_id,
@@ -170,13 +180,19 @@ fn drain_writer_loop(store: &mut Store, rx: Receiver<WriterMessage>) {
                 };
                 let elapsed_ms = started.elapsed().as_millis();
                 span.record("elapsed_ms", field::display(elapsed_ms));
-                if elapsed_ms > SLOW_WRITER_COMMAND_MS {
+                if elapsed_ms > slow_writer_threshold_ms(label) {
                     let _entered = span.enter();
-                    warn!(elapsed_ms, "slow writer command");
+                    warn!(writer_cmd_id = %command_id, label, elapsed_ms, "slow writer command");
                 }
                 if let Err(error) = &result {
                     let _entered = span.enter();
-                    warn!(elapsed_ms, error = %format!("{error:#}"), "writer command failed");
+                    warn!(
+                        writer_cmd_id = %command_id,
+                        label,
+                        elapsed_ms,
+                        error = %format!("{error:#}"),
+                        "writer command failed"
+                    );
                 }
                 let _ = reply.send(result);
             }
