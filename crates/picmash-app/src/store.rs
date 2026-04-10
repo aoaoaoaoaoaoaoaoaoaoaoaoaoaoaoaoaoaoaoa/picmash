@@ -45,7 +45,11 @@ mod session;
 mod tests;
 mod vectors;
 
+pub use external::ExternalIdentityDisposition;
 pub use faces::{FaceIdentityRecord, FaceRecord, FacemashIdentityCandidate};
+pub use schema::{
+    BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS, BOOTSTRAP_PHASE_INITIAL, BootstrapMaintenanceProgress,
+};
 
 pub struct Store {
     conn: Connection,
@@ -113,6 +117,14 @@ impl Store {
     pub fn devour_bootstrap_maintenance(&self) -> anyhow::Result<()> {
         self.run_bootstrap_maintenance()
     }
+
+    pub fn devour_bootstrap_maintenance_batch(
+        &self,
+        phase: &str,
+        limit: usize,
+    ) -> anyhow::Result<BootstrapMaintenanceProgress> {
+        self.run_bootstrap_maintenance_batch(phase, limit)
+    }
 }
 
 fn resolve_asset_id_for_identity(
@@ -129,6 +141,23 @@ fn resolve_asset_id_for_identity(
             LIMIT 1
             ",
             params![identity.blob_id.0],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(AssetId(asset_id)));
+    }
+
+    if let Some(asset_id) = tx
+        .query_row(
+            r"
+            SELECT id
+            FROM assets
+            WHERE render_hash = ?1
+            ORDER BY pixel_width * pixel_height DESC, created_at ASC, id ASC
+            LIMIT 1
+            ",
+            params![identity.render_hash.0],
             |row| row.get::<_, String>(0),
         )
         .optional()?
@@ -202,6 +231,7 @@ fn upsert_asset_identity_tx(
             id,
             created_at,
             preferred_blob_id,
+            render_hash,
             visual_key,
             pixel_width,
             pixel_height,
@@ -214,8 +244,9 @@ fn upsert_asset_identity_tx(
             hearted,
             compare_count,
             win_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0)
         ON CONFLICT(id) DO UPDATE SET
+            render_hash = COALESCE(NULLIF(assets.render_hash, ''), excluded.render_hash),
             visual_key = COALESCE(NULLIF(assets.visual_key, ''), excluded.visual_key),
             preferred_blob_id = CASE
                 WHEN excluded.pixel_width * excluded.pixel_height
@@ -240,6 +271,7 @@ fn upsert_asset_identity_tx(
             asset_id.0,
             now_ts(),
             identity.blob_id.0,
+            identity.render_hash.0,
             identity.visual_key.0,
             i64::from(identity.width),
             i64::from(identity.height),
@@ -247,6 +279,34 @@ fn upsert_asset_identity_tx(
         ],
     )?;
     Ok(())
+}
+
+fn resolve_external_aliases_for_asset_identity_tx(
+    tx: &Transaction<'_>,
+    asset_id: &AssetId,
+    identity: &ImageIdentity,
+) -> anyhow::Result<usize> {
+    tx.execute(
+        r"
+        UPDATE external_items
+        SET resolved_asset_id = ?1,
+            updated_at = ?5
+        WHERE imported_asset_id IS NULL
+          AND (
+            blob_id = ?2
+            OR render_hash = ?3
+            OR visual_key = ?4
+          )
+        ",
+        params![
+            asset_id.0,
+            identity.blob_id.0,
+            identity.render_hash.0,
+            identity.visual_key.0,
+            now_ts(),
+        ],
+    )
+    .map_err(Into::into)
 }
 
 fn upsert_corpus_variant_tx(

@@ -2,7 +2,7 @@ use super::*;
 
 impl AppState {
     pub fn explore_empty(&self, map_mode: ExploreMapMode) -> anyhow::Result<ExploreView> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         Ok(match self.similarity_field(&store, Some(map_mode))? {
             Some(field) => ExploreView {
                 map_mode,
@@ -24,7 +24,7 @@ impl AppState {
         focus_id: Option<&AssetId>,
         map_mode: ExploreMapMode,
     ) -> anyhow::Result<RedirectTarget> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let Some(vectors) = self.explore_vector_cache(&store)? else {
             return Ok(RedirectTarget::ExploreRoot { map_mode });
         };
@@ -50,7 +50,7 @@ impl AppState {
         focus_id: Option<&AssetId>,
         map_mode: ExploreMapMode,
     ) -> anyhow::Result<Option<ExploreView>> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let Some(field) = self.similarity_field(&store, Some(map_mode))? else {
             return Ok(None);
         };
@@ -74,7 +74,7 @@ impl AppState {
         focus_id: Option<&AssetId>,
         map_mode: ExploreMapMode,
     ) -> anyhow::Result<Option<ExplorePanels>> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let Some(field) = self.similarity_field(&store, None)? else {
             return Ok(None);
         };
@@ -92,65 +92,71 @@ impl AppState {
         focus_id: Option<&AssetId>,
         map_mode: ExploreMapMode,
     ) -> anyhow::Result<RedirectTarget> {
-        self.with_locked_store_write(|store| {
-            let Some(mut vectors) = self.explore_vector_cache(store)? else {
-                return Ok(RedirectTarget::ExploreRoot { map_mode });
-            };
-            let [Some(_embedding_a), Some(_embedding_b), Some(_embedding_c)] = [
-                vectors.embedding(asset_a),
-                vectors.embedding(asset_b),
-                vectors.embedding(asset_c),
-            ] else {
-                return Ok(RedirectTarget::ExploreRoot { map_mode });
-            };
-            let history = store.similarity_history(self.active.corpus_id)?;
-            if history.len() + 1 >= crate::model::ORDINAL_BOOTSTRAP_TRIADS
-                && !matches!(vectors.model, SimilarityModel::Ordinal(_))
-                && let Some(bootstrapped) = vectors.model.bootstrap_ordinal(
-                    &vectors.embeddings,
-                    &history,
-                    LR_SIMILARITY,
-                    SIMILARITY_BETA,
-                    SIMILARITY_WEIGHT_DECAY,
-                )
-            {
-                vectors.model = bootstrapped;
-            }
-            vectors.model.triad_step(
+        let store = self.read_store()?;
+        let Some(mut vectors) = self.explore_vector_cache(&store)? else {
+            return Ok(RedirectTarget::ExploreRoot { map_mode });
+        };
+        let [Some(_embedding_a), Some(_embedding_b), Some(_embedding_c)] = [
+            vectors.embedding(asset_a),
+            vectors.embedding(asset_b),
+            vectors.embedding(asset_c),
+        ] else {
+            return Ok(RedirectTarget::ExploreRoot { map_mode });
+        };
+        let history = store.similarity_history(self.active.corpus_id)?;
+        if history.len() + 1 >= crate::model::ORDINAL_BOOTSTRAP_TRIADS
+            && !matches!(vectors.model, SimilarityModel::Ordinal(_))
+            && let Some(bootstrapped) = vectors.model.bootstrap_ordinal(
                 &vectors.embeddings,
-                asset_a,
-                asset_b,
-                asset_c,
-                choice,
+                &history,
                 LR_SIMILARITY,
                 SIMILARITY_BETA,
                 SIMILARITY_WEIGHT_DECAY,
-            );
-            vectors.refresh_learned_geometry();
+            )
+        {
+            vectors.model = bootstrapped;
+        }
+        vectors.model.triad_step(
+            &vectors.embeddings,
+            asset_a,
+            asset_b,
+            asset_c,
+            choice,
+            LR_SIMILARITY,
+            SIMILARITY_BETA,
+            SIMILARITY_WEIGHT_DECAY,
+        );
+        vectors.refresh_learned_geometry();
+        let corpus_id = self.active.corpus_id;
+        let session_id = self.active.session_id;
+        let asset_a = asset_a.clone();
+        let asset_b = asset_b.clone();
+        let asset_c = asset_c.clone();
+        let persisted_model = vectors.model.clone();
+        let next = choose_similarity_triad(&vectors, &store, corpus_id);
+        self.with_write_store("persist_similarity_step", move |store| {
             store.persist_similarity_step(
-                self.active.corpus_id,
-                &vectors.model,
-                asset_a,
-                asset_b,
-                asset_c,
+                corpus_id,
+                &persisted_model,
+                &asset_a,
+                &asset_b,
+                &asset_c,
                 choice,
             )?;
-            self.purge_explore_vectors();
-            self.purge_explore_layout(ExploreMapMode::Learned);
-            store.touch_session(self.active.session_id)?;
+            store.touch_session(session_id)
+        })?;
+        self.purge_explore_vectors();
+        self.purge_explore_layout(ExploreMapMode::Learned);
 
-            Ok(
-                match choose_similarity_triad(&vectors, store, self.active.corpus_id) {
-                    Some([next_a, next_b, next_c]) => RedirectTarget::ExploreTriad {
-                        asset_a: next_a,
-                        asset_b: next_b,
-                        asset_c: next_c,
-                        focus_id: focus_id.cloned(),
-                        map_mode,
-                    },
-                    None => RedirectTarget::ExploreRoot { map_mode },
-                },
-            )
+        Ok(match next {
+            Some([next_a, next_b, next_c]) => RedirectTarget::ExploreTriad {
+                asset_a: next_a,
+                asset_b: next_b,
+                asset_c: next_c,
+                focus_id: focus_id.cloned(),
+                map_mode,
+            },
+            None => RedirectTarget::ExploreRoot { map_mode },
         })
     }
 

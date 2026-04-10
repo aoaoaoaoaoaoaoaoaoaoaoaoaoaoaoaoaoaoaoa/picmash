@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ExternalItemWarmState {
+    pub(crate) needs_materialization: bool,
     pub(crate) needs_identity: bool,
     pub(crate) needs_quality_features: bool,
     pub(crate) needs_embedding: bool,
@@ -12,11 +13,19 @@ pub(crate) struct ExternalItemWarmState {
 
 impl ExternalItemWarmState {
     pub(crate) fn needs_inline_work(self) -> bool {
-        self.needs_identity
+        self.needs_materialization
+            || self.needs_identity
             || self.needs_quality_features
             || self.needs_embedding
             || self.needs_clip_embedding
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalIdentityDisposition {
+    Active,
+    Tombstoned,
+    Resolved(AssetId),
 }
 
 impl Store {
@@ -122,30 +131,32 @@ impl Store {
             )
             .optional()?
             .unwrap_or(0);
-        let cached_items = self
-            .conn
-            .query_row(
-                r"
-                SELECT COUNT(*)
-                FROM external_items i
-                JOIN external_streams s ON s.id = i.stream_id
-                WHERE i.source_key = ?1
-                  AND s.active = 1
-                  AND s.blocked = 0
-                  AND i.hidden = 0
-                  AND i.imported_asset_id IS NULL
-                  AND i.cached_path IS NOT NULL
-                  AND i.embedding IS NOT NULL
-                ",
-                params![source_key],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(0);
+        let mut cached_stmt = self.conn.prepare(
+            r"
+            SELECT i.cached_path
+            FROM external_items i
+            JOIN external_streams s ON s.id = i.stream_id
+            WHERE i.source_key = ?1
+              AND s.active = 1
+              AND s.blocked = 0
+              AND i.hidden = 0
+              AND i.import_pending = 0
+              AND i.resolved_asset_id IS NULL
+              AND i.imported_asset_id IS NULL
+              AND i.cached_path IS NOT NULL
+              AND i.embedding IS NOT NULL
+            ",
+        )?;
+        let cached_items = cached_stmt
+            .query_map(params![source_key], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+            .count();
         Ok((
             usize::try_from(active_streams).unwrap_or_default(),
             usize::try_from(blocked_streams).unwrap_or_default(),
-            usize::try_from(cached_items).unwrap_or_default(),
+            cached_items,
         ))
     }
 
@@ -156,30 +167,33 @@ impl Store {
     ) -> anyhow::Result<(usize, HashMap<i64, usize>)> {
         let mut stmt = self.conn.prepare(
             r"
-            SELECT i.stream_id, COUNT(*)
+            SELECT i.stream_id, i.cached_path
             FROM external_items i
             JOIN external_streams s ON s.id = i.stream_id
             WHERE i.source_key = ?1
               AND s.active = 1
               AND s.blocked = 0
               AND i.hidden = 0
+              AND i.import_pending = 0
+              AND i.resolved_asset_id IS NULL
               AND i.imported_asset_id IS NULL
               AND i.cached_path IS NOT NULL
               AND i.embedding IS NOT NULL
               AND i.embedding_model = ?2
-            GROUP BY i.stream_id
             ",
         )?;
         let mut by_stream = HashMap::new();
         let mut total = 0usize;
         let rows = stmt.query_map(params![source_key, model_name], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
-            let (stream_id, count) = row?;
-            let count = usize::try_from(count).unwrap_or_default();
-            total += count;
-            by_stream.insert(stream_id, count);
+            let (stream_id, cached_path) = row?;
+            if !PathBuf::from(cached_path).exists() {
+                continue;
+            }
+            total += 1;
+            *by_stream.entry(stream_id).or_default() += 1;
         }
         Ok((total, by_stream))
     }
@@ -241,6 +255,8 @@ impl Store {
                     UPDATE external_items
                     SET cached_path = NULL, updated_at = ?2
                     WHERE source_key = ?1
+                      AND import_pending = 0
+                      AND resolved_asset_id IS NULL
                       AND imported_asset_id IS NULL
                       AND cached_path IS NOT NULL
                     ",
@@ -259,6 +275,8 @@ impl Store {
             UPDATE external_items
             SET cached_path = NULL, updated_at = ?2
             WHERE source_key = ?1
+              AND import_pending = 0
+              AND resolved_asset_id IS NULL
               AND imported_asset_id IS NULL
               AND cached_path IS NOT NULL
               AND post_no NOT IN ({placeholders})
@@ -291,6 +309,8 @@ impl Store {
             UPDATE external_items
             SET cached_path = NULL, updated_at = ?1
             WHERE cached_path IS NOT NULL
+              AND import_pending = 0
+              AND resolved_asset_id IS NULL
               AND imported_asset_id IS NULL
               AND id IN ({placeholders})
             "
@@ -555,7 +575,12 @@ impl Store {
                 r"
                 SELECT
                     CASE
+                        WHEN i.cached_path IS NULL OR i.cached_path = ''
+                        THEN 1 ELSE 0
+                    END,
+                    CASE
                         WHEN i.blob_id IS NULL OR i.blob_id = ''
+                          OR i.render_hash IS NULL OR i.render_hash = ''
                           OR i.visual_key IS NULL OR i.visual_key = ''
                         THEN 1 ELSE 0
                     END,
@@ -588,11 +613,12 @@ impl Store {
                 ],
                 |row| {
                     Ok(ExternalItemWarmState {
-                        needs_identity: row.get::<_, i64>(0)? != 0,
-                        needs_quality_features: row.get::<_, i64>(1)? != 0,
-                        needs_embedding: row.get::<_, i64>(2)? != 0,
-                        needs_clip_embedding: row.get::<_, i64>(3)? != 0,
-                        needs_face_embedding: row.get::<_, i64>(4)? != 0,
+                        needs_materialization: row.get::<_, i64>(0)? != 0,
+                        needs_identity: row.get::<_, i64>(1)? != 0,
+                        needs_quality_features: row.get::<_, i64>(2)? != 0,
+                        needs_embedding: row.get::<_, i64>(3)? != 0,
+                        needs_clip_embedding: row.get::<_, i64>(4)? != 0,
+                        needs_face_embedding: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
@@ -666,6 +692,8 @@ impl Store {
               AND s.active = 1
               AND s.blocked = 0
               AND i.hidden = 0
+              AND i.import_pending = 0
+              AND i.resolved_asset_id IS NULL
               AND i.imported_asset_id IS NULL
               AND i.cached_path IS NOT NULL
               AND i.embedding IS NOT NULL
@@ -790,6 +818,8 @@ impl Store {
                 FROM external_items
                 WHERE id = ?1
                   AND hidden = 0
+                  AND import_pending = 0
+                  AND resolved_asset_id IS NULL
                   AND imported_asset_id IS NULL
                   AND cached_path IS NOT NULL
                   AND embedding IS NOT NULL
@@ -813,6 +843,7 @@ impl Store {
                 WHERE id = ?1
                   AND (
                     blob_id IS NULL OR blob_id = ''
+                    OR render_hash IS NULL OR render_hash = ''
                     OR visual_key IS NULL OR visual_key = ''
                   )
                 LIMIT 1
@@ -837,6 +868,140 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn external_item_import_pending(&self, item_id: RemoteItemId) -> anyhow::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT import_pending FROM external_items WHERE id = ?1",
+                params![item_id.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|pending| pending.unwrap_or_default() != 0)
+            .map_err(Into::into)
+    }
+
+    pub fn external_item_resolved_asset_id(
+        &self,
+        item_id: RemoteItemId,
+    ) -> anyhow::Result<Option<AssetId>> {
+        self.conn
+            .query_row(
+                "SELECT resolved_asset_id FROM external_items WHERE id = ?1",
+                params![item_id.0],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|asset_id| asset_id.flatten().map(AssetId))
+            .map_err(Into::into)
+    }
+
+    pub fn pending_external_import_outcome(
+        &self,
+        item_id: RemoteItemId,
+    ) -> anyhow::Result<Option<crate::model::PendingExternalImportOutcome>> {
+        self.conn
+            .query_row(
+                r"
+                SELECT session_id, corpus_id, outcome_kind
+                FROM pending_external_import_outcomes
+                WHERE item_id = ?1
+                ",
+                params![item_id.0],
+                |row| {
+                    Ok(crate::model::PendingExternalImportOutcome {
+                        item_id,
+                        session_id: SessionId(row.get(0)?),
+                        corpus_id: CorpusId(row.get(1)?),
+                        outcome_kind: row
+                            .get::<_, String>(2)?
+                            .parse()
+                            .map_err(quality_payload_into_rusqlite)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn queue_external_import_outcome(
+        &mut self,
+        session_id: SessionId,
+        corpus_id: CorpusId,
+        item_id: RemoteItemId,
+        outcome_kind: ExternalEventKind,
+    ) -> anyhow::Result<bool> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("opening pending external import transaction")?;
+        let queued = tx.execute(
+            r"
+            UPDATE external_items
+            SET import_pending = 1,
+                updated_at = ?2
+            WHERE id = ?1
+              AND hidden = 0
+              AND import_pending = 0
+              AND resolved_asset_id IS NULL
+              AND imported_asset_id IS NULL
+            ",
+            params![item_id.0, now_ts()],
+        )?;
+        if queued > 0 {
+            tx.execute(
+                r"
+                INSERT OR IGNORE INTO pending_external_import_outcomes (
+                    item_id,
+                    session_id,
+                    corpus_id,
+                    outcome_kind,
+                    queued_at,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                ",
+                params![
+                    item_id.0,
+                    session_id.0,
+                    corpus_id.0,
+                    outcome_kind.as_str(),
+                    now_ts(),
+                ],
+            )?;
+            tx.execute(
+                r"
+                INSERT INTO maintenance_jobs (
+                    kind,
+                    job_key,
+                    priority,
+                    next_run_at,
+                    generation,
+                    running_generation,
+                    attempts,
+                    last_error,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, 1, NULL, 0, NULL, ?5)
+                ON CONFLICT(kind, job_key) DO UPDATE SET
+                    priority = MIN(maintenance_jobs.priority, excluded.priority),
+                    next_run_at = MIN(maintenance_jobs.next_run_at, excluded.next_run_at),
+                    generation = maintenance_jobs.generation + 1,
+                    last_error = NULL,
+                    updated_at = excluded.updated_at
+                ",
+                params![
+                    crate::maintenance::MaintenanceJobKind::ExternalOutcomeSeal.as_str(),
+                    item_id.0.to_string(),
+                    crate::maintenance::MaintenancePriority::Hot.as_i64(),
+                    now_ts(),
+                    now_ts(),
+                ],
+            )?;
+            touch_session_tx(&tx, session_id)?;
+        }
+        tx.commit()
+            .context("committing pending external import transaction")?;
+        Ok(queued > 0)
+    }
+
     pub fn external_item_cached_path(
         &self,
         item_id: RemoteItemId,
@@ -857,9 +1022,12 @@ impl Store {
         item_id: RemoteItemId,
         identity: &ImageIdentity,
         cached_path: &Path,
-    ) -> anyhow::Result<bool> {
-        let tombstoned = self
+    ) -> anyhow::Result<ExternalIdentityDisposition> {
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .context("opening external identity transaction")?;
+        let tombstoned = tx
             .query_row(
                 r"
                 SELECT 1
@@ -872,26 +1040,41 @@ impl Store {
             )
             .optional()?
             .is_some();
-        self.conn.execute(
+        let resolved_asset_id = resolve_asset_id_for_identity(&tx, identity)?;
+        tx.execute(
             r"
             UPDATE external_items
             SET blob_id = ?2,
-                visual_key = ?3,
-                cached_path = ?4,
-                hidden = CASE WHEN hidden = 1 OR ?5 = 1 THEN 1 ELSE 0 END,
-                updated_at = ?6
+                render_hash = ?3,
+                visual_key = ?4,
+                cached_path = ?5,
+                resolved_asset_id = COALESCE(?6, resolved_asset_id),
+                hidden = CASE WHEN hidden = 1 OR ?7 = 1 THEN 1 ELSE 0 END,
+                updated_at = ?8
             WHERE id = ?1
             ",
             params![
                 item_id.0,
                 identity.blob_id.0.as_str(),
+                identity.render_hash.0.as_str(),
                 identity.visual_key.0.as_str(),
                 cached_path.to_string_lossy().into_owned(),
+                resolved_asset_id
+                    .as_ref()
+                    .map(|asset_id| asset_id.0.as_str()),
                 if tombstoned { 1_i64 } else { 0_i64 },
                 now_ts(),
             ],
         )?;
-        Ok(tombstoned)
+        tx.commit()
+            .context("committing external identity transaction")?;
+        if tombstoned {
+            return Ok(ExternalIdentityDisposition::Tombstoned);
+        }
+        Ok(match resolved_asset_id {
+            Some(asset_id) => ExternalIdentityDisposition::Resolved(asset_id),
+            None => ExternalIdentityDisposition::Active,
+        })
     }
 
     pub fn save_external_embedding(
@@ -1008,6 +1191,7 @@ impl Store {
                     cached_path,
                     image_url,
                     thumb_url,
+                    visual_key,
                     rotation_quarters
                 FROM external_items
                 WHERE id = ?1
@@ -1028,7 +1212,106 @@ impl Store {
                         path: PathBuf::from(path),
                         image_url: row.get(8)?,
                         thumb_url: row.get(9)?,
-                        rotation_quarters: row.get(10)?,
+                        visual_key: row
+                            .get::<_, Option<String>>(10)?
+                            .map(crate::identity::VisualKey),
+                        rotation_quarters: row.get(11)?,
+                    }))
+                },
+            )
+            .optional()
+            .map(|item| item.flatten())
+            .map_err(Into::into)
+    }
+
+    pub fn remote_item_snapshot(
+        &self,
+        item_id: RemoteItemId,
+    ) -> anyhow::Result<Option<crate::sources::RemoteItemSnapshot>> {
+        self.conn
+            .query_row(
+                r"
+                SELECT
+                    thread_no,
+                    post_no,
+                    title,
+                    image_url,
+                    thumb_url,
+                    ext,
+                    md5,
+                    width,
+                    height
+                FROM external_items
+                WHERE id = ?1
+                ",
+                params![item_id.0],
+                |row| {
+                    Ok(crate::sources::RemoteItemSnapshot {
+                        thread_no: row.get(0)?,
+                        post_no: row.get(1)?,
+                        title: row.get(2)?,
+                        image_url: row.get(3)?,
+                        thumb_url: row.get(4)?,
+                        ext: row.get(5)?,
+                        md5: row.get(6)?,
+                        width: u32::try_from(row.get::<_, i64>(7)?).unwrap_or_default(),
+                        height: u32::try_from(row.get::<_, i64>(8)?).unwrap_or_default(),
+                        file_size: 0,
+                        materialized_path: None,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn arena_remote_item(
+        &self,
+        item_id: RemoteItemId,
+    ) -> anyhow::Result<Option<RemoteItemRecord>> {
+        self.conn
+            .query_row(
+                r"
+                SELECT
+                    id,
+                    source_key,
+                    stream_id,
+                    stream_title,
+                    thread_no,
+                    post_no,
+                    title,
+                    cached_path,
+                    image_url,
+                    thumb_url,
+                    visual_key,
+                    rotation_quarters
+                FROM external_items
+                WHERE id = ?1
+                  AND hidden = 0
+                  AND import_pending = 0
+                  AND resolved_asset_id IS NULL
+                  AND imported_asset_id IS NULL
+                ",
+                params![item_id.0],
+                |row| {
+                    let Some(path) = row.get::<_, Option<String>>(7)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some(RemoteItemRecord {
+                        id: RemoteItemId(row.get(0)?),
+                        source_key: row.get(1)?,
+                        stream_id: row.get(2)?,
+                        stream_title: row.get(3)?,
+                        thread_no: row.get(4)?,
+                        post_no: row.get(5)?,
+                        title: row.get(6)?,
+                        path: PathBuf::from(path),
+                        image_url: row.get(8)?,
+                        thumb_url: row.get(9)?,
+                        visual_key: row
+                            .get::<_, Option<String>>(10)?
+                            .map(crate::identity::VisualKey),
+                        rotation_quarters: row.get(11)?,
                     }))
                 },
             )
@@ -1057,6 +1340,7 @@ impl Store {
                 i.cached_path,
                 i.image_url,
                 i.thumb_url,
+                i.visual_key,
                 i.rotation_quarters,
                 i.embedding,
                 i.face_embedding_model,
@@ -1090,10 +1374,17 @@ impl Store {
               AND s.active = 1
               AND s.blocked = 0
               AND i.hidden = 0
+              AND i.import_pending = 0
+              AND i.resolved_asset_id IS NULL
               AND i.imported_asset_id IS NULL
               AND i.cached_path IS NOT NULL
               AND i.embedding IS NOT NULL
               AND i.embedding_model = ?2
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM external_item_tombstones tombstone
+                  WHERE tombstone.visual_key = i.visual_key
+              )
             ORDER BY s.last_modified DESC, i.post_no DESC
             ",
         )?;
@@ -1117,12 +1408,15 @@ impl Store {
                         path: PathBuf::from(row.get::<_, String>(7)?),
                         image_url: row.get(8)?,
                         thumb_url: row.get(9)?,
-                        rotation_quarters: row.get(10)?,
+                        visual_key: row
+                            .get::<_, Option<String>>(10)?
+                            .map(crate::identity::VisualKey),
+                        rotation_quarters: row.get(11)?,
                     },
-                    embedding: decode_vec_f32(&row.get::<_, Vec<u8>>(11)?),
+                    embedding: decode_vec_f32(&row.get::<_, Vec<u8>>(12)?),
                     face_embedding: match (
-                        row.get::<_, Option<String>>(12)?,
-                        row.get::<_, Option<Vec<u8>>>(13)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<Vec<u8>>>(14)?,
                     ) {
                         (Some(face_model), Some(blob))
                             if face_model == face_model_name && blob.len() % 4 == 0 =>
@@ -1132,8 +1426,8 @@ impl Store {
                         _ => None,
                     },
                     quality_features: match (
-                        row.get::<_, Option<String>>(14)?,
                         row.get::<_, Option<String>>(15)?,
+                        row.get::<_, Option<String>>(16)?,
                     ) {
                         (Some(technical), Some(vibe)) => {
                             Some(crate::quality_features::AssetQualityFeatures {
@@ -1146,24 +1440,24 @@ impl Store {
                         _ => None,
                     },
                     quality_cache: row
-                        .get::<_, Option<String>>(16)?
+                        .get::<_, Option<String>>(17)?
                         .map(|payload| crate::quality::decode_quality_payload(&payload))
                         .transpose()
                         .map_err(quality_payload_into_rusqlite)?,
-                    selected_count: row.get(17)?,
-                    reject_count: row.get(18)?,
-                    survive_count: row.get(19)?,
-                    import_count: row.get(20)?,
-                    win_count: row.get(21)?,
-                    loss_count: row.get(22)?,
-                    stream_selected_count: row.get(23)?,
-                    stream_reject_count: row.get(24)?,
-                    stream_survive_count: row.get(25)?,
-                    stream_import_count: row.get(26)?,
-                    stream_win_count: row.get(27)?,
-                    stream_loss_count: row.get(28)?,
-                    stream_image_count: row.get(29)?,
-                    stream_last_modified: row.get(30)?,
+                    selected_count: row.get(18)?,
+                    reject_count: row.get(19)?,
+                    survive_count: row.get(20)?,
+                    import_count: row.get(21)?,
+                    win_count: row.get(22)?,
+                    loss_count: row.get(23)?,
+                    stream_selected_count: row.get(24)?,
+                    stream_reject_count: row.get(25)?,
+                    stream_survive_count: row.get(26)?,
+                    stream_import_count: row.get(27)?,
+                    stream_win_count: row.get(28)?,
+                    stream_loss_count: row.get(29)?,
+                    stream_image_count: row.get(30)?,
+                    stream_last_modified: row.get(31)?,
                 })
             },
         )?;
@@ -1183,6 +1477,8 @@ impl Store {
             WHERE s.active = 1
               AND s.blocked = 0
               AND i.hidden = 0
+              AND i.import_pending = 0
+              AND i.resolved_asset_id IS NULL
               AND i.imported_asset_id IS NULL
               AND i.cached_path IS NOT NULL
               AND i.embedding IS NOT NULL
@@ -1219,7 +1515,7 @@ impl Store {
             SELECT item_id
             FROM external_events
             WHERE session_id = ?1
-              AND event_kind = ?2
+              AND event_kind <> ?2
             ORDER BY id DESC
             LIMIT ?3
             ",
@@ -1227,7 +1523,7 @@ impl Store {
         let rows = stmt.query_map(
             params![
                 session_id.0,
-                ExternalEventKind::Selected.as_str(),
+                ExternalEventKind::Imported.as_str(),
                 i64::try_from(limit)?,
             ],
             |row| Ok(RemoteItemId(row.get(0)?)),
@@ -1245,7 +1541,7 @@ impl Store {
             SELECT stream_id
             FROM external_events
             WHERE session_id = ?1
-              AND event_kind = ?2
+              AND event_kind <> ?2
             ORDER BY id DESC
             LIMIT ?3
             ",
@@ -1253,7 +1549,7 @@ impl Store {
         let rows = stmt.query_map(
             params![
                 session_id.0,
-                ExternalEventKind::Selected.as_str(),
+                ExternalEventKind::Imported.as_str(),
                 i64::try_from(limit)?,
             ],
             |row| row.get(0),
@@ -1271,7 +1567,7 @@ impl Store {
             SELECT source_key
             FROM external_events
             WHERE session_id = ?1
-              AND event_kind = ?2
+              AND event_kind <> ?2
             ORDER BY id DESC
             LIMIT ?3
             ",
@@ -1279,7 +1575,7 @@ impl Store {
         let rows = stmt.query_map(
             params![
                 session_id.0,
-                ExternalEventKind::Selected.as_str(),
+                ExternalEventKind::Imported.as_str(),
                 i64::try_from(limit)?,
             ],
             |row| row.get(0),
@@ -1300,14 +1596,14 @@ impl Store {
                 FROM external_events
                 WHERE session_id = ?1
                   AND source_key = ?2
-                  AND event_kind = ?3
+                  AND event_kind <> ?3
                   AND created_at >= ?4
             )
             ",
             params![
                 session_id.0,
                 source_key,
-                ExternalEventKind::Selected.as_str(),
+                ExternalEventKind::Imported.as_str(),
                 since_ts
             ],
             |row| row.get::<_, i64>(0),
@@ -1414,6 +1710,8 @@ impl Store {
                     reject_count = reject_count + 1,
                     updated_at = ?4
                 WHERE hidden = 0
+                  AND import_pending = 0
+                  AND resolved_asset_id IS NULL
                   AND imported_asset_id IS NULL
                   AND id != ?1
                   AND (
@@ -1438,6 +1736,8 @@ impl Store {
                     reject_count = reject_count + 1,
                     updated_at = ?3
                 WHERE hidden = 0
+                  AND import_pending = 0
+                  AND resolved_asset_id IS NULL
                   AND imported_asset_id IS NULL
                   AND md5 = ?2
                   AND id != ?1
@@ -1613,11 +1913,16 @@ impl Store {
         let asset_id = resolve_asset_id_for_identity(&tx, identity)?.unwrap_or_else(mint_asset_id);
         let hidden = preserved_hidden_state_tx(&tx, corpus_id, &path_string, &asset_id)?;
         upsert_asset_identity_tx(&tx, &asset_id, identity, rotation_quarters.rem_euclid(4))?;
+        resolve_external_aliases_for_asset_identity_tx(&tx, &asset_id, identity)?;
         upsert_corpus_variant_tx(&tx, corpus_id, &path_string, &asset_id, identity, hidden)?;
         if let Some(embedding) = embedding {
             upsert_embedding_tx(&tx, &asset_id, embedding)?;
         }
         link_external_import_tx(&tx, session_id, corpus_id, item_id, &asset_id)?;
+        tx.execute(
+            "DELETE FROM pending_external_import_outcomes WHERE item_id = ?1",
+            params![item_id.0],
+        )?;
         record_external_result_tx(&tx, session_id, corpus_id, item_id, &asset_id, outcome_kind)?;
         touch_session_tx(&tx, session_id)?;
         tx.commit()
@@ -1768,6 +2073,8 @@ fn link_external_import_tx(
         r"
         UPDATE external_items
         SET imported_asset_id = ?2,
+            resolved_asset_id = ?2,
+            import_pending = 0,
             import_count = import_count + 1,
             updated_at = ?3
         WHERE id = ?1

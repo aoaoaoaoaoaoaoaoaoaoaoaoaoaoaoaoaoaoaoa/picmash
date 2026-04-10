@@ -366,6 +366,7 @@ impl Store {
                     asset: AssetRecord {
                         id: id.clone(),
                         path: PathBuf::new(),
+                        visual_key: None,
                         width: 0,
                         height: 0,
                         alpha: 0.0,

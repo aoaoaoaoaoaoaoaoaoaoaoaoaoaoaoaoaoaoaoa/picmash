@@ -106,7 +106,7 @@ impl AppState {
             });
         }
 
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let detector_model = self.embedder.face_detection_model_name();
         let recognition_model = self.embedder.recognition_model_name();
         let faces = store.identity_review_faces(
@@ -400,11 +400,12 @@ impl AppState {
         let Some(identity_id) = self.resolve_identity_anchor_handle(anchor_handle) else {
             return Ok(false);
         };
-        self.with_db_write_gate(|| {
-            let mut store = self.store.lock();
-            let changed = store.rename_face_identity_by_id(identity_id, name)?;
+        let session_id = self.active.session_id;
+        let name = name.to_owned();
+        self.with_write_store("rename_face_identity", move |store| {
+            let changed = store.rename_face_identity_by_id(identity_id, &name)?;
             if changed {
-                store.touch_session(self.active.session_id)?;
+                store.touch_session(session_id)?;
             }
             Ok(changed)
         })
@@ -416,8 +417,8 @@ impl AppState {
         else {
             return Ok(false);
         };
-        self.with_db_write_gate(|| {
-            let mut store = self.store.lock();
+        let session_id = self.active.session_id;
+        self.with_write_store("merge_face_identities", move |store| {
             let Some(_anchor) = store.face_identity_by_id(anchor_identity)? else {
                 return Ok(false);
             };
@@ -429,7 +430,7 @@ impl AppState {
             }
             let changed = store.merge_face_identities_by_id(anchor_identity, candidate_identity)?;
             if changed {
-                store.touch_session(self.active.session_id)?;
+                store.touch_session(session_id)?;
             }
             Ok(changed)
         })
@@ -441,15 +442,16 @@ impl AppState {
         else {
             return Ok(false);
         };
-        self.with_db_write_gate(|| {
-            let mut store = self.store.lock();
+        let session_id = self.active.session_id;
+        let recognition_model = self.embedder.recognition_model_name().to_owned();
+        self.with_write_store("veto_face_identity_pair", move |store| {
             let changed = store.veto_face_identity_pair_by_id(
                 anchor_identity,
                 candidate_identity,
-                self.embedder.recognition_model_name(),
+                &recognition_model,
             )?;
             if changed {
-                store.touch_session(self.active.session_id)?;
+                store.touch_session(session_id)?;
             }
             Ok(changed)
         })
@@ -458,7 +460,9 @@ impl AppState {
     pub fn devour_identity_review_refresh(&self) -> anyhow::Result<()> {
         let store = Store::open_hot(&self.db_path)?;
         let beauty = store.compute_identity_beauty_snapshot()?;
-        self.with_fresh_store_write(|store| store.save_identity_beauty_snapshot(&beauty))?;
+        self.with_write_store("save_identity_beauty_snapshot", move |store| {
+            store.save_identity_beauty_snapshot(&beauty)
+        })?;
         let store = Store::open_hot(&self.db_path)?;
         self.retrain_face_oracle(&store)?;
         Ok(())

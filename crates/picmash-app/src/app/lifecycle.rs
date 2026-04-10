@@ -153,8 +153,7 @@ impl AppState {
         let session = store.resume_or_create_session(corpus_id, SESSION_SNAP_WINDOW)?;
 
         Ok(Self {
-            store: Mutex::new(store),
-            db_write_gate: gate::DbWriteGate::new(),
+            writer: writer::DbWriter::spawn(&paths.db_path)?,
             db_path: paths.db_path,
             config: RwLock::new(config),
             config_path,
@@ -167,6 +166,7 @@ impl AppState {
             },
             root_path,
             cache_root: paths.cache_root,
+            session_field_cache: RwLock::new(None),
             explore_layouts: RwLock::new(HashMap::new()),
             explore_vectors: RwLock::new(None),
             asset_domain_oracle: RwLock::new(None),
@@ -191,6 +191,7 @@ impl AppState {
         info!(root = %self.root_path.display(), "ingesting corpus");
         let mut store = Store::open_hot(&self.db_path)?;
         store.ingest_corpus(&self.root_path, self.active.corpus_id, &self.embedder)?;
+        self.invalidate_session_field_cache();
         self.purge_explore_vectors();
         self.purge_all_explore_layouts();
         self.schedule_corpus_face_scan_backfill();
@@ -200,13 +201,31 @@ impl AppState {
         Ok(())
     }
 
-    pub fn devour_bootstrap_maintenance(&self) -> anyhow::Result<()> {
-        info!("running deferred bootstrap maintenance");
-        let store = Store::open_hot(&self.db_path)?;
-        self.with_db_write_gate(|| store.devour_bootstrap_maintenance())?;
-        self.retrain_face_oracle(&store)?;
-        info!("deferred bootstrap maintenance complete");
-        Ok(())
+    pub fn devour_bootstrap_maintenance_batch(
+        &self,
+        phase: &str,
+        limit: usize,
+    ) -> anyhow::Result<crate::store::BootstrapMaintenanceProgress> {
+        let progress = self.with_write_store("bootstrap_maintenance_batch", {
+            let phase = phase.to_owned();
+            move |store| store.devour_bootstrap_maintenance_batch(&phase, limit)
+        })?;
+        if progress.processed > 0 {
+            self.invalidate_session_field_cache();
+            if phase == crate::store::BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS
+                && progress.requeue_phase.as_deref() != Some(phase)
+            {
+                let store = self.read_store()?;
+                self.retrain_face_oracle(&store)?;
+            }
+            info!(
+                phase,
+                processed = progress.processed,
+                next_phase = progress.requeue_phase,
+                "deferred bootstrap maintenance batch complete"
+            );
+        }
+        Ok(progress)
     }
 
     pub(super) fn devour_corpus_face_scan_batch(&self, limit: usize) -> anyhow::Result<usize> {
@@ -290,7 +309,7 @@ impl AppState {
         &self,
         prepared: PreparedCorpusFacePass,
     ) -> anyhow::Result<PersistedCorpusFacePass> {
-        self.with_fresh_store_write(move |store| {
+        self.with_write_store("persist_corpus_face_pass", move |store| {
             if store.face_scan_exists_for_asset(&prepared.asset_id, &prepared.detector_model)? {
                 return Ok(PersistedCorpusFacePass {
                     detected_count: 0,
@@ -365,7 +384,9 @@ impl AppState {
         if persisted_paths.is_empty() {
             return Ok(());
         }
-        self.with_fresh_store_write(|store| store.set_face_aligned_paths(&persisted_paths))
+        self.with_write_store("set_face_aligned_paths", move |store| {
+            store.set_face_aligned_paths(&persisted_paths)
+        })
     }
 
     pub(super) fn devour_corpus_face_recognition_backfill_batch(
@@ -378,7 +399,7 @@ impl AppState {
 
         let detector_model = self.embedder.face_detection_model_name().to_owned();
         let recognition_model = self.embedder.recognition_model_name().to_owned();
-        let missing = self.store.lock().faces_missing_recognition(
+        let missing = self.read_store()?.faces_missing_recognition(
             self.active.corpus_id,
             &detector_model,
             &recognition_model,
@@ -414,7 +435,7 @@ impl AppState {
             let Some(recognition) = self.embedder.recognize_face_image(&aligned.crop)? else {
                 continue;
             };
-            if self.with_locked_store_write(|store| {
+            if self.with_write_store("save_face_recognition", move |store| {
                 store.save_face_recognition(face.id, &recognition.model_name, &recognition.vector)
             })? {
                 backfilled += 1;
@@ -453,19 +474,23 @@ impl AppState {
             });
         }
         if !warmed.is_empty() {
-            self.with_fresh_store_write(|store| store.save_asset_quality_features_batch(&warmed))?;
+            let warmed_count = warmed.len();
+            self.with_write_store("save_asset_quality_features_batch", move |store| {
+                store.save_asset_quality_features_batch(&warmed)
+            })?;
             info!(
-                assets = warmed.len(),
+                assets = warmed_count,
                 "asset quality feature batch complete"
             );
+            return Ok(warmed_count);
         }
-        Ok(warmed.len())
+        Ok(0)
     }
 
     pub fn devour_quality_model_refresh(&self) -> anyhow::Result<()> {
         let model_name = self.embedder.model_name().to_owned();
         let active_model = {
-            let store = self.store.lock();
+            let store = self.read_store()?;
             store.active_quality_model()?
         };
         let log_stats = |stats: &crate::quality::QualityReplayStats| {
@@ -484,12 +509,15 @@ impl AppState {
         if active_model.formal_version
             != crate::quality::QualityFormalVersion::HierarchicalPerturbativeV3
         {
-            return self.with_db_write_gate(|| {
-                let mut store = Store::open_hot(&self.db_path)?;
+            let result = self.with_write_store("quality_refresh_rebuild", move |store| {
                 let stats = store.rebuild_active_quality_state(&model_name)?;
                 log_stats(&stats);
                 Ok(())
             });
+            if result.is_ok() {
+                self.invalidate_session_field_cache();
+            }
+            return result;
         }
 
         for attempt in 1..=4 {
@@ -497,12 +525,12 @@ impl AppState {
                 let store = Store::open_hot(&self.db_path)?;
                 store.prepare_perturbative_replay_v3(&model_name)?
             };
-            let maybe_stats = self.with_db_write_gate(|| {
-                let mut store = Store::open_hot(&self.db_path)?;
+            let maybe_stats = self.with_write_store("quality_refresh_commit", move |store| {
                 store.commit_prepared_perturbative_replay(prepared)
             })?;
             if let Some(stats) = maybe_stats {
                 log_stats(&stats);
+                self.invalidate_session_field_cache();
                 return Ok(());
             }
             warn!(
@@ -579,7 +607,9 @@ mod tests {
     }
 
     fn source_remote_items(state: &AppState, source_key: &str) -> Vec<RemoteItemId> {
-        let store = state.store.lock();
+        let store = state
+            .read_store()
+            .expect("open read store for lifecycle test");
         (1..=64)
             .map(RemoteItemId)
             .filter(|item_id| {
@@ -623,19 +653,23 @@ mod tests {
         state.schedule_corpus_ingest();
         drain_maintenance(&state);
 
-        let read_guard = state.store.lock();
+        let read_store = state
+            .read_store()
+            .expect("open read store for write-path lifecycle test");
         let worker = std::sync::Arc::clone(&state);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let result = worker
-                .with_locked_store_write(|store| store.touch_session(worker.active.session_id));
+            let session_id = worker.active.session_id;
+            let result = worker.with_write_store("touch_session", move |store| {
+                store.touch_session(session_id)
+            });
             tx.send(result.map(|_| ())).expect("send write result");
         });
 
         let result = rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("fresh write should not wait on shared store read lock");
-        drop(read_guard);
+        drop(read_store);
         result.expect("touch session through fresh write store");
     }
 
@@ -695,8 +729,8 @@ mod tests {
 
         assert_eq!(
             state
-                .store
-                .lock()
+                .read_store()
+                .expect("open read store for seed corpus count")
                 .corpus_assets(state.active.corpus_id)
                 .expect("seed corpus assets")
                 .len(),
@@ -719,8 +753,8 @@ mod tests {
         drain_maintenance(&state);
         assert_eq!(
             state
-                .store
-                .lock()
+                .read_store()
+                .expect("open read store after first accept")
                 .corpus_assets(state.active.corpus_id)
                 .expect("assets after first accept")
                 .len(),
@@ -747,8 +781,8 @@ mod tests {
         drain_maintenance(&state);
         assert_eq!(
             state
-                .store
-                .lock()
+                .read_store()
+                .expect("open read store after second accept")
                 .corpus_assets(state.active.corpus_id)
                 .expect("assets after second accept")
                 .len(),
@@ -812,8 +846,8 @@ mod tests {
 
         assert!(
             state
-                .store
-                .lock()
+                .read_store()
+                .expect("open read store for local refresh job check")
                 .has_pending_maintenance_job(
                     crate::maintenance::MaintenanceJobKind::LocalDirectoryRefresh,
                     &source_key,
@@ -832,6 +866,233 @@ mod tests {
             source_remote_items(&state, &source_key).len(),
             1,
             "queued maintenance should eventually harvest the local-directory item"
+        );
+    }
+
+    #[test]
+    fn imported_remote_handles_are_not_live_in_arena() {
+        let _guard = test_guard();
+        let root = test_root("imported-remote-stale-handle");
+        let corpus_root = root.join("corpus");
+        let source_root = root.join("source");
+        let config_root = root.join("config");
+        let app_data_root = root.join("xdg-data");
+        let app_cache_root = root.join("xdg-cache");
+        std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+        std::fs::create_dir_all(&source_root).expect("create source root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&app_data_root).expect("create data root");
+        std::fs::create_dir_all(&app_cache_root).expect("create cache root");
+
+        solid_png(&corpus_root.join("seed.png"), [32, 48, 64]);
+        solid_png(&source_root.join("remote-a.png"), [180, 40, 60]);
+
+        let mut config = AppConfig::default();
+        let source = SourceConfig {
+            weight: 1.0,
+            import_policy: ImportPolicy::NotX,
+            scan_interval_seconds: 0,
+            upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
+                root: source_root.clone(),
+                recurse: true,
+                filters: RemoteImageFilterConfig {
+                    min_shortest_edge: 0,
+                    ..RemoteImageFilterConfig::default()
+                },
+            }),
+        };
+        let source_key = source.source_key();
+        config.sources = vec![source];
+        let config_path = config_root.join("config.toml");
+        let config_digest = config.write(&config_path).expect("write config");
+        let app_paths = AppBootPaths {
+            db_path: app_data_root.join("picmash.sqlite3"),
+            model_cache_root: app_cache_root.clone(),
+            cache_root: app_cache_root.join("renditions"),
+            source_cache_root: app_cache_root.join("sources"),
+        };
+
+        let state =
+            AppState::boot_with_paths(&corpus_root, config, config_path, config_digest, app_paths)
+                .expect("boot app state");
+        state.schedule_corpus_ingest();
+        drain_maintenance(&state);
+        state
+            .refresh_external_sources_if_due(true)
+            .expect("harvest local-directory source");
+
+        let local_asset = state
+            .read_store()
+            .expect("open read store for local asset")
+            .corpus_assets(state.active.corpus_id)
+            .expect("load corpus assets")
+            .into_iter()
+            .next()
+            .expect("seed asset present");
+        let remote_item = source_remote_items(&state, &source_key)
+            .into_iter()
+            .next()
+            .expect("remote item present");
+        let remote_handle = ArenaHandle::Remote(remote_item);
+        assert!(
+            state
+                .arena_handle_is_live(&remote_handle)
+                .expect("remote handle should start live"),
+            "harvested remote should be arena-live before import"
+        );
+
+        state
+            .seal_imported_external_outcome(remote_item, ExternalEventKind::RemoteWin)
+            .expect("accept remote");
+
+        assert!(
+            !state
+                .arena_handle_is_live(&remote_handle)
+                .expect("reload imported remote liveness"),
+            "imported remote handle should become stale immediately"
+        );
+        assert!(
+            state
+                .arena_pair(&ArenaHandle::Local(local_asset.id.clone()), &remote_handle)
+                .expect("load arena pair with stale imported remote")
+                .is_none(),
+            "arena should refuse to render imported remote handles"
+        );
+    }
+
+    #[test]
+    fn remote_win_retires_handle_before_deferred_import_finalizes() {
+        let _guard = test_guard();
+        let root = test_root("remote-win-pending-import");
+        let corpus_root = root.join("corpus");
+        let source_root = root.join("source");
+        let config_root = root.join("config");
+        let app_data_root = root.join("xdg-data");
+        let app_cache_root = root.join("xdg-cache");
+        std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+        std::fs::create_dir_all(&source_root).expect("create source root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&app_data_root).expect("create data root");
+        std::fs::create_dir_all(&app_cache_root).expect("create cache root");
+
+        solid_png(&corpus_root.join("seed.png"), [32, 48, 64]);
+        solid_png(&source_root.join("remote-a.png"), [180, 40, 60]);
+
+        let mut config = AppConfig::default();
+        let source = SourceConfig {
+            weight: 1.0,
+            import_policy: ImportPolicy::NotX,
+            scan_interval_seconds: 0,
+            upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
+                root: source_root.clone(),
+                recurse: true,
+                filters: RemoteImageFilterConfig {
+                    min_shortest_edge: 0,
+                    ..RemoteImageFilterConfig::default()
+                },
+            }),
+        };
+        let source_key = source.source_key();
+        config.sources = vec![source];
+        let config_path = config_root.join("config.toml");
+        let config_digest = config.write(&config_path).expect("write config");
+        let app_paths = AppBootPaths {
+            db_path: app_data_root.join("picmash.sqlite3"),
+            model_cache_root: app_cache_root.clone(),
+            cache_root: app_cache_root.join("renditions"),
+            source_cache_root: app_cache_root.join("sources"),
+        };
+
+        let state =
+            AppState::boot_with_paths(&corpus_root, config, config_path, config_digest, app_paths)
+                .expect("boot app state");
+        state.schedule_corpus_ingest();
+        drain_maintenance(&state);
+        state
+            .refresh_external_sources_if_due(true)
+            .expect("harvest local-directory source");
+
+        let local_asset = state
+            .read_store()
+            .expect("open read store for local asset")
+            .corpus_assets(state.active.corpus_id)
+            .expect("load corpus assets")
+            .into_iter()
+            .next()
+            .expect("seed asset present");
+        let remote_item = source_remote_items(&state, &source_key)
+            .into_iter()
+            .next()
+            .expect("remote item present");
+        let local_handle = ArenaHandle::Local(local_asset.id.clone());
+        let remote_handle = ArenaHandle::Remote(remote_item);
+
+        state
+            .vote(&local_handle, &remote_handle, &remote_handle)
+            .expect("queue remote import");
+
+        let store = state
+            .read_store()
+            .expect("open read store after queuing remote import");
+        assert!(
+            store
+                .external_item_import_pending(remote_item)
+                .expect("load pending import bit"),
+            "remote win should retire the remote immediately under import_pending"
+        );
+        assert!(
+            store
+                .pending_external_import_outcome(remote_item)
+                .expect("load pending external import row")
+                .is_some(),
+            "remote win should enqueue a deferred import outcome"
+        );
+        assert_eq!(
+            store
+                .external_item_resolved_asset_id(remote_item)
+                .expect("load resolved asset before finalize"),
+            None,
+            "deferred import should not fabricate the imported asset before maintenance runs"
+        );
+        assert!(
+            !state
+                .arena_handle_is_live(&remote_handle)
+                .expect("reload pending remote liveness"),
+            "pending import should already make the remote arena-stale"
+        );
+
+        for _ in 0..8 {
+            if !state
+                .read_store()
+                .expect("open read store in maintenance loop")
+                .external_item_import_pending(remote_item)
+                .expect("reload pending state in maintenance loop")
+            {
+                break;
+            }
+            assert!(
+                state
+                    .devour_one_maintenance_job()
+                    .expect("run one maintenance job"),
+                "pending import should leave a maintenance job to devour"
+            );
+        }
+
+        let store = state
+            .read_store()
+            .expect("open read store after deferred finalize");
+        assert!(
+            !store
+                .external_item_import_pending(remote_item)
+                .expect("load cleared pending import bit"),
+            "deferred finalize should clear import_pending"
+        );
+        assert!(
+            store
+                .external_item_resolved_asset_id(remote_item)
+                .expect("load resolved asset after finalize")
+                .is_some(),
+            "deferred finalize should eventually resolve the imported asset"
         );
     }
 
@@ -899,8 +1160,8 @@ mod tests {
             .into_iter()
             .map(|item_id| {
                 let item = state
-                    .store
-                    .lock()
+                    .read_store()
+                    .expect("open read store for locked remote item")
                     .remote_item(item_id)
                     .expect("load remote item")
                     .expect("remote item present");
@@ -924,8 +1185,8 @@ mod tests {
             _ => panic!("expected local-vs-remote pair under lock"),
         };
         let locked_remote = state
-            .store
-            .lock()
+            .read_store()
+            .expect("open read store for locked remote reload")
             .remote_item(locked_remote_id)
             .expect("reload locked remote")
             .expect("locked remote present");
@@ -935,7 +1196,7 @@ mod tests {
         );
 
         state
-            .with_fresh_store_write(|store| {
+            .with_write_store("block_external_stream", move |store| {
                 store.block_external_stream(
                     state.active.session_id,
                     state.active.corpus_id,
@@ -960,8 +1221,8 @@ mod tests {
         );
         assert_eq!(
             state
-                .store
-                .lock()
+                .read_store()
+                .expect("open read store for cleared lock reload")
                 .session_subsource_lock(state.active.session_id)
                 .expect("reload cleared lock"),
             None,
@@ -1058,12 +1319,292 @@ mod tests {
         );
         assert!(
             state
-                .store
-                .lock()
+                .read_store()
+                .expect("open read store for subsource lock reload")
                 .session_subsource_lock(state.active.session_id)
                 .expect("reload subsource lock")
                 .is_some(),
             "locking should persist the session subsource lock"
+        );
+    }
+
+    #[test]
+    fn arena_prefetch_excludes_visual_keys_without_replacement() {
+        let _guard = test_guard();
+        let root = test_root("arena-prefetch-excluded-visual-keys");
+        let corpus_root = root.join("corpus");
+        let config_root = root.join("config");
+        let app_data_root = root.join("xdg-data");
+        let app_cache_root = root.join("xdg-cache");
+        std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&app_data_root).expect("create data root");
+        std::fs::create_dir_all(&app_cache_root).expect("create cache root");
+
+        solid_png(&corpus_root.join("seed-a.png"), [32, 48, 64]);
+        solid_png(&corpus_root.join("seed-b.png"), [64, 48, 32]);
+        solid_png(&corpus_root.join("seed-c.png"), [180, 40, 60]);
+
+        let mut config = AppConfig::default();
+        config.arena = ArenaConfig {
+            external_probability: 0.0,
+            explore: 0.0,
+            dedup_radius: 0.0,
+        };
+        let config_path = config_root.join("config.toml");
+        let config_digest = config.write(&config_path).expect("write config");
+        let app_paths = AppBootPaths {
+            db_path: app_data_root.join("picmash.sqlite3"),
+            model_cache_root: app_cache_root.clone(),
+            cache_root: app_cache_root.join("renditions"),
+            source_cache_root: app_cache_root.join("sources"),
+        };
+
+        let state =
+            AppState::boot_with_paths(&corpus_root, config, config_path, config_digest, app_paths)
+                .expect("boot app state");
+        state.schedule_corpus_ingest();
+        drain_maintenance(&state);
+
+        let assets = state
+            .read_store()
+            .expect("open read store for local assets")
+            .corpus_assets(state.active.corpus_id)
+            .expect("load corpus assets");
+        let excluded_visual_key = assets[0]
+            .visual_key
+            .clone()
+            .expect("ingested local asset should have visual key");
+        let excluded = std::collections::HashSet::from([excluded_visual_key.clone()]);
+
+        let target = state
+            .arena_prefetch_target_excluding(&excluded)
+            .expect("prefetch target excluding visual key");
+        let RedirectTarget::ArenaPair { left, right } = target else {
+            panic!("expected local arena pair after excluding one visual identity");
+        };
+        let Some(view) = state
+            .arena_pair(&left, &right)
+            .expect("load excluded prefetch pair")
+        else {
+            panic!("expected rendered arena pair");
+        };
+        let pair = view.pair.expect("prefetch pair present");
+        assert!(
+            !pair.visual_keys().contains(&excluded_visual_key),
+            "prefetch without replacement should exclude already-buffered visual identities"
+        );
+    }
+
+    #[test]
+    fn arena_recent_visual_buffer_excludes_last_seen_local_pair() {
+        let _guard = test_guard();
+        let root = test_root("arena-recent-visual-buffer");
+        let corpus_root = root.join("corpus");
+        let config_root = root.join("config");
+        let app_data_root = root.join("xdg-data");
+        let app_cache_root = root.join("xdg-cache");
+        std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&app_data_root).expect("create data root");
+        std::fs::create_dir_all(&app_cache_root).expect("create cache root");
+
+        for (name, rgb) in [
+            ("seed-a.png", [32, 48, 64]),
+            ("seed-b.png", [64, 48, 32]),
+            ("seed-c.png", [180, 40, 60]),
+            ("seed-d.png", [20, 160, 120]),
+        ] {
+            solid_png(&corpus_root.join(name), rgb);
+        }
+
+        let mut config = AppConfig::default();
+        config.arena = ArenaConfig {
+            external_probability: 0.0,
+            explore: 0.0,
+            dedup_radius: 0.0,
+        };
+        let config_path = config_root.join("config.toml");
+        let config_digest = config.write(&config_path).expect("write config");
+        let app_paths = AppBootPaths {
+            db_path: app_data_root.join("picmash.sqlite3"),
+            model_cache_root: app_cache_root.clone(),
+            cache_root: app_cache_root.join("renditions"),
+            source_cache_root: app_cache_root.join("sources"),
+        };
+
+        let state =
+            AppState::boot_with_paths(&corpus_root, config, config_path, config_digest, app_paths)
+                .expect("boot app state");
+        state.schedule_corpus_ingest();
+        drain_maintenance(&state);
+
+        let initial_target = state.arena_target().expect("initial arena target");
+        let RedirectTarget::ArenaPair { left, right } = initial_target else {
+            panic!("expected initial local arena pair");
+        };
+        assert!(
+            matches!(
+                (&left, &right),
+                (ArenaHandle::Local(_), ArenaHandle::Local(_))
+            ),
+            "local-only arena should serve a local pair"
+        );
+        let seen_pair = state
+            .arena_pair(&left, &right)
+            .expect("load initial arena pair")
+            .expect("rendered initial arena pair")
+            .pair
+            .expect("initial arena pair payload");
+        let seen_visual_keys = seen_pair.visual_keys();
+        assert_eq!(
+            seen_visual_keys.len(),
+            2,
+            "a local duel should expose two distinct visual identities"
+        );
+
+        let next_target = state.vote(&left, &right, &left).expect("vote local pair");
+        let RedirectTarget::ArenaPair {
+            left: next_left,
+            right: next_right,
+        } = next_target
+        else {
+            panic!("expected next local arena pair after voting");
+        };
+        let next_pair = state
+            .arena_pair(&next_left, &next_right)
+            .expect("load next arena pair")
+            .expect("rendered next arena pair")
+            .pair
+            .expect("next arena pair payload");
+        assert!(
+            next_pair.visual_keys().is_disjoint(&seen_visual_keys),
+            "the rolling recent-visual buffer should exclude the just-seen pair"
+        );
+    }
+
+    #[test]
+    fn vetoing_a_locked_thread_lifts_the_lock_before_rerolling() {
+        let _guard = test_guard();
+        let root = test_root("subsource-lock-veto-clears");
+        let corpus_root = root.join("corpus");
+        let source_root = root.join("source");
+        let config_root = root.join("config");
+        let app_data_root = root.join("xdg-data");
+        let app_cache_root = root.join("xdg-cache");
+        std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+        std::fs::create_dir_all(source_root.join("a")).expect("create source stream a");
+        std::fs::create_dir_all(source_root.join("b")).expect("create source stream b");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&app_data_root).expect("create data root");
+        std::fs::create_dir_all(&app_cache_root).expect("create cache root");
+
+        solid_png(&corpus_root.join("seed-a.png"), [32, 48, 64]);
+        solid_png(&corpus_root.join("seed-b.png"), [64, 48, 32]);
+        solid_png(&source_root.join("a").join("remote-a.png"), [180, 40, 60]);
+        solid_png(&source_root.join("b").join("remote-b.png"), [40, 160, 90]);
+
+        let mut config = AppConfig::default();
+        config.arena = ArenaConfig {
+            external_probability: 0.0,
+            explore: 0.0,
+            dedup_radius: 0.0,
+        };
+        let source = SourceConfig {
+            weight: 1.0,
+            import_policy: ImportPolicy::NotX,
+            scan_interval_seconds: 0,
+            upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
+                root: source_root.clone(),
+                recurse: true,
+                filters: RemoteImageFilterConfig {
+                    min_shortest_edge: 0,
+                    ..RemoteImageFilterConfig::default()
+                },
+            }),
+        };
+        let source_key = source.source_key();
+        config.sources = vec![source];
+        let config_path = config_root.join("config.toml");
+        let config_digest = config.write(&config_path).expect("write config");
+        let app_paths = AppBootPaths {
+            db_path: app_data_root.join("picmash.sqlite3"),
+            model_cache_root: app_cache_root.clone(),
+            cache_root: app_cache_root.join("renditions"),
+            source_cache_root: app_cache_root.join("sources"),
+        };
+
+        let state =
+            AppState::boot_with_paths(&corpus_root, config, config_path, config_digest, app_paths)
+                .expect("boot app state");
+        state.schedule_corpus_ingest();
+        drain_maintenance(&state);
+        state
+            .refresh_external_sources_if_due(true)
+            .expect("harvest local-directory source");
+
+        let mut remote_items = source_remote_items(&state, &source_key)
+            .into_iter()
+            .map(|item_id| {
+                let item = state
+                    .read_store()
+                    .expect("open read store for locked remote item")
+                    .remote_item(item_id)
+                    .expect("load remote item")
+                    .expect("remote item present");
+                (item_id, item.stream_id)
+            })
+            .collect::<Vec<_>>();
+        remote_items.sort_by_key(|(_, stream_id)| *stream_id);
+        let (locked_item_id, locked_stream_id) = remote_items[0];
+
+        state
+            .set_external_subsource_lock(locked_item_id, true)
+            .expect("lock subsource");
+
+        let locked_target = state.arena_target().expect("arena target under lock");
+        let RedirectTarget::ArenaPair { left, right } = locked_target else {
+            panic!("expected arena pair under lock");
+        };
+        let remote_handle = match (&left, &right) {
+            (ArenaHandle::Local(_), ArenaHandle::Remote(item_id))
+            | (ArenaHandle::Remote(item_id), ArenaHandle::Local(_)) => {
+                ArenaHandle::Remote(*item_id)
+            }
+            _ => panic!("expected local-vs-remote pair under lock"),
+        };
+        let locked_remote = state
+            .read_store()
+            .expect("open read store for locked remote reload")
+            .remote_item(locked_item_id)
+            .expect("reload locked remote")
+            .expect("locked remote present");
+        assert_eq!(
+            locked_remote.stream_id, locked_stream_id,
+            "expected the locked stream to drive the current remote candidate"
+        );
+
+        let unlocked_target = state
+            .veto_external_thread_for_handle(&remote_handle, &left, &right)
+            .expect("veto locked thread");
+        let RedirectTarget::ArenaPair { left, right } = unlocked_target else {
+            panic!("expected arena pair after vetoing locked thread");
+        };
+        assert!(
+            matches!(
+                (&left, &right),
+                (ArenaHandle::Local(_), ArenaHandle::Local(_))
+            ),
+            "vetoing the locked thread should behave like unlocking before rerolling"
+        );
+        assert_eq!(
+            state
+                .read_store()
+                .expect("open read store for cleared lock reload")
+                .session_subsource_lock(state.active.session_id)
+                .expect("reload cleared lock"),
+            None,
+            "vetoing the locked thread should clear the active subsource lock"
         );
     }
 
@@ -1149,8 +1690,8 @@ mod tests {
         );
         assert!(
             state
-                .store
-                .lock()
+                .read_store()
+                .expect("open read store for preserved lock reload")
                 .session_subsource_lock(state.active.session_id)
                 .expect("reload preserved lock")
                 .is_some(),

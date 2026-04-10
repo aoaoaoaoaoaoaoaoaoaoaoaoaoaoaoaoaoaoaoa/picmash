@@ -1,10 +1,11 @@
+use super::support::asset_visual_key_excluded;
 use super::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
     crush::crush_import_image,
     face::align_face_for_embedding,
-    identity::{ImageIdentity, canonical_embedding_image, inspect_image_bytes},
+    identity::{ImageIdentity, VisualKey, canonical_embedding_image, inspect_image_bytes},
     quality_features::{
         LinearTechnicalPriorHead, QUALITY_FEATURE_REVISION, technical_prior_mean_with_head,
         technical_prior_variance_with_head,
@@ -19,22 +20,54 @@ struct PreparedRemoteImport {
     embedding: Option<crate::model::EmbeddingRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct RemoteSourceArenaBonuses {
+    pub(super) stream_size: f32,
+    pub(super) freshness: f32,
+}
+
 impl AppState {
+    fn arena_recent_visual_exclusions(
+        &self,
+        store: &Store,
+        exempt_visual_key: Option<&VisualKey>,
+    ) -> anyhow::Result<HashSet<VisualKey>> {
+        let mut excluded = store
+            .recent_arena_visual_keys(self.active.session_id, ARENA_RECENT_VISUAL_EXCLUDE)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if let Some(exempt_visual_key) = exempt_visual_key {
+            excluded.remove(exempt_visual_key);
+        }
+        Ok(excluded)
+    }
+
+    fn arena_effective_visual_exclusions(
+        &self,
+        store: &Store,
+        excluded_visual_keys: &HashSet<VisualKey>,
+        exempt_visual_key: Option<&VisualKey>,
+    ) -> anyhow::Result<HashSet<VisualKey>> {
+        let mut effective = self.arena_recent_visual_exclusions(store, exempt_visual_key)?;
+        effective.extend(excluded_visual_keys.iter().cloned());
+        if let Some(exempt_visual_key) = exempt_visual_key {
+            effective.remove(exempt_visual_key);
+        }
+        Ok(effective)
+    }
+
     pub(super) fn set_external_subsource_lock(
         &self,
         item_id: RemoteItemId,
         active: bool,
     ) -> anyhow::Result<()> {
-        self.with_fresh_store_write(|store| {
+        let session_id = self.active.session_id;
+        self.with_write_store("set_external_subsource_lock", move |store| {
             if active {
                 let item = store
                     .remote_item(item_id)?
                     .with_context(|| format!("missing remote item {}", item_id.0))?;
-                store.set_session_subsource_lock(
-                    self.active.session_id,
-                    &item.source_key,
-                    item.stream_id,
-                )?;
+                store.set_session_subsource_lock(session_id, &item.source_key, item.stream_id)?;
                 info!(
                     source = %item.source_key,
                     stream_id = item.stream_id,
@@ -43,18 +76,37 @@ impl AppState {
                     "locked arena to external subsource"
                 );
             } else {
-                store.clear_session_subsource_lock(self.active.session_id)?;
+                store.clear_session_subsource_lock(session_id)?;
                 info!("cleared arena external subsource lock");
             }
-            store.touch_session(self.active.session_id)
-        })
+            store.touch_session(session_id)
+        })?;
+        self.session_field_cache.write().as_mut().map(|field| {
+            field.subsource_lock = if active {
+                self.read_store()
+                    .ok()
+                    .and_then(|store| store.remote_item(item_id).ok().flatten())
+                    .map(|item| crate::model::SessionSubsourceLock {
+                        source_key: item.source_key,
+                        stream_id: item.stream_id,
+                    })
+            } else {
+                None
+            };
+        });
+        Ok(())
     }
 
     pub(super) fn clear_external_subsource_lock(&self) -> anyhow::Result<()> {
-        self.with_fresh_store_write(|store| {
-            store.clear_session_subsource_lock(self.active.session_id)?;
-            store.touch_session(self.active.session_id)
-        })
+        let session_id = self.active.session_id;
+        self.with_write_store("clear_external_subsource_lock", move |store| {
+            store.clear_session_subsource_lock(session_id)?;
+            store.touch_session(session_id)
+        })?;
+        if let Some(field) = self.session_field_cache.write().as_mut() {
+            field.subsource_lock = None;
+        }
+        Ok(())
     }
 
     pub(super) fn devour_local_directory_refresh(&self, source_key: &str) -> anyhow::Result<()> {
@@ -106,31 +158,15 @@ impl AppState {
         &self,
         store: &Store,
         item_id: RemoteItemId,
-        cached_path: &Path,
+        source_key: &str,
     ) -> anyhow::Result<Option<Vec<f32>>> {
         if let Some(embedding) =
             store.external_item_face_embedding(item_id, self.embedder.recognition_model_name())?
         {
             return Ok(Some(embedding));
         }
-        if !self.embedder.face_detection_enabled() || !cached_path.exists() {
-            return Ok(None);
-        }
-        let bytes = match fs::read(cached_path) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(None),
-        };
-        let embedding = self.devour_remote_face_embedding(store, item_id, cached_path, &bytes)?;
-        let vector = embedding.as_ref().map(|embedding| embedding.vector.clone());
-        let persist_store = Store::open_hot(&self.db_path)?;
-        self.with_db_write_gate(|| {
-            persist_store.save_external_face_embedding(
-                item_id,
-                self.embedder.recognition_model_name(),
-                embedding.as_ref(),
-            )
-        })?;
-        Ok(vector)
+        self.schedule_external_face_embedding_backfill(source_key);
+        Ok(None)
     }
 
     pub(super) fn backfill_external_face_embeddings_for_source(
@@ -159,15 +195,17 @@ impl AppState {
             };
             let face_embedding =
                 self.devour_remote_face_embedding(&store, item_id, &cached_path, &bytes)?;
-            self.with_db_write_gate(|| {
+            let embedded_now = face_embedding.is_some();
+            let recognition_model = self.embedder.recognition_model_name().to_owned();
+            self.with_write_store("save_external_face_embedding", move |store| {
                 store.save_external_face_embedding(
                     item_id,
-                    self.embedder.recognition_model_name(),
+                    &recognition_model,
                     face_embedding.as_ref(),
                 )
             })?;
             attempted += 1;
-            if face_embedding.is_some() {
+            if embedded_now {
                 embedded += 1;
             }
         }
@@ -193,28 +231,32 @@ impl AppState {
         source: &SourceConfig,
         harvest: &SourceHarvest,
     ) -> anyhow::Result<()> {
-        macro_rules! gated {
-            ($expr:expr) => {
-                self.with_db_write_gate(|| $expr)
-            };
-        }
-
-        let store = Store::open_hot(&self.db_path)?;
         let source_key = source.source_key();
-        gated!(store.upsert_external_source(
-            &source_key,
-            &harvest.display_name,
-            source.source_type_name(),
-            &source.source_locator(),
-            None,
-        ))?;
+        self.with_write_store("upsert_external_source", {
+            let source_key = source_key.clone();
+            let display_name = harvest.display_name.clone();
+            let source_type = source.source_type_name().to_owned();
+            let source_locator = source.source_locator();
+            move |store| {
+                store.upsert_external_source(
+                    &source_key,
+                    &display_name,
+                    &source_type,
+                    &source_locator,
+                    None,
+                )
+            }
+        })?;
 
         let live_thread_nos = harvest
             .streams
             .iter()
             .map(|stream| stream.thread_no)
             .collect::<Vec<_>>();
-        gated!(store.retire_missing_external_streams(&source_key, &live_thread_nos))?;
+        self.with_write_store("retire_missing_external_streams", {
+            let source_key = source_key.clone();
+            move |store| store.retire_missing_external_streams(&source_key, &live_thread_nos)
+        })?;
 
         if source.local_directory().is_some() {
             let live_post_nos = harvest
@@ -222,9 +264,13 @@ impl AppState {
                 .iter()
                 .flat_map(|stream| stream.items.iter().map(|item| item.post_no))
                 .collect::<Vec<_>>();
-            gated!(store.withdraw_missing_external_items(&source_key, &live_post_nos))?;
+            self.with_write_store("withdraw_missing_external_items", {
+                let source_key = source_key.clone();
+                move |store| store.withdraw_missing_external_items(&source_key, &live_post_nos)
+            })?;
         }
 
+        let store = Store::open_hot(&self.db_path)?;
         let (total_ready, ready_by_stream) =
             store.external_source_ready_profile(&source_key, self.embedder.model_name())?;
         let mut ready_frontier = SourceReadyFrontier::new(
@@ -236,13 +282,30 @@ impl AppState {
         let mut needs_face_backfill = false;
 
         for stream in &harvest.streams {
-            let (stream_id, blocked) = gated!(store.upsert_external_stream(&source_key, stream))?;
+            let (stream_id, blocked, item_ids) =
+                self.with_write_store("upsert_external_stream_batch", {
+                    let source_key = source_key.clone();
+                    let title = stream.title.clone();
+                    let stream = stream.clone();
+                    move |store| {
+                        let (stream_id, blocked) =
+                            store.upsert_external_stream(&source_key, &stream)?;
+                        let item_ids = if blocked {
+                            HashMap::new()
+                        } else {
+                            store.upsert_external_items(
+                                &source_key,
+                                stream_id,
+                                &title,
+                                &stream.items,
+                            )?
+                        };
+                        Ok((stream_id, blocked, item_ids))
+                    }
+                })?;
             if blocked {
                 continue;
             }
-            let item_ids = self.with_fresh_store_write(|store| {
-                store.upsert_external_items(&source_key, stream_id, &stream.title, &stream.items)
-            })?;
 
             for item in &stream.items {
                 let item_id = item_ids.get(&item.post_no).copied().with_context(|| {
@@ -277,15 +340,16 @@ impl AppState {
                     QUALITY_FEATURE_REVISION,
                 )?;
                 needs_face_backfill |= warm.needs_face_embedding;
-                if !warm.needs_inline_work() {
+                let cached_path = match item.materialized_path.as_ref() {
+                    Some(path) if path.exists() => path.clone(),
+                    Some(_) if source.local_directory().is_some() => continue,
+                    Some(_) | None => self.source_scanner.cache_remote_image(&source_key, item)?,
+                };
+                if !cached_path.exists() {
                     continue;
                 }
 
-                let cached_path = match item.materialized_path.as_ref() {
-                    Some(path) => path.clone(),
-                    None => self.source_scanner.cache_remote_image(&source_key, item)?,
-                };
-                if !cached_path.exists() {
+                if !warm.needs_inline_work() {
                     continue;
                 }
 
@@ -307,12 +371,13 @@ impl AppState {
                             cached_path.display()
                         )
                     })?;
-                    let tombstoned = gated!(store.save_external_item_identity(
-                        item_id,
-                        &identity,
-                        &cached_path,
-                    ))?;
-                    if tombstoned {
+                    let disposition = self.with_write_store("save_external_item_identity", {
+                        let cached_path = cached_path.clone();
+                        move |store| {
+                            store.save_external_item_identity(item_id, &identity, &cached_path)
+                        }
+                    })?;
+                    if disposition != crate::store::ExternalIdentityDisposition::Active {
                         continue;
                     }
                 }
@@ -322,23 +387,30 @@ impl AppState {
                     && let Ok(features) =
                         crate::quality_features::extract_asset_quality_features(bytes)
                 {
-                    gated!(store.save_external_item_quality_features(
-                        item_id,
-                        QUALITY_FEATURE_REVISION,
-                        &features,
-                    ))?;
+                    self.with_write_store("save_external_item_quality_features", move |store| {
+                        store.save_external_item_quality_features(
+                            item_id,
+                            QUALITY_FEATURE_REVISION,
+                            &features,
+                        )
+                    })?;
                 }
 
                 if warm.needs_embedding
                     && let Some(embedding) = self.embedder.embed(&cached_path)?
                 {
-                    gated!(store.save_external_embedding(item_id, &embedding, &cached_path))?;
+                    let cached_path = cached_path.clone();
+                    self.with_write_store("save_external_embedding", move |store| {
+                        store.save_external_embedding(item_id, &embedding, &cached_path)
+                    })?;
                 }
 
                 if warm.needs_clip_embedding
                     && let Some(embedding) = self.embedder.clip_embed(&cached_path)?
                 {
-                    gated!(store.save_external_clip_embedding(item_id, &embedding))?;
+                    self.with_write_store("save_external_clip_embedding", move |store| {
+                        store.save_external_clip_embedding(item_id, &embedding)
+                    })?;
                 }
 
                 if !already_ready
@@ -362,14 +434,18 @@ impl AppState {
         store: &Store,
         field: &SessionField,
         assets: &[AssetRecord],
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
         if assets.is_empty() {
             return Ok(None);
         }
 
+        let effective_excluded =
+            self.arena_effective_visual_exclusions(store, excluded_visual_keys, None)?;
         let explore = self.arena_explore();
-        let local_pair = choose_local_pair(assets, field, store, explore)?;
-        let external_pair = self.choose_external_pair(store, field, assets, explore)?;
+        let local_pair = choose_local_pair(assets, field, store, explore, &effective_excluded)?;
+        let external_pair =
+            self.choose_external_pair(store, field, assets, explore, &effective_excluded)?;
         Ok(choose_pair_source(
             &mut rng(),
             self.config.read().external_probability(),
@@ -402,7 +478,7 @@ impl AppState {
                 })))
             }
             ArenaHandle::Remote(item_id) => {
-                let Some(item) = store.remote_item(*item_id)? else {
+                let Some(item) = store.arena_remote_item(*item_id)? else {
                     return Ok(None);
                 };
                 if !item.path.exists() {
@@ -414,9 +490,8 @@ impl AppState {
                     return Ok(None);
                 };
                 let face_embedding =
-                    self.ensure_remote_face_embedding(store, *item_id, &item.path)?;
+                    self.ensure_remote_face_embedding(store, *item_id, &item.source_key)?;
                 let quality_features = self.lazy_remote_quality_features(
-                    &item.path,
                     store.external_item_quality_features(*item_id, QUALITY_FEATURE_REVISION)?,
                 );
                 let quality_cache = store
@@ -500,15 +575,24 @@ impl AppState {
         store: &Store,
         field: &SessionField,
         local_anchor: Option<&AssetId>,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
         let assets = visible_assets(store, self.active.corpus_id)?;
         let pair = match local_anchor
             .and_then(|asset_id| assets.iter().find(|asset| asset.id == *asset_id).cloned())
         {
-            Some(anchor) => {
-                self.choose_pair_against_local_anchor_with_store(store, field, &assets, &anchor)?
-            }
-            None => self.choose_pair_with_store(store, field, &assets)?,
+            Some(anchor) => self.choose_pair_against_local_anchor_with_store(
+                store,
+                field,
+                &assets,
+                &anchor,
+                &self.arena_effective_visual_exclusions(
+                    store,
+                    excluded_visual_keys,
+                    anchor.visual_key.as_ref(),
+                )?,
+            )?,
+            None => self.choose_pair_with_store(store, field, &assets, excluded_visual_keys)?,
         };
         Ok(pair)
     }
@@ -519,6 +603,7 @@ impl AppState {
         field: &SessionField,
         assets: &[AssetRecord],
         local_anchor: Option<&AssetId>,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
         let Some(lock) = field.subsource_lock.as_ref() else {
             return Ok(None);
@@ -526,10 +611,19 @@ impl AppState {
         let Some(source) = self.source_config_for_key(&lock.source_key) else {
             return Ok(None);
         };
+        let mut effective_excluded =
+            self.arena_effective_visual_exclusions(store, excluded_visual_keys, None)?;
         let anchor = match local_anchor
             .and_then(|asset_id| assets.iter().find(|asset| asset.id == *asset_id).cloned())
         {
-            Some(anchor) => anchor,
+            Some(anchor) => {
+                effective_excluded = self.arena_effective_visual_exclusions(
+                    store,
+                    excluded_visual_keys,
+                    anchor.visual_key.as_ref(),
+                )?;
+                anchor
+            }
             None => {
                 if assets.is_empty() {
                     return Ok(None);
@@ -546,13 +640,12 @@ impl AppState {
                 let pool = assets
                     .iter()
                     .filter(|asset| !recent.contains(&asset.id))
+                    .filter(|asset| !asset_visual_key_excluded(asset, &effective_excluded))
                     .cloned()
                     .collect::<Vec<_>>();
-                let pool = if pool.is_empty() {
-                    assets.to_vec()
-                } else {
-                    pool
-                };
+                if pool.is_empty() {
+                    return Ok(None);
+                }
                 let mut rng = rng();
                 let anchor_scores = pool
                     .iter()
@@ -571,7 +664,13 @@ impl AppState {
         };
         let explore = self.arena_explore();
         let Some(scored) = self.pick_remote_candidate_from_locked_stream(
-            store, field, &anchor, &source, lock, explore,
+            store,
+            field,
+            &anchor,
+            &source,
+            lock,
+            explore,
+            &effective_excluded,
         )?
         else {
             return Ok(None);
@@ -613,16 +712,35 @@ impl AppState {
         Ok(())
     }
 
+    fn queue_external_import_outcome(
+        &self,
+        item_id: RemoteItemId,
+        outcome_kind: ExternalEventKind,
+    ) -> anyhow::Result<()> {
+        let session_id = self.active.session_id;
+        let corpus_id = self.active.corpus_id;
+        let queued = self.with_write_store("queue_external_import_outcome", move |store| {
+            store.queue_external_import_outcome(session_id, corpus_id, item_id, outcome_kind)
+        })?;
+        if queued {
+            self.purge_duplicate_frontier();
+            self.maintenance_notify.notify_one();
+        }
+        Ok(())
+    }
+
     pub(super) fn seal_imported_external_outcome(
         &self,
         item_id: RemoteItemId,
         outcome_kind: ExternalEventKind,
     ) -> anyhow::Result<AssetId> {
         let prepared = self.prepare_remote_import(item_id)?;
-        let asset_id = self.with_fresh_store_write(|store| {
+        let session_id = self.active.session_id;
+        let corpus_id = self.active.corpus_id;
+        let asset_id = self.with_write_store("seal_imported_external_outcome", move |store| {
             store.seal_imported_external_outcome_precomputed(
-                self.active.session_id,
-                self.active.corpus_id,
+                session_id,
+                corpus_id,
                 item_id,
                 &prepared.import_path,
                 &prepared.identity,
@@ -638,12 +756,48 @@ impl AppState {
         Ok(asset_id)
     }
 
+    pub(super) fn devour_pending_external_import_outcome(
+        &self,
+        item_id: RemoteItemId,
+    ) -> anyhow::Result<()> {
+        let pending = {
+            let store = Store::open_hot(&self.db_path)?;
+            store.pending_external_import_outcome(item_id)?
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let prepared = self.prepare_remote_import(item_id)?;
+        self.with_write_store("finalize_external_import_outcome", move |store| {
+            store.seal_imported_external_outcome_precomputed(
+                pending.session_id,
+                pending.corpus_id,
+                item_id,
+                &prepared.import_path,
+                &prepared.identity,
+                prepared.rotation_quarters,
+                prepared.embedding.as_ref(),
+                pending.outcome_kind,
+            )
+        })?;
+        if self.quality_refresh_is_inline()? {
+            self.devour_quality_model_refresh()?;
+        } else {
+            self.schedule_quality_model_refresh();
+        }
+        self.purge_duplicate_frontier();
+        Ok(())
+    }
+
     fn prepare_remote_import(&self, item_id: RemoteItemId) -> anyhow::Result<PreparedRemoteImport> {
-        let (item, embedding_record) = {
+        let (item, item_snapshot, embedding_record) = {
             let store = Store::open_hot(&self.db_path)?;
             let item = store
                 .remote_item(item_id)?
                 .with_context(|| format!("missing remote item {}", item_id.0))?;
+            let item_snapshot = store
+                .remote_item_snapshot(item_id)?
+                .with_context(|| format!("missing remote item snapshot {}", item_id.0))?;
             let embedding = store.external_item_embedding(item_id, self.embedder.model_name())?;
             let embedding_record = embedding
                 .as_ref()
@@ -651,10 +805,16 @@ impl AppState {
                     model_name: self.embedder.model_name().to_owned(),
                     vector: vector.clone(),
                 });
-            (item, embedding_record)
+            (item, item_snapshot, embedding_record)
         };
-        let raw_bytes = fs::read(&item.path)
-            .with_context(|| format!("reading remote import {}", item.path.display()))?;
+        let source_path = if item.image_url.starts_with("file://") {
+            item.path.clone()
+        } else {
+            self.source_scanner
+                .cache_remote_image(&item.source_key, &item_snapshot)?
+        };
+        let raw_bytes = fs::read(&source_path)
+            .with_context(|| format!("reading remote import {}", source_path.display()))?;
         let import_dir = self
             .root_path
             .join(".picmash-imported")
@@ -668,7 +828,8 @@ impl AppState {
             item.post_no,
             extension_or_fallback(&item.path)
         ));
-        let crushed = crush_import_image(&path_hint, &raw_bytes);
+        let crushed = crush_import_image(&path_hint, &raw_bytes)
+            .context("normalizing remote import into canonical jxl")?;
         let extension = crushed.extension().to_owned();
         let import_bytes = crushed.into_bytes();
         let identity =
@@ -692,7 +853,7 @@ impl AppState {
         winner: &ArenaHandle,
     ) -> anyhow::Result<RedirectTarget> {
         let (local_asset, source_policy) = {
-            let store = self.store.lock();
+            let store = self.read_store()?;
             let Some(local_asset) = store.corpus_asset(self.active.corpus_id, local_asset_id)?
             else {
                 return self.arena_target();
@@ -715,21 +876,16 @@ impl AppState {
 
         match winner {
             ArenaHandle::Local(winner_id) if *winner_id == local_asset.id => {
-                let imported_asset = if source_policy == ImportPolicy::NotX {
-                    Some(self.seal_imported_external_outcome(
-                        remote_item_id,
-                        ExternalEventKind::LocalWin,
-                    )?)
-                } else {
-                    None
-                };
                 if source_policy != ImportPolicy::NotX {
-                    self.with_fresh_store_write(|store| {
+                    let session_id = self.active.session_id;
+                    let corpus_id = self.active.corpus_id;
+                    let local_asset_id = local_asset.id.clone();
+                    self.with_write_store("record_external_result", move |store| {
                         store.record_external_result_and_touch_session(
-                            self.active.session_id,
-                            self.active.corpus_id,
+                            session_id,
+                            corpus_id,
                             remote_item_id,
-                            &local_asset.id,
+                            &local_asset_id,
                             ExternalEventKind::LocalWin,
                         )
                     })?;
@@ -737,9 +893,10 @@ impl AppState {
                         self.devour_quality_model_refresh()?;
                     }
                 } else {
-                    let _ = imported_asset
-                        .as_ref()
-                        .context("missing imported remote asset after not_x import")?;
+                    self.queue_external_import_outcome(
+                        remote_item_id,
+                        ExternalEventKind::LocalWin,
+                    )?;
                 }
                 if source_policy == ImportPolicy::NotX {
                     self.arena_target()
@@ -748,9 +905,7 @@ impl AppState {
                 }
             }
             ArenaHandle::Remote(winner_id) if *winner_id == remote_item_id => {
-                let _imported = self
-                    .seal_imported_external_outcome(remote_item_id, ExternalEventKind::RemoteWin)?;
-                self.purge_duplicate_frontier();
+                self.queue_external_import_outcome(remote_item_id, ExternalEventKind::RemoteWin)?;
                 self.arena_target()
             }
             _ => bail!("remote duel winner is not one of the compared assets"),
@@ -795,14 +950,9 @@ impl AppState {
 
     fn lazy_remote_quality_features(
         &self,
-        path: &Path,
         features: Option<crate::quality_features::AssetQualityFeatures>,
     ) -> Option<crate::quality_features::AssetQualityFeatures> {
-        features.or_else(|| {
-            fs::read(path).ok().and_then(|bytes| {
-                crate::quality_features::extract_asset_quality_features(&bytes).ok()
-            })
-        })
+        features
     }
 
     fn remote_quality_summary(
@@ -1021,11 +1171,24 @@ impl AppState {
         field: &SessionField,
         assets: &[AssetRecord],
         anchor: &AssetRecord,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
         let explore = self.arena_explore();
-        let local_pair = choose_local_pair_against_anchor(anchor, assets, field, store, explore)?;
-        let external_pair =
-            self.choose_external_pair_against_anchor(store, field, anchor, explore)?;
+        let local_pair = choose_local_pair_against_anchor(
+            anchor,
+            assets,
+            field,
+            store,
+            explore,
+            excluded_visual_keys,
+        )?;
+        let external_pair = self.choose_external_pair_against_anchor(
+            store,
+            field,
+            anchor,
+            explore,
+            excluded_visual_keys,
+        )?;
         Ok(choose_pair_source(
             &mut rng(),
             self.config.read().external_probability(),
@@ -1040,6 +1203,7 @@ impl AppState {
         field: &SessionField,
         assets: &[AssetRecord],
         explore: f32,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
         let recent = (assets.len() > ARENA_RECENT_REPEAT_EXCLUDE)
             .then(|| store.recent_arena_asset_ids(field.session.id, ARENA_RECENT_REPEAT_EXCLUDE))
@@ -1050,13 +1214,13 @@ impl AppState {
         let usable = assets
             .iter()
             .filter(|asset| !recent.contains(&asset.id))
+            .filter(|asset| !asset_visual_key_excluded(asset, excluded_visual_keys))
             .cloned()
             .collect::<Vec<_>>();
-        let pool = if usable.is_empty() {
-            assets.to_vec()
-        } else {
-            usable
-        };
+        let pool = usable;
+        if pool.is_empty() {
+            return Ok(None);
+        }
         let mut rng = rng();
         let anchor_scores = pool
             .iter()
@@ -1071,7 +1235,13 @@ impl AppState {
             return Ok(None);
         };
         let anchor = pool[anchor_index].clone();
-        self.choose_external_pair_against_anchor(store, field, &anchor, explore)
+        self.choose_external_pair_against_anchor(
+            store,
+            field,
+            &anchor,
+            explore,
+            excluded_visual_keys,
+        )
     }
 
     fn choose_external_pair_against_anchor(
@@ -1080,17 +1250,17 @@ impl AppState {
         field: &SessionField,
         anchor: &AssetRecord,
         explore: f32,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
-        let Some(mut scored) = self.pick_remote_candidate(store, field, anchor, explore)? else {
+        let Some(mut scored) =
+            self.pick_remote_candidate(store, field, anchor, explore, excluded_visual_keys)?
+        else {
             return Ok(None);
         };
         if scored.quality.technical.is_none() && scored.quality.vibe.is_none() {
             let face_oracle = self.ensure_face_oracle(store)?;
             let domain_oracle = self.asset_domain_oracle(store)?;
-            let features = self.lazy_remote_quality_features(
-                &scored.candidate.item.path,
-                scored.candidate.quality_features,
-            );
+            let features = self.lazy_remote_quality_features(scored.candidate.quality_features);
             let technical_head = store.active_quality_model().ok().and_then(|model| {
                 store
                     .load_linear_technical_prior_head(&model)
@@ -1135,6 +1305,7 @@ impl AppState {
         source: &SourceConfig,
         lock: &crate::model::SessionSubsourceLock,
         explore: f32,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ScoredRemoteCandidate>> {
         let mut candidates = store.remote_candidates(
             &lock.source_key,
@@ -1142,8 +1313,9 @@ impl AppState {
             self.embedder.recognition_model_name(),
             field.quality_model,
         )?;
-        prune_stale_local_directory_candidates(store, source, &mut candidates)?;
+        prune_unmaterialized_remote_candidates(source, &mut candidates)?;
         candidates.retain(|candidate| candidate.item.stream_id == lock.stream_id);
+        candidates.retain(|candidate| !remote_visual_key_excluded(candidate, excluded_visual_keys));
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -1232,6 +1404,7 @@ impl AppState {
         field: &SessionField,
         anchor: &AssetRecord,
         explore: f32,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ScoredRemoteCandidate>> {
         let sources = self
             .configured_sources()
@@ -1263,6 +1436,7 @@ impl AppState {
                 &source,
                 explore,
                 enforce_item_repeat_exclusion,
+                excluded_visual_keys,
             )?
             else {
                 continue;
@@ -1270,7 +1444,6 @@ impl AppState {
             let score = remote_source_score(
                 source.weight,
                 recency_discount(source_ranks.get(&source.source_key()).copied(), 0.28),
-                candidate.selection_score,
                 explore,
             );
             contenders.push((score, candidate));
@@ -1303,6 +1476,7 @@ impl AppState {
         source: &SourceConfig,
         explore: f32,
         enforce_item_repeat_exclusion: bool,
+        excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ScoredRemoteCandidate>> {
         let mut candidates = store.remote_candidates(
             &source.source_key(),
@@ -1310,7 +1484,8 @@ impl AppState {
             self.embedder.recognition_model_name(),
             field.quality_model,
         )?;
-        prune_stale_local_directory_candidates(store, source, &mut candidates)?;
+        prune_unmaterialized_remote_candidates(source, &mut candidates)?;
+        candidates.retain(|candidate| !remote_visual_key_excluded(candidate, excluded_visual_keys));
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -1384,6 +1559,8 @@ impl AppState {
             let stream_id = candidate.item.stream_id;
             let stream_image_count = candidate.stream_image_count;
             let stream_last_modified = candidate.stream_last_modified;
+            let source_bonuses =
+                remote_source_arena_bonuses(source, now, stream_last_modified, stream_image_count);
             let quality = self.remote_quality_summary(
                 field,
                 &candidate.embedding,
@@ -1408,8 +1585,8 @@ impl AppState {
                 candidate,
                 selection_score: remote_stream_score(
                     selection_score,
-                    stream_size_bias(stream_image_count),
-                    freshness_pull(now, stream_last_modified),
+                    source_bonuses.stream_size,
+                    source_bonuses.freshness,
                     recency_discount(stream_ranks.get(&stream_id).copied(), 0.22),
                     explore,
                 ),
@@ -1442,20 +1619,17 @@ impl AppState {
     pub(super) fn note_remote_pair_selected(&self, pair: &ArenaPair) -> anyhow::Result<()> {
         let (local_asset_id, remote_item_id) = match (&pair.left, &pair.right) {
             (ArenaCard::Local(local), ArenaCard::Remote(remote)) => {
-                (&local.asset.id, remote.item.id)
+                (local.asset.id.clone(), remote.item.id)
             }
             (ArenaCard::Remote(remote), ArenaCard::Local(local)) => {
-                (&local.asset.id, remote.item.id)
+                (local.asset.id.clone(), remote.item.id)
             }
             _ => return Ok(()),
         };
-        self.with_fresh_store_write(|store| {
-            store.note_external_selected(
-                self.active.session_id,
-                self.active.corpus_id,
-                remote_item_id,
-                local_asset_id,
-            )
+        let session_id = self.active.session_id;
+        let corpus_id = self.active.corpus_id;
+        self.with_write_store("note_external_selected", move |store| {
+            store.note_external_selected(session_id, corpus_id, remote_item_id, &local_asset_id)
         })
     }
 }
@@ -1508,6 +1682,17 @@ fn recency_discount(rank: Option<usize>, floor: f32) -> f32 {
     rank.map_or(1.0, |rank| {
         floor + (1.0 - floor) * (rank as f32 / (rank as f32 + 1.0))
     })
+}
+
+fn remote_visual_key_excluded(
+    candidate: &RemoteCandidate,
+    excluded_visual_keys: &HashSet<VisualKey>,
+) -> bool {
+    candidate
+        .item
+        .visual_key
+        .as_ref()
+        .is_some_and(|visual_key| excluded_visual_keys.contains(visual_key))
 }
 
 fn pair_balance_pull(anchor_quality: f32, candidate_quality: f32) -> f32 {
@@ -1573,15 +1758,27 @@ fn remote_stream_score(
                 + recency * ARENA_REMOTE_STREAM_RECENCY_WEIGHT)
 }
 
-fn remote_source_score(
-    source_weight: f32,
-    source_recency: f32,
-    candidate_score: f32,
-    explore: f32,
-) -> f32 {
-    candidate_score
-        + source_weight_bonus(source_weight)
+fn remote_source_score(source_weight: f32, source_recency: f32, explore: f32) -> f32 {
+    source_weight_bonus(source_weight)
         + explore * source_recency * ARENA_REMOTE_SOURCE_RECENCY_WEIGHT
+}
+
+pub(super) fn remote_source_arena_bonuses(
+    source: &SourceConfig,
+    now: i64,
+    stream_last_modified: i64,
+    stream_image_count: u32,
+) -> RemoteSourceArenaBonuses {
+    if source.local_directory().is_some() {
+        return RemoteSourceArenaBonuses {
+            stream_size: 0.0,
+            freshness: 0.0,
+        };
+    }
+    RemoteSourceArenaBonuses {
+        stream_size: stream_size_bias(stream_image_count),
+        freshness: freshness_pull(now, stream_last_modified),
+    }
 }
 
 fn source_weight_bonus(source_weight: f32) -> f32 {
@@ -1597,14 +1794,10 @@ fn freshness_pull(now: i64, last_modified: i64) -> f32 {
     1.0 / (1.0 + age_days / 5.0)
 }
 
-fn prune_stale_local_directory_candidates(
-    _store: &Store,
-    source: &SourceConfig,
+fn prune_unmaterialized_remote_candidates(
+    _source: &SourceConfig,
     candidates: &mut Vec<RemoteCandidate>,
 ) -> anyhow::Result<()> {
-    if source.local_directory().is_none() {
-        return Ok(());
-    }
     let stale = candidates
         .iter()
         .filter(|candidate| !candidate.item.path.exists())

@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use super::Store;
+use super::{ExternalIdentityDisposition, Store};
 use crate::{
     asset_domain::AssetDomainLabel,
     face::{DetectedFace, FaceLandmarks},
@@ -1259,6 +1259,18 @@ fn recent_arena_asset_ids_merge_local_duels_with_remote_selections() {
             Some(&remote_path),
         )
         .expect("upsert external item");
+    let remote_identity =
+        inspect_image_bytes(&std::fs::read(&remote_path).expect("read remote identity payload"))
+            .expect("inspect remote identity");
+    assert!(
+        matches!(
+            store
+                .save_external_item_identity(item_id, &remote_identity, &remote_path)
+                .expect("save remote identity"),
+            ExternalIdentityDisposition::Active
+        ),
+        "distinct remote selection should stay frontier-eligible"
+    );
     store
         .conn
         .execute(
@@ -1293,6 +1305,140 @@ fn recent_arena_asset_ids_merge_local_duels_with_remote_selections() {
             assets[2].id.clone(),
             assets[0].id.clone(),
             assets[1].id.clone()
+        ]
+    );
+
+    let recent_visual_keys = store
+        .recent_arena_visual_keys(session.id, 4)
+        .expect("load recent arena visual keys");
+    assert_eq!(
+        recent_visual_keys,
+        vec![
+            assets[2]
+                .visual_key
+                .clone()
+                .expect("seed asset c visual key"),
+            remote_identity.visual_key.clone(),
+            assets[0]
+                .visual_key
+                .clone()
+                .expect("seed asset a visual key"),
+            assets[1]
+                .visual_key
+                .clone()
+                .expect("seed asset b visual key"),
+        ]
+    );
+}
+
+#[test]
+fn recent_external_recency_queries_include_result_events() {
+    let root = test_root("recent-external-recency-result-events");
+    let corpus_root = root.join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+    for (name, rgb) in [("a.png", [120, 80, 40]), ("b.png", [80, 120, 40])] {
+        std::fs::write(corpus_root.join(name), flat_png(256, 256, rgb)).expect("write asset");
+    }
+
+    let db_path = root.join("picmash.sqlite3");
+    let mut store = Store::open(&db_path).expect("open store");
+    let embedder = OnnxEngine::disabled_for_tests();
+    let corpus_id = store.ensure_corpus_id(&corpus_root).expect("ensure corpus");
+    store
+        .ingest_corpus(&corpus_root, corpus_id, &embedder)
+        .expect("ingest corpus");
+    let session = store.create_session(corpus_id).expect("create session");
+    let assets = store.corpus_assets(corpus_id).expect("load assets");
+
+    store
+        .upsert_external_source("4chan:w", "w", "4chan_board", "w", None)
+        .expect("upsert source");
+    let (stream_id, blocked) = store
+        .upsert_external_stream("4chan:w", &remote_stream(9101, 1))
+        .expect("upsert stream");
+    assert!(!blocked);
+    let remote_path = root.join("remote-result.png");
+    std::fs::write(&remote_path, flat_png(640, 480, [180, 140, 110])).expect("write remote");
+    let item_id = store
+        .upsert_external_item(
+            "4chan:w",
+            stream_id,
+            "thread 9101",
+            &remote_item(9101, 9102, None),
+            Some(&remote_path),
+        )
+        .expect("upsert external item");
+    let remote_identity =
+        inspect_image_bytes(&std::fs::read(&remote_path).expect("read remote identity payload"))
+            .expect("inspect remote identity");
+    assert!(
+        matches!(
+            store
+                .save_external_item_identity(item_id, &remote_identity, &remote_path)
+                .expect("save remote identity"),
+            ExternalIdentityDisposition::Active
+        ),
+        "distinct remote result item should stay frontier-eligible"
+    );
+
+    store
+        .conn
+        .execute(
+            r"
+            INSERT INTO external_events (
+                session_id,
+                corpus_id,
+                source_key,
+                stream_id,
+                item_id,
+                local_asset_id,
+                event_kind,
+                created_at
+            ) VALUES (?1, ?2, '4chan:w', ?3, ?4, ?5, 'rejected', 30)
+            ",
+            rusqlite::params![
+                session.id.0,
+                corpus_id.0,
+                stream_id,
+                item_id.0,
+                assets[0].id.0
+            ],
+        )
+        .expect("insert external result event");
+
+    let recent_items = store
+        .recent_selected_external_item_ids(session.id, 1)
+        .expect("load recent external items");
+    assert_eq!(recent_items, vec![item_id]);
+
+    let recent_streams = store
+        .recent_selected_external_stream_ids(session.id, 1)
+        .expect("load recent external streams");
+    assert_eq!(recent_streams, vec![stream_id]);
+
+    let recent_sources = store
+        .recent_selected_external_source_keys(session.id, 1)
+        .expect("load recent external source keys");
+    assert_eq!(recent_sources, vec!["4chan:w".to_owned()]);
+
+    assert!(
+        store
+            .external_source_recently_selected(session.id, "4chan:w", 0)
+            .expect("check recent source selection"),
+        "non-import external result events should count as recent source exposure"
+    );
+
+    let recent_visual_keys = store
+        .recent_arena_visual_keys(session.id, 2)
+        .expect("load recent arena visual keys");
+    assert_eq!(
+        recent_visual_keys,
+        vec![
+            assets[0]
+                .visual_key
+                .clone()
+                .expect("seed asset a visual key"),
+            remote_identity.visual_key,
         ]
     );
 }
@@ -1533,10 +1679,11 @@ fn rejecting_remote_tombstones_future_reposts_by_visual_identity() {
             Some(&cache_one),
         )
         .expect("upsert first item");
-    assert!(
-        !store
+    assert_eq!(
+        store
             .save_external_item_identity(first_item, &identity, &cache_one)
-            .expect("save first identity")
+            .expect("save first identity"),
+        ExternalIdentityDisposition::Active
     );
     store
         .reject_external_item(
@@ -1559,10 +1706,11 @@ fn rejecting_remote_tombstones_future_reposts_by_visual_identity() {
             Some(&cache_two),
         )
         .expect("upsert repost");
-    assert!(
+    assert_eq!(
         store
             .save_external_item_identity(repost, &identity, &cache_two)
             .expect("save repost identity"),
+        ExternalIdentityDisposition::Tombstoned,
         "repost should be pre-hidden by remote tombstone"
     );
     assert!(
@@ -1570,6 +1718,78 @@ fn rejecting_remote_tombstones_future_reposts_by_visual_identity() {
             .external_item_hidden(repost)
             .expect("load repost hidden"),
         "repost row should be hidden"
+    );
+}
+
+#[test]
+fn rejecting_remote_tombstones_matching_corpus_assets_by_visual_identity() {
+    let root = test_root("external-identity-tombstone-hides-corpus");
+    let corpus_root = root.join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+    let local_path = corpus_root.join("local.png");
+    std::fs::write(&local_path, flat_png(240, 320, [180, 120, 90])).expect("write local png");
+    let db_path = root.join("picmash.sqlite3");
+    let mut store = Store::open(&db_path).expect("open store");
+
+    let corpus_id = store.ensure_corpus_id(&corpus_root).expect("ensure corpus");
+    let embedder = OnnxEngine::disabled_for_tests();
+    store
+        .ingest_corpus(&corpus_root, corpus_id, &embedder)
+        .expect("ingest corpus");
+    let session_id = store.create_session(corpus_id).expect("create session").id;
+    let local_asset = store
+        .corpus_assets(corpus_id)
+        .expect("load corpus assets")
+        .into_iter()
+        .next()
+        .expect("corpus asset present");
+    assert!(!local_asset.hidden, "fresh local asset should be visible");
+
+    store
+        .upsert_external_source("4chan:s", "s", "4chan_board", "s", None)
+        .expect("upsert source");
+    let (stream_id, blocked) = store
+        .upsert_external_stream("4chan:s", &remote_stream(1001, 1))
+        .expect("upsert stream");
+    assert!(!blocked);
+
+    let bytes = std::fs::read(&local_path).expect("read local bytes");
+    let identity = inspect_image_bytes(&bytes).expect("inspect remote identity");
+    let cache_path = root.join("cached.png");
+    std::fs::write(&cache_path, &bytes).expect("write remote cache");
+    let item_id = store
+        .upsert_external_item(
+            "4chan:s",
+            stream_id,
+            "thread 1001",
+            &remote_item(1001, 2001, None),
+            Some(&cache_path),
+        )
+        .expect("upsert remote item");
+    assert_eq!(
+        store
+            .save_external_item_identity(item_id, &identity, &cache_path)
+            .expect("save remote identity"),
+        ExternalIdentityDisposition::Resolved(local_asset.id.clone()),
+        "matching remote should resolve onto the existing corpus asset",
+    );
+    store
+        .reject_external_item(
+            session_id,
+            corpus_id,
+            item_id,
+            Some(&local_asset.id),
+            crate::model::ExternalEventKind::Rejected,
+        )
+        .expect("reject remote item");
+
+    let reloaded = store
+        .corpus_asset(corpus_id, &local_asset.id)
+        .expect("reload tombstoned corpus asset")
+        .expect("tombstoned corpus asset present");
+    assert!(
+        reloaded.hidden,
+        "visual tombstone should hide matching corpus assets from visibility"
     );
 }
 
@@ -1604,9 +1824,12 @@ fn imported_remote_leaves_frontier_even_if_still_visible() {
             Some(&cache_path),
         )
         .expect("upsert item");
-    store
-        .save_external_item_identity(item_id, &identity, &cache_path)
-        .expect("save identity");
+    assert_eq!(
+        store
+            .save_external_item_identity(item_id, &identity, &cache_path)
+            .expect("save identity"),
+        ExternalIdentityDisposition::Active
+    );
     store
         .save_external_embedding(
             item_id,
@@ -1638,6 +1861,147 @@ fn imported_remote_leaves_frontier_even_if_still_visible() {
             .external_item_frontier_ready(item_id, "test-model")
             .expect("frontier after import"),
         "imported remote should leave frontier"
+    );
+}
+
+#[test]
+fn remote_repost_of_existing_asset_resolves_before_frontier() {
+    let root = test_root("remote-resolves-existing-asset");
+    let corpus_root = root.join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+    let db_path = root.join("picmash.sqlite3");
+    let mut store = Store::open(&db_path).expect("open store");
+
+    let corpus_id = store.ensure_corpus_id(&corpus_root).expect("ensure corpus");
+    let bytes = flat_png(256, 256, [135, 80, 210]);
+    let import_path = corpus_root.join("canonical.png");
+    std::fs::write(&import_path, &bytes).expect("write canonical import");
+    let asset_id = store
+        .ingest_external_import(corpus_id, &import_path, &bytes, 0, None)
+        .expect("ingest canonical asset");
+
+    store
+        .upsert_external_source("4chan:s", "s", "4chan_board", "s", None)
+        .expect("upsert source");
+    let (stream_id, blocked) = store
+        .upsert_external_stream("4chan:s", &remote_stream(1004, 1))
+        .expect("upsert stream");
+    assert!(!blocked);
+
+    let cache_path = root.join("remote-repost.png");
+    std::fs::write(&cache_path, &bytes).expect("write repost cache");
+    let identity = inspect_image_bytes(&bytes).expect("inspect repost identity");
+    let item_id = store
+        .upsert_external_item(
+            "4chan:s",
+            stream_id,
+            "thread 1004",
+            &remote_item(1004, 2005, None),
+            Some(&cache_path),
+        )
+        .expect("upsert repost");
+
+    assert_eq!(
+        store
+            .save_external_item_identity(item_id, &identity, &cache_path)
+            .expect("save repost identity"),
+        ExternalIdentityDisposition::Resolved(asset_id.clone())
+    );
+    store
+        .save_external_embedding(
+            item_id,
+            &EmbeddingRecord {
+                model_name: "test-model".to_owned(),
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            &cache_path,
+        )
+        .expect("save embedding");
+
+    assert_eq!(
+        store
+            .external_item_resolved_asset_id(item_id)
+            .expect("load resolved asset"),
+        Some(asset_id)
+    );
+    assert!(
+        !store
+            .external_item_frontier_ready(item_id, "test-model")
+            .expect("resolved repost frontier state"),
+        "resolved repost should never become frontier-ready"
+    );
+}
+
+#[test]
+fn local_ingest_resolves_existing_remote_visual_duplicate() {
+    let root = test_root("local-ingest-resolves-remote-duplicate");
+    let corpus_root = root.join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+    let db_path = root.join("picmash.sqlite3");
+    let mut store = Store::open(&db_path).expect("open store");
+
+    let corpus_id = store.ensure_corpus_id(&corpus_root).expect("ensure corpus");
+    store
+        .upsert_external_source("4chan:s", "s", "4chan_board", "s", None)
+        .expect("upsert source");
+    let (stream_id, blocked) = store
+        .upsert_external_stream("4chan:s", &remote_stream(1005, 1))
+        .expect("upsert stream");
+    assert!(!blocked);
+
+    let bytes = flat_png(320, 240, [75, 130, 215]);
+    let identity = inspect_image_bytes(&bytes).expect("inspect remote identity");
+    let cache_path = root.join("pending-remote.png");
+    std::fs::write(&cache_path, &bytes).expect("write pending cache");
+    let item_id = store
+        .upsert_external_item(
+            "4chan:s",
+            stream_id,
+            "thread 1005",
+            &remote_item(1005, 2006, None),
+            Some(&cache_path),
+        )
+        .expect("upsert pending remote");
+    assert_eq!(
+        store
+            .save_external_item_identity(item_id, &identity, &cache_path)
+            .expect("save pending identity"),
+        ExternalIdentityDisposition::Active
+    );
+    store
+        .save_external_embedding(
+            item_id,
+            &EmbeddingRecord {
+                model_name: "test-model".to_owned(),
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            &cache_path,
+        )
+        .expect("save pending embedding");
+    assert!(
+        store
+            .external_item_frontier_ready(item_id, "test-model")
+            .expect("frontier before local ingest"),
+        "unresolved remote should initially be frontier-ready"
+    );
+
+    let import_path = corpus_root.join("fresh-local.png");
+    std::fs::write(&import_path, &bytes).expect("write fresh local import");
+    let asset_id = store
+        .ingest_external_import(corpus_id, &import_path, &bytes, 0, None)
+        .expect("ingest local asset");
+
+    assert_eq!(
+        store
+            .external_item_resolved_asset_id(item_id)
+            .expect("resolved remote after local ingest"),
+        Some(asset_id)
+    );
+    assert!(
+        !store
+            .external_item_frontier_ready(item_id, "test-model")
+            .expect("frontier after local ingest"),
+        "local ingest should withdraw visually identical remotes from frontier"
     );
 }
 

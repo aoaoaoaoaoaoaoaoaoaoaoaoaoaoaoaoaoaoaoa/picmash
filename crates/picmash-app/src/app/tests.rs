@@ -2,7 +2,15 @@ use std::collections::HashMap;
 
 use rand::{SeedableRng, rngs::StdRng};
 
-use super::{ReadyTargetProfile, SourceReadyFrontier, external::choose_pair_source};
+use crate::config::{
+    FourChanBoardSource, FourChanContentConfig, FourChanHarvestConfig, ImportPolicy,
+    LocalDirectorySource, RemoteImageFilterConfig, SourceConfig, UpstreamSource,
+};
+
+use super::{
+    ReadyTargetProfile, SourceReadyFrontier,
+    external::{choose_pair_source, remote_source_arena_bonuses},
+};
 
 #[test]
 fn remote_ready_frontier_has_hard_cap() {
@@ -46,4 +54,38 @@ fn choose_pair_source_respects_probability_boundaries() {
         choose_pair_source::<_, &str>(&mut rng, 0.4, None, None),
         None
     );
+}
+
+#[test]
+fn local_directory_sources_do_not_get_fake_hot_thread_bonuses() {
+    let now = 1_775_765_480;
+    let local = SourceConfig {
+        weight: 1.0,
+        import_policy: ImportPolicy::NotX,
+        scan_interval_seconds: 60,
+        upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
+            root: "/tmp/picmash-local-remote".into(),
+            recurse: true,
+            filters: RemoteImageFilterConfig::default(),
+        }),
+    };
+    let network = SourceConfig {
+        weight: 1.0,
+        import_policy: ImportPolicy::NotX,
+        scan_interval_seconds: 60,
+        upstream: UpstreamSource::FourChanBoard(FourChanBoardSource {
+            board: "s".to_owned(),
+            content: FourChanContentConfig::default(),
+            harvest: FourChanHarvestConfig::default(),
+            filters: RemoteImageFilterConfig::default(),
+        }),
+    };
+
+    let local_bonuses = remote_source_arena_bonuses(&local, now, now, 3_788);
+    assert_eq!(local_bonuses.stream_size, 0.0);
+    assert_eq!(local_bonuses.freshness, 0.0);
+
+    let network_bonuses = remote_source_arena_bonuses(&network, now, now, 300);
+    assert!(network_bonuses.stream_size > 0.0);
+    assert!(network_bonuses.freshness > 0.0);
 }

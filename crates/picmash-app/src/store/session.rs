@@ -1,4 +1,5 @@
 use super::*;
+use crate::identity::VisualKey;
 
 impl Store {
     pub fn create_session(&self, corpus_id: CorpusId) -> anyhow::Result<SessionRecord> {
@@ -143,8 +144,8 @@ impl Store {
                     local_asset_id AS asset_id
                 FROM external_events
                 WHERE session_id = ?1
-                  AND event_kind = ?2
                   AND local_asset_id IS NOT NULL
+                  AND event_kind <> ?2
             )
             ORDER BY created_at DESC, source_ord ASC, id DESC, slot_ord ASC
             LIMIT ?3
@@ -152,7 +153,7 @@ impl Store {
         )?;
         let mut rows = stmt.query(params![
             session_id.0,
-            ExternalEventKind::Selected.as_str(),
+            ExternalEventKind::Imported.as_str(),
             i64::try_from(limit)?,
         ])?;
         let mut ids = Vec::with_capacity(limit);
@@ -160,6 +161,82 @@ impl Store {
             ids.push(AssetId(row.get(0)?));
         }
         Ok(ids)
+    }
+
+    pub fn recent_arena_visual_keys(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> anyhow::Result<Vec<VisualKey>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT visual_key
+            FROM (
+                SELECT
+                    c.created_at,
+                    c.id,
+                    0 AS source_ord,
+                    0 AS slot_ord,
+                    a_left.visual_key AS visual_key
+                FROM comparisons c
+                JOIN assets a_left ON a_left.id = c.left_asset_id
+                WHERE c.session_id = ?1
+                  AND a_left.visual_key IS NOT NULL
+                  AND a_left.visual_key <> ''
+                UNION ALL
+                SELECT
+                    c.created_at,
+                    c.id,
+                    0 AS source_ord,
+                    1 AS slot_ord,
+                    a_right.visual_key AS visual_key
+                FROM comparisons c
+                JOIN assets a_right ON a_right.id = c.right_asset_id
+                WHERE c.session_id = ?1
+                  AND a_right.visual_key IS NOT NULL
+                  AND a_right.visual_key <> ''
+                UNION ALL
+                SELECT
+                    e.created_at,
+                    e.id,
+                    1 AS source_ord,
+                    0 AS slot_ord,
+                    a_local.visual_key AS visual_key
+                FROM external_events e
+                JOIN assets a_local ON a_local.id = e.local_asset_id
+                WHERE e.session_id = ?1
+                  AND e.local_asset_id IS NOT NULL
+                  AND e.event_kind <> ?2
+                  AND a_local.visual_key IS NOT NULL
+                  AND a_local.visual_key <> ''
+                UNION ALL
+                SELECT
+                    e.created_at,
+                    e.id,
+                    1 AS source_ord,
+                    1 AS slot_ord,
+                    i.visual_key AS visual_key
+                FROM external_events e
+                JOIN external_items i ON i.id = e.item_id
+                WHERE e.session_id = ?1
+                  AND e.event_kind <> ?2
+                  AND i.visual_key IS NOT NULL
+                  AND i.visual_key <> ''
+            )
+            ORDER BY created_at DESC, source_ord ASC, id DESC, slot_ord ASC
+            LIMIT ?3
+            ",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.0,
+            ExternalEventKind::Imported.as_str(),
+            i64::try_from(limit)?,
+        ])?;
+        let mut visual_keys = Vec::with_capacity(limit);
+        while let Some(row) = rows.next()? {
+            visual_keys.push(VisualKey(row.get(0)?));
+        }
+        Ok(visual_keys)
     }
 
     pub fn session_asset_offsets(
