@@ -1,5 +1,7 @@
 use super::*;
+use std::time::Instant;
 use time::OffsetDateTime;
+use tracing::{field, info_span, warn};
 
 const MAINTENANCE_IDLE_POLL_SECONDS: u64 = 2;
 const IDENTITY_REVIEW_REFRESH_DEBOUNCE_SECONDS: i64 = 8;
@@ -7,6 +9,7 @@ const BOOTSTRAP_MAINTENANCE_BATCH: usize = 32;
 const CORPUS_FACE_SCAN_BATCH: usize = 8;
 const CORPUS_FACE_RECOGNITION_BATCH: usize = 32;
 const CORPUS_QUALITY_FEATURE_BATCH: usize = 32;
+const SLOW_MAINTENANCE_JOB_MS: u128 = 150;
 
 impl AppState {
     pub fn maintenance_idle_poll(&self) -> Duration {
@@ -140,7 +143,23 @@ impl AppState {
         let Some(job) = claimed else {
             return Ok(false);
         };
+        let started = Instant::now();
+        let span = info_span!(
+            "maintenance.job",
+            kind = job.kind.as_str(),
+            key = %job.key,
+            priority = job.priority.as_i64(),
+            generation = job.generation,
+            elapsed_ms = field::Empty,
+            retry_at = field::Empty,
+        );
+        let _entered = span.enter();
         let result = self.execute_maintenance_job(&job);
+        let elapsed_ms = started.elapsed().as_millis();
+        span.record("elapsed_ms", field::display(elapsed_ms));
+        if elapsed_ms > SLOW_MAINTENANCE_JOB_MS {
+            warn!(elapsed_ms, "slow maintenance job");
+        }
         match result {
             Ok(()) => {
                 let job = job.clone();
@@ -153,6 +172,7 @@ impl AppState {
                 let job = job.clone();
                 let job_for_write = job.clone();
                 let error_message = format!("{error:#}");
+                span.record("retry_at", field::display(retry_at));
                 self.with_write_store("fail_maintenance_job", move |store| {
                     store.fail_maintenance_job(&job_for_write, &error_message, retry_at)
                 })?;

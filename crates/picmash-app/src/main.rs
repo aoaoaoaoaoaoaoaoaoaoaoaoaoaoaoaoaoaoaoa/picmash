@@ -8,15 +8,17 @@ use directories::ProjectDirs;
 use picmash_app::{
     app::{AppState, RuntimeState, StartupSummary},
     config::AppConfig,
-    web,
+    telemetry, web,
 };
 use tokio::net::TcpListener;
-use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
+use tracing::{Instrument, error, info, info_span};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let boot_id = telemetry::fresh_boot_id();
+    telemetry::install_boot_id(boot_id.clone())?;
+    telemetry::init_subscriber();
     let dirs = ProjectDirs::from("moe", "swarm", "picmash")
         .context("resolving XDG directories for picmash")?;
     let (mut config, config_path, mut config_digest) = AppConfig::load_or_init(dirs.config_dir())?;
@@ -32,25 +34,26 @@ async fn main() -> anyhow::Result<()> {
         config_digest = config.write(&config_path)?;
     }
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .compact()
-        .init();
-
     let addr: SocketAddr = config
         .bind_addr()
         .parse()
         .with_context(|| format!("parsing runtime.bind_addr `{}`", config.bind_addr()))?;
     let runtime = Arc::new(RuntimeState::loading());
     let app = web::router(runtime.clone());
+    let boot_id_text = boot_id.0.clone();
+    let boot_span = info_span!(
+        "boot",
+        boot_id = %boot_id_text,
+        root = %root_path.display(),
+        bind_addr = %addr,
+    );
+    let _boot_guard = boot_span.enter();
 
-    info!(root = %root_path.display(), "booting picmash");
+    info!(boot_id = %boot_id.0, root = %root_path.display(), "booting picmash");
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding server on {addr}"))?;
-    info!(url = %format!("http://{addr}"), "picmash bootstrap shell ready");
+    info!(boot_id = %boot_id.0, url = %format!("http://{addr}"), "picmash bootstrap shell ready");
 
     let boot_runtime = runtime.clone();
     tokio::spawn(async move {
@@ -74,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
                         embedded_assets,
                     }) => {
                         info!(
+                            boot_id = %boot_id.0,
                             root = %root_path.display(),
                             corpus_id = corpus_id.0,
                             session_id = session_id.0,
@@ -85,27 +89,28 @@ async fn main() -> anyhow::Result<()> {
                         spawn_background_maintenance_loop(state.clone());
                         state.schedule_corpus_ingest();
                         state.schedule_bootstrap_maintenance();
-                        info!(url = %format!("http://{addr}"), "picmash ready");
+                        info!(boot_id = %boot_id.0, url = %format!("http://{addr}"), "picmash ready");
                     }
                     Err(error) => {
                         let message = format!("{error:#}");
-                        error!(root = %root_path.display(), error = %message, "picmash boot summary failed");
+                        error!(boot_id = %boot_id.0, root = %root_path.display(), error = %message, "picmash boot summary failed");
                         boot_runtime.install_failed(message);
                     }
                 }
             }
             Ok(Err(error)) => {
                 let message = format!("{error:#}");
-                error!(root = %root_path.display(), error = %message, "picmash boot failed");
+                error!(boot_id = %boot_id.0, root = %root_path.display(), error = %message, "picmash boot failed");
                 boot_runtime.install_failed(message);
             }
             Err(error) => {
                 let message = format!("joining picmash boot task: {error:#}");
-                error!(root = %root_path.display(), error = %message, "picmash boot task crashed");
+                error!(boot_id = %boot_id.0, root = %root_path.display(), error = %message, "picmash boot task crashed");
                 boot_runtime.install_failed(message);
             }
         }
-    });
+    }
+    .instrument(info_span!("boot.load_state", boot_id = %boot_id_text)));
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -121,7 +126,10 @@ fn spawn_background_maintenance_loop(state: Arc<AppState>) {
         let poll = u64::try_from(state.maintenance_idle_poll().whole_seconds().max(1)).unwrap_or(2);
         loop {
             let worker = state.clone();
-            match tokio::task::spawn_blocking(move || worker.devour_one_maintenance_job()).await {
+            match tokio::task::spawn_blocking(move || worker.devour_one_maintenance_job())
+                .instrument(info_span!("maintenance.loop.tick"))
+                .await
+            {
                 Ok(Ok(true)) => continue,
                 Ok(Ok(false)) => {}
                 Ok(Err(error)) => {
@@ -142,16 +150,34 @@ fn spawn_background_maintenance_loop(state: Arc<AppState>) {
 fn spawn_external_source_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
         let initial = state.clone();
-        tokio::task::spawn_blocking(move || initial.refresh_external_sources_if_due(false))
+        match tokio::task::spawn_blocking(move || initial.refresh_external_sources_if_due(false))
+            .instrument(info_span!("external.refresh.loop.initial"))
             .await
-            .ok();
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                error!(error = %format!("{error:#}"), "initial external refresh failed");
+            }
+            Err(error) => {
+                error!(error = %format!("{error:#}"), "initial external refresh task crashed");
+            }
+        }
         let pulse = u64::try_from(state.external_scan_pulse().whole_seconds().max(5)).unwrap_or(20);
         loop {
             tokio::time::sleep(StdDuration::from_secs(pulse)).await;
             let state = state.clone();
-            tokio::task::spawn_blocking(move || state.refresh_external_sources_if_due(false))
+            match tokio::task::spawn_blocking(move || state.refresh_external_sources_if_due(false))
+                .instrument(info_span!("external.refresh.loop.tick"))
                 .await
-                .ok();
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!(error = %format!("{error:#}"), "external refresh loop failed");
+                }
+                Err(error) => {
+                    error!(error = %format!("{error:#}"), "external refresh task crashed");
+                }
+            }
         }
     });
 }
@@ -162,9 +188,18 @@ fn spawn_config_reload_loop(state: Arc<AppState>) {
         loop {
             tokio::time::sleep(StdDuration::from_secs(pulse)).await;
             let state = state.clone();
-            tokio::task::spawn_blocking(move || state.reload_config_if_changed())
+            match tokio::task::spawn_blocking(move || state.reload_config_if_changed())
+                .instrument(info_span!("config.reload.tick"))
                 .await
-                .ok();
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!(error = %format!("{error:#}"), "config reload loop failed");
+                }
+                Err(error) => {
+                    error!(error = %format!("{error:#}"), "config reload task crashed");
+                }
+            }
         }
     });
 }

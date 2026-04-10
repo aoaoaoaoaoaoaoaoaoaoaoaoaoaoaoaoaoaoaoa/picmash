@@ -1,4 +1,5 @@
 use super::*;
+use tracing::{error, info_span};
 
 pub(super) fn log_site_loaded(route: &'static str) {
     if SITE_LOAD_LOGGED
@@ -11,6 +12,22 @@ pub(super) fn log_site_loaded(route: &'static str) {
 
 pub(super) async fn runtime_status(State(state): State<SharedRuntimeState>) -> Response {
     no_store_response(Json(state.snapshot()).into_response())
+}
+
+pub(super) async fn client_event(
+    Json(report): Json<crate::telemetry::ClientAnomalyReport>,
+) -> WebResult<Response> {
+    let _span = info_span!(
+        "client.anomaly",
+        kind = report.kind.as_str(),
+        page_id = %report.page_id.as_ref().map_or("", |id| id.0.as_str()),
+        interaction_id = %report.interaction_id.as_ref().map_or("", |id| id.0.as_str()),
+    )
+    .entered();
+    crate::telemetry::log_client_anomaly(&report);
+    Ok(no_store_response(
+        Json(serde_json::json!({ "ok": true })).into_response(),
+    ))
 }
 
 pub(super) async fn frontend_javascript() -> Response {
@@ -128,6 +145,7 @@ where
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        error!(error = %format!("{:#}", self.0), "web request failed");
         let markup = layout(
             "empty-page",
             html! {

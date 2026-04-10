@@ -3,7 +3,11 @@ use std::{
     fmt,
     marker::PhantomData,
     sync::mpsc::{self, Receiver, SyncSender},
+    time::Instant,
 };
+use tracing::{Span, field, info_span, warn};
+
+const SLOW_WRITER_COMMAND_MS: u128 = 25;
 
 trait ErasedWriterCommand: Send {
     fn label(&self) -> &'static str;
@@ -45,7 +49,9 @@ where
 }
 
 struct WriterRequest {
+    command_id: String,
     command: Box<dyn ErasedWriterCommand>,
+    parent_span: Span,
     reply: SyncSender<anyhow::Result<Box<dyn Any + Send>>>,
 }
 
@@ -104,9 +110,12 @@ impl DbWriter {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let command =
             Box::new(ClosureCommand::<T, F>::forge(label, f)) as Box<dyn ErasedWriterCommand>;
+        let command_id = crate::telemetry::fresh_writer_command_id();
         self.tx
             .send(WriterMessage::Execute(WriterRequest {
+                command_id,
                 command,
+                parent_span: Span::current(),
                 reply: reply_tx,
             }))
             .map_err(|_| anyhow::anyhow!("sending writer command `{label}`"))?;
@@ -138,12 +147,38 @@ fn drain_writer_loop(store: &mut Store, rx: Receiver<WriterMessage>) {
     while let Ok(message) = rx.recv() {
         match message {
             WriterMessage::Execute(request) => {
-                let label = request.command.label();
-                let result = request
-                    .command
-                    .apply_box(store)
-                    .map_err(|error| anyhow::anyhow!("writer command `{label}` failed: {error:#}"));
-                let _ = request.reply.send(result);
+                let WriterRequest {
+                    command_id,
+                    command,
+                    parent_span,
+                    reply,
+                } = request;
+                let label = command.label();
+                let started = Instant::now();
+                let span = info_span!(
+                    parent: &parent_span,
+                    "writer.commit",
+                    writer_cmd_id = %command_id,
+                    label,
+                    elapsed_ms = field::Empty,
+                );
+                let result = {
+                    let _entered = span.enter();
+                    command.apply_box(store).map_err(|error| {
+                        anyhow::anyhow!("writer command `{label}` failed: {error:#}")
+                    })
+                };
+                let elapsed_ms = started.elapsed().as_millis();
+                span.record("elapsed_ms", field::display(elapsed_ms));
+                if elapsed_ms > SLOW_WRITER_COMMAND_MS {
+                    let _entered = span.enter();
+                    warn!(elapsed_ms, "slow writer command");
+                }
+                if let Err(error) = &result {
+                    let _entered = span.enter();
+                    warn!(elapsed_ms, error = %format!("{error:#}"), "writer command failed");
+                }
+                let _ = reply.send(result);
             }
             WriterMessage::Shutdown => break,
         }

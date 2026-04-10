@@ -1,8 +1,10 @@
 use super::*;
 use crate::identity::VisualKey;
 use std::collections::HashSet;
+use tracing::{Instrument, info_span};
 
 pub(super) async fn arena_root(State(state): State<SharedRuntimeState>) -> WebResult<Response> {
+    let _span = info_span!("arena.render.root").entered();
     let state = match ready_app_or_snapshot(&state) {
         Ok(state) => state,
         Err(snapshot) => return Ok(boot_response(snapshot)),
@@ -38,6 +40,14 @@ pub(super) async fn arena(
     State(state): State<SharedRuntimeState>,
     Path((left_id, right_id)): Path<(String, String)>,
 ) -> WebResult<Response> {
+    let pair_href = format!("/arena/{left_id}/{right_id}");
+    let _span = info_span!(
+        "arena.render.pair",
+        pair_href = %pair_href,
+        left_handle = %left_id,
+        right_handle = %right_id,
+    )
+    .entered();
     let state = match ready_app_or_snapshot(&state) {
         Ok(state) => state,
         Err(snapshot) => return Ok(boot_response(snapshot)),
@@ -95,38 +105,56 @@ pub(super) async fn vote(
     headers: HeaderMap,
     Form(form): Form<VoteForm>,
 ) -> WebResult<Response> {
-    let Some(state) = state.ready_app() else {
-        return Ok(service_unavailable_response());
-    };
-    let left = ArenaHandle::from_str(&form.left_id).map_err(anyhow::Error::msg)?;
-    let right = ArenaHandle::from_str(&form.right_id).map_err(anyhow::Error::msg)?;
-    let winner = ArenaHandle::from_str(&form.winner_id).map_err(anyhow::Error::msg)?;
-    if let Some(response) = stale_arena_action_response(&state, [&left, &right, &winner])? {
-        return Ok(response);
+    let span = info_span!(
+        "arena.action.vote",
+        left_handle = %form.left_id,
+        right_handle = %form.right_id,
+        winner_handle = %form.winner_id,
+        accept_json = %accepts_json(&headers),
+    );
+    async move {
+        let Some(state) = state.ready_app() else {
+            return Ok(service_unavailable_response());
+        };
+        let left = ArenaHandle::from_str(&form.left_id).map_err(anyhow::Error::msg)?;
+        let right = ArenaHandle::from_str(&form.right_id).map_err(anyhow::Error::msg)?;
+        let winner = ArenaHandle::from_str(&form.winner_id).map_err(anyhow::Error::msg)?;
+        if let Some(response) = stale_arena_action_response(&state, [&left, &right, &winner])? {
+            return Ok(response);
+        }
+        let refresh_state = state.clone();
+        let target = tokio::task::spawn_blocking(move || state.vote(&left, &right, &winner))
+            .await
+            .map_err(|error| anyhow::anyhow!("joining arena vote task: {error:#}"))??;
+        if !refresh_state.quality_refresh_is_inline()? {
+            refresh_state.schedule_quality_model_refresh();
+        }
+        if headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("application/json"))
+        {
+            return Ok(no_store_response(
+                axum::Json(serde_json::json!({ "ok": true })).into_response(),
+            ));
+        }
+        Ok(Redirect::to(&target.href()).into_response())
     }
-    let refresh_state = state.clone();
-    let target = tokio::task::spawn_blocking(move || state.vote(&left, &right, &winner))
-        .await
-        .map_err(|error| anyhow::anyhow!("joining arena vote task: {error:#}"))??;
-    if !refresh_state.quality_refresh_is_inline()? {
-        refresh_state.schedule_quality_model_refresh();
-    }
-    if headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("application/json"))
-    {
-        return Ok(no_store_response(
-            axum::Json(serde_json::json!({ "ok": true })).into_response(),
-        ));
-    }
-    Ok(Redirect::to(&target.href()).into_response())
+    .instrument(span)
+    .await
 }
 
 pub(super) async fn api_arena_next(
     State(state): State<SharedRuntimeState>,
     Query(query): Query<ArenaNextQuery>,
 ) -> WebResult<Response> {
+    let excluded_visual_count = query.exclude_visual_keys().len();
+    let _span = info_span!(
+        "arena.prefetch.next",
+        anchor = %query.anchor.as_deref().unwrap_or(""),
+        excluded_visual_count,
+    )
+    .entered();
     let Some(state) = state.ready_app() else {
         return Ok(service_unavailable_response());
     };
@@ -153,6 +181,15 @@ pub(super) async fn rotate(
     Path((left_id, right_id)): Path<(String, String)>,
     Form(form): Form<RotateForm>,
 ) -> WebResult<Response> {
+    let pair_href = format!("/arena/{left_id}/{right_id}");
+    let _span = info_span!(
+        "arena.action.rotate",
+        pair_href = %pair_href,
+        asset_handle = %form.asset_id,
+        direction = form.direction,
+        next_rotation = form._next_rotation.unwrap_or_default(),
+    )
+    .entered();
     let Some(state) = state.ready_app() else {
         return Ok(service_unavailable_response());
     };
@@ -172,6 +209,14 @@ pub(super) async fn heart(
     Path((left_id, right_id)): Path<(String, String)>,
     Form(form): Form<HeartAssetForm>,
 ) -> WebResult<Response> {
+    let pair_href = format!("/arena/{left_id}/{right_id}");
+    let _span = info_span!(
+        "arena.action.heart",
+        pair_href = %pair_href,
+        asset_handle = %form.asset_id,
+        active = form.active,
+    )
+    .entered();
     let Some(state) = state.ready_app() else {
         return Ok(service_unavailable_response());
     };
@@ -206,6 +251,16 @@ pub(super) async fn hide(
     headers: HeaderMap,
     Form(form): Form<HideForm>,
 ) -> WebResult<Response> {
+    let pair_href = format!("/arena/{left_id}/{right_id}");
+    let _span = info_span!(
+        "arena.action.hide",
+        pair_href = %pair_href,
+        asset_handle = %form.asset_id,
+        cluster_size = form.cluster_ids.len(),
+        hide = form.hide,
+        accept_json = %accepts_json(&headers),
+    )
+    .entered();
     let Some(state) = state.ready_app() else {
         return Ok(service_unavailable_response());
     };
@@ -242,6 +297,14 @@ pub(super) async fn veto_thread(
     headers: HeaderMap,
     Form(form): Form<HandleForm>,
 ) -> WebResult<Response> {
+    let pair_href = format!("/arena/{left_id}/{right_id}");
+    let _span = info_span!(
+        "arena.action.veto_thread",
+        pair_href = %pair_href,
+        asset_handle = %form.asset_id,
+        accept_json = %accepts_json(&headers),
+    )
+    .entered();
     let Some(state) = state.ready_app() else {
         return Ok(service_unavailable_response());
     };
@@ -270,6 +333,15 @@ pub(super) async fn lock_thread(
     headers: HeaderMap,
     Form(form): Form<ThreadLockForm>,
 ) -> WebResult<Response> {
+    let pair_href = format!("/arena/{left_id}/{right_id}");
+    let _span = info_span!(
+        "arena.action.lock_thread",
+        pair_href = %pair_href,
+        asset_handle = %form.asset_id,
+        active = form.active,
+        accept_json = %accepts_json(&headers),
+    )
+    .entered();
     let Some(state) = state.ready_app() else {
         return Ok(service_unavailable_response());
     };
@@ -320,6 +392,13 @@ impl ArenaNextQuery {
             })
             .unwrap_or_default()
     }
+}
+
+fn accepts_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/json"))
 }
 
 fn arena_pair_local_anchor(pair: &crate::model::ArenaPair) -> Option<&AssetId> {
