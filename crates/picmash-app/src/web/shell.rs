@@ -269,6 +269,48 @@ fn shared_runtime_script_block() -> Markup {
             (PreEscaped(
                 r#"
                 (() => {
+                  const freshTelemetryId = (prefix) => {
+                    const uuid = globalThis.crypto?.randomUUID?.();
+                    if (uuid) return `${prefix}_${uuid}`;
+                    return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+                  };
+                  const pageId = freshTelemetryId("page");
+                  const telemetry = {
+                    pageId,
+                    nextInteractionId(kind) {
+                      return freshTelemetryId(kind || "interaction");
+                    },
+                    headers({ headers, interactionId, arenaEpoch } = {}) {
+                      const values = new Headers(headers || {});
+                      values.set("x-picmash-page-id", pageId);
+                      if (interactionId) values.set("x-picmash-interaction-id", interactionId);
+                      if (arenaEpoch !== undefined && arenaEpoch !== null && `${arenaEpoch}` !== "") {
+                        values.set("x-picmash-arena-epoch", `${arenaEpoch}`);
+                      }
+                      return values;
+                    },
+                    reportClientEvent(kind, payload = {}) {
+                      const body = JSON.stringify({
+                        kind,
+                        page_id: pageId,
+                        ...payload,
+                      });
+                      try {
+                        const beacon = new Blob([body], { type: "application/json" });
+                        if (globalThis.navigator?.sendBeacon?.("/api/client-event", beacon)) return;
+                      } catch (_error) {}
+                      fetch("/api/client-event", {
+                        method: "POST",
+                        body,
+                        credentials: "same-origin",
+                        cache: "no-store",
+                        keepalive: true,
+                        headers: { "content-type": "application/json" },
+                      }).catch(() => {});
+                    },
+                  };
+                  window.__picmashTelemetry = telemetry;
+
                   const overlay = document.querySelector("[data-reconnect-overlay]");
                   const overlayMessage = overlay?.querySelector("[data-reconnect-message]");
                   const loadingPage = document.body.classList.contains("loading-page");
@@ -290,6 +332,7 @@ fn shared_runtime_script_block() -> Markup {
                         method: "GET",
                         credentials: "same-origin",
                         cache: "no-store",
+                        headers: telemetry.headers(),
                       });
                       if (!response.ok) throw new Error(`runtime status ${response.status}`);
                       const status = await response.json();
@@ -367,10 +410,18 @@ pub(super) fn script_block() -> Markup {
                   let queuedPreservedRequest = null;
                   let isTransitioning = false;
                   let isActionPending = false;
+                  const telemetry = window.__picmashTelemetry || null;
 
                   const layerStage = (layer) => layer?.querySelector(".arena-stage") ?? null;
                   const layerImages = (layer) =>
                     Array.from(layer?.querySelectorAll(".vote-surface .arena-image") ?? []);
+                  const layerRole = (layer) => {
+                    if (!layer) return "";
+                    if (layer === currentLayer) return "current";
+                    if (layer === lookaheadLayer) return "lookahead";
+                    if (layer === preservedLookaheadLayer) return "preserved_lookahead";
+                    return "unknown";
+                  };
                   const eventElement = (event) =>
                     event.target instanceof Element ? event.target : event.target?.parentElement ?? null;
                   const currentVoteForms = () =>
@@ -380,6 +431,25 @@ pub(super) fn script_block() -> Markup {
                   const currentVetoThreadForms = () =>
                     Array.from(currentLayer?.querySelectorAll(".arena-veto-thread-form") ?? []);
                   const arenaAdvancePolicy = (form) => form.dataset.arenaAdvance || "";
+                  const currentPairHref = () => currentLayer?.dataset.href || window.location.pathname;
+                  const telemetryInteractionId = (prefix) =>
+                    telemetry?.nextInteractionId?.(prefix || "arena") || "";
+                  const telemetryHeaders = (interactionId, headers) =>
+                    telemetry?.headers?.({
+                      headers,
+                      interactionId,
+                      arenaEpoch: preparedEpoch,
+                    }) || new Headers(headers || {});
+                  const reportArenaAnomaly = (kind, payload = {}) => {
+                    telemetry?.reportClientEvent?.(kind, {
+                      pair_href: currentPairHref(),
+                      current_href: currentLayer?.dataset.href || "",
+                      lookahead_href: lookaheadLayer?.dataset.href || "",
+                      preserved_href: preservedLookaheadLayer?.dataset.href || "",
+                      arena_epoch: preparedEpoch,
+                      ...payload,
+                    });
+                  };
                   const parseVisualKeys = (value) =>
                     (value || "")
                       .split(",")
@@ -544,6 +614,10 @@ pub(super) fn script_block() -> Markup {
                         image.dataset.failed = "1";
                         image.dataset.settled = "1";
                         image.classList.remove("is-ready");
+                        reportArenaAnomaly("arena_image_error", {
+                          layer_role: layerRole(layer),
+                          image_src: image.currentSrc || image.getAttribute("src") || "",
+                        });
                         failed = true;
                         remaining -= 1;
                         if (remaining <= 0) resolve(false);
@@ -599,7 +673,14 @@ pub(super) fn script_block() -> Markup {
 
                   const seedPreparedLayer = async (layer, payload, options = {}) => {
                     const stage = parseStageMarkup(payload.html);
-                    if (!layer || !stage) return false;
+                    if (!layer || !stage) {
+                      reportArenaAnomaly("arena_prefetch_payload_rejected", {
+                        interaction_id: options.interactionId || "",
+                        layer_role: layerRole(layer),
+                        pair_href: payload?.href || currentPairHref(),
+                      });
+                      return false;
+                    }
                     transplantSettledArenaImages(options.preserveImagesFromLayer, stage);
                     layer.replaceChildren(stage);
                     layer.dataset.href = payload.href || "";
@@ -614,7 +695,13 @@ pub(super) fn script_block() -> Markup {
                     const refreshed = await seedPreparedLayer(currentLayer, payload, {
                       preserveImagesFromLayer: currentLayer,
                     });
-                    if (!refreshed) return false;
+                    if (!refreshed) {
+                      reportArenaAnomaly("arena_refresh_current_failed", {
+                        pair_href: payload.href,
+                        layer_role: "current",
+                      });
+                      return false;
+                    }
                     if (!preservedLayerAnchorMatchesCurrent()) {
                       clearPreparedLayer(preservedLookaheadLayer);
                       preservedLookaheadReady = false;
@@ -659,29 +746,42 @@ pub(super) fn script_block() -> Markup {
                     await refillPreservedLookaheadFromReserve();
                   };
 
-                  const fetchArenaPayload = async (url) => {
+                  const fetchArenaPayload = async (url, interactionId) => {
                     const response = await fetch(url, {
                       credentials: "same-origin",
                       cache: "no-store",
+                      headers: telemetryHeaders(interactionId),
                     });
                     if (!response.ok) throw new Error(`arena prefetch failed: ${response.status}`);
                     const payload = await response.json();
-                    return payload.empty ? null : payload;
+                    if (payload.empty) return null;
+                    if (!payload?.href || !payload?.html) {
+                      reportArenaAnomaly("arena_prefetch_payload_rejected", {
+                        interaction_id: interactionId || "",
+                        pair_href: payload?.href || url,
+                      });
+                      return null;
+                    }
+                    return payload;
                   };
 
                   const prefetchLookahead = async () => {
                     const epoch = preparedEpoch;
                     try {
                       lookaheadReady = false;
+                      const interactionId = telemetryInteractionId("arena-prefetch");
                       const payload = await fetchArenaPayload(
                         arenaPrefetchUrl("/api/arena/next", collectExcludedVisualKeys(false)),
+                        interactionId,
                       );
                       if (epoch !== preparedEpoch) return;
                       if (!payload) {
                         clearPreparedLayer(lookaheadLayer);
                         return;
                       }
-                      const seeded = await seedPreparedLayer(lookaheadLayer, payload);
+                      const seeded = await seedPreparedLayer(lookaheadLayer, payload, {
+                        interactionId,
+                      });
                       if (epoch !== preparedEpoch) return;
                       lookaheadReady = seeded;
                     } catch (error) {
@@ -702,11 +802,13 @@ pub(super) fn script_block() -> Markup {
                       return;
                     }
                     try {
+                      const interactionId = telemetryInteractionId("arena-prefetch");
                       const payload = await fetchArenaPayload(
                         arenaPrefetchUrl(
                           `/api/arena/next?anchor=${encodeURIComponent(anchor)}`,
                           collectExcludedVisualKeys(true),
                         ),
+                        interactionId,
                       );
                       if (epoch !== preparedEpoch) return;
                       if (!payload) {
@@ -716,6 +818,7 @@ pub(super) fn script_block() -> Markup {
                       const seeded = await seedPreparedLayer(
                         preservedLookaheadLayer,
                         payload,
+                        { interactionId },
                       );
                       if (epoch !== preparedEpoch) return;
                       preservedLookaheadReady = seeded;
@@ -737,8 +840,10 @@ pub(super) fn script_block() -> Markup {
                         epoch === preparedEpoch &&
                         queuedLookaheadPayloads.length < PREFETCH_RESERVE_DEPTH
                       ) {
+                        const interactionId = telemetryInteractionId("arena-prefetch");
                         const payload = await fetchArenaPayload(
                           arenaPrefetchUrl("/api/arena/next", collectExcludedVisualKeys(false)),
+                          interactionId,
                         );
                         if (epoch !== preparedEpoch) return;
                         if (!payload) return;
@@ -785,11 +890,13 @@ pub(super) fn script_block() -> Markup {
                         queuedPreservedAnchor === anchor &&
                         queuedPreservedPayloads.length < PREFETCH_RESERVE_DEPTH
                       ) {
+                        const interactionId = telemetryInteractionId("arena-prefetch");
                         const payload = await fetchArenaPayload(
                           arenaPrefetchUrl(
                             `/api/arena/next?anchor=${encodeURIComponent(anchor)}`,
                             collectExcludedVisualKeys(true),
                           ),
+                          interactionId,
                         );
                         if (epoch !== preparedEpoch || queuedPreservedAnchor !== anchor) return;
                         if (!payload) return;
@@ -920,12 +1027,14 @@ pub(super) fn script_block() -> Markup {
                     const image = frame?.querySelector(".arena-image");
                     if (!image) return;
                     const body = new URLSearchParams(new FormData(form));
+                    const interactionId = telemetryInteractionId("arena-rotate");
                     try {
                       const response = await fetch(form.action, {
                         method: "POST",
                         body,
                         credentials: "same-origin",
                         cache: "no-store",
+                        headers: telemetryHeaders(interactionId),
                       });
                       if (!response.ok) throw new Error(`rotate failed: ${response.status}`);
                       const nextRotation = body.get("next_rotation");
@@ -944,7 +1053,12 @@ pub(super) fn script_block() -> Markup {
 
                   const promotePreparedLayer = async (incoming, bufferClass) => {
                     const outgoing = currentLayer;
-                    if (!outgoing || !incoming || !incoming.dataset.href) return false;
+                    if (!outgoing || !incoming || !incoming.dataset.href) {
+                      reportArenaAnomaly("arena_promotion_failed", {
+                        layer_role: bufferClass === "is-lookahead" ? "lookahead" : "preserved_lookahead",
+                      });
+                      return false;
+                    }
                     isTransitioning = true;
                     arenaShell.classList.add("is-transitioning");
                     incoming.classList.remove("is-hidden", "is-lookahead", "is-preserved-lookahead");
@@ -1048,6 +1162,9 @@ pub(super) fn script_block() -> Markup {
                         "",
                         currentLayer.dataset.href || window.location.pathname,
                       );
+                      reportArenaAnomaly("arena_salvage_current_from_hidden", {
+                        layer_role: bufferClass === "is-lookahead" ? "lookahead" : "preserved_lookahead",
+                      });
                       return true;
                     };
                     return (
@@ -1104,12 +1221,13 @@ pub(super) fn script_block() -> Markup {
                         advancePolicy === "buffered-preserve"
                       ) {
                         const usePreservedLookahead = advancePolicy === "buffered-preserve";
+                        const interactionId = telemetryInteractionId("arena-action");
                         const sendAction = fetch(form.action, {
                           method: "POST",
                           body,
                           credentials: "same-origin",
                           cache: "no-store",
-                          headers: { Accept: "application/json" },
+                          headers: telemetryHeaders(interactionId, { Accept: "application/json" }),
                         });
                         const ready = await ensurePreparedLookahead(usePreservedLookahead);
                         if (ready) {
@@ -1146,11 +1264,21 @@ pub(super) fn script_block() -> Markup {
                             payload,
                           );
                           if (!seeded) {
+                            reportArenaAnomaly("arena_promotion_failed", {
+                              interaction_id: interactionId,
+                              pair_href: payload.href,
+                              layer_role: usePreservedLookahead ? "preserved_lookahead" : "lookahead",
+                            });
                             window.location.assign(payload.href);
                             return;
                           }
                           const promoted = await promoteBufferedPolicy(usePreservedLookahead);
                           if (!promoted) {
+                            reportArenaAnomaly("arena_promotion_failed", {
+                              interaction_id: interactionId,
+                              pair_href: payload.href,
+                              layer_role: usePreservedLookahead ? "preserved_lookahead" : "lookahead",
+                            });
                             window.location.assign(payload.href);
                           }
                         } catch (error) {
@@ -1162,6 +1290,7 @@ pub(super) fn script_block() -> Markup {
                         return;
                       }
                       const epoch = invalidatePreparedArena();
+                      const interactionId = telemetryInteractionId("arena-action");
                       isActionPending = true;
                       try {
                         const response = await fetch(form.action, {
@@ -1169,7 +1298,7 @@ pub(super) fn script_block() -> Markup {
                           body,
                           credentials: "same-origin",
                           cache: "no-store",
-                          headers: { Accept: "application/json" },
+                          headers: telemetryHeaders(interactionId, { Accept: "application/json" }),
                         });
                         if (!response.ok) {
                           throw new Error(`arena action failed: ${response.status}`);
@@ -1183,6 +1312,10 @@ pub(super) fn script_block() -> Markup {
                         if (advancePolicy === "refresh-current") {
                           const refreshed = await refreshCurrentLayer(payload);
                           if (!refreshed) {
+                            reportArenaAnomaly("arena_refresh_current_failed", {
+                              interaction_id: interactionId,
+                              pair_href: payload.href,
+                            });
                             window.location.assign(payload.href);
                           }
                           return;
@@ -1191,11 +1324,21 @@ pub(super) fn script_block() -> Markup {
                         if (epoch !== preparedEpoch) return;
                         lookaheadReady = seeded;
                         if (!seeded) {
+                          reportArenaAnomaly("arena_promotion_failed", {
+                            interaction_id: interactionId,
+                            pair_href: payload.href,
+                            layer_role: "lookahead",
+                          });
                           window.location.assign(payload.href);
                           return;
                         }
                         const promoted = await promoteLookahead();
                         if (!promoted) {
+                          reportArenaAnomaly("arena_promotion_failed", {
+                            interaction_id: interactionId,
+                            pair_href: payload.href,
+                            layer_role: "lookahead",
+                          });
                           window.location.assign(payload.href);
                         }
                       } catch (error) {
@@ -1258,8 +1401,17 @@ pub(super) fn script_block() -> Markup {
                     void refillPreservedLookaheadFromReserve();
                   }
 
+                  if (!layerImages(currentLayer).length) {
+                    reportArenaAnomaly("arena_current_layer_empty", {
+                      layer_role: "current",
+                    });
+                  }
+
                   primeLayer(currentLayer).then((primed) => {
                     if (!primed) {
+                      reportArenaAnomaly("arena_current_layer_empty", {
+                        layer_role: "current",
+                      });
                       window.location.assign(currentLayer?.dataset.href || window.location.pathname);
                       return;
                     }

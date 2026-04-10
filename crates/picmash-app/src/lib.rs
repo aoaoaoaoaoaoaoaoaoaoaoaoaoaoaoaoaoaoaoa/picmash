@@ -15,5 +15,6 @@ pub mod quality;
 pub mod quality_features;
 pub mod sources;
 pub mod store;
+pub mod telemetry;
 pub mod vptree;
 pub mod web;

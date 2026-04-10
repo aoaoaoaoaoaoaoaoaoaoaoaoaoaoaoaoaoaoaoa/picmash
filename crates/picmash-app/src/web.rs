@@ -24,6 +24,10 @@ use image::{
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
 use tokio::fs;
+use tower_http::{
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -45,6 +49,7 @@ use crate::{
         ExternalArenaStatus, FaceId, PosteriorSummary, RemoteItemId, RemoteItemRecord,
     },
     store::FaceRecord,
+    telemetry,
 };
 
 mod arena;
@@ -92,6 +97,7 @@ pub fn router(state: SharedRuntimeState) -> Router {
         .route("/", get(home))
         .route("/favicon.svg", get(favicon_asset))
         .route("/__status", get(runtime_status))
+        .route("/api/client-event", post(client_event))
         .route("/__frontend/picmash-client.js", get(frontend_javascript))
         .route("/__frontend/picmash-client.css", get(frontend_stylesheet))
         .route("/arena", get(arena_root))
@@ -158,6 +164,14 @@ pub fn router(state: SharedRuntimeState) -> Router {
         .route("/identities/veto", post(identities_veto))
         .route("/__swarm/fonts/{font_name}", get(font_asset))
         .with_state(state)
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(telemetry::http_request_span)
+                .on_response(telemetry::record_http_response)
+                .on_failure(telemetry::record_http_failure),
+        )
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
 }
 
 static SITE_LOAD_LOGGED: AtomicBool = AtomicBool::new(false);

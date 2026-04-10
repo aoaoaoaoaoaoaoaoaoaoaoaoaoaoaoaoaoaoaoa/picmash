@@ -1,27 +1,42 @@
 use super::*;
+use std::time::Instant;
+use tracing::{Instrument, info_span};
+
+const SLOW_MEDIA_RESPONSE_MS: u128 = 100;
 
 pub(super) async fn asset_image(
     State(state): State<SharedRuntimeState>,
     Path(asset_id): Path<String>,
     Query(query): Query<AssetQuery>,
 ) -> WebResult<Response> {
-    let Some(state) = state.ready_app() else {
-        return Ok(service_unavailable_response());
-    };
-    let Some(asset) = state.maybe_image_asset(&AssetId(asset_id.clone()))? else {
-        return Ok((StatusCode::NOT_FOUND, "missing asset").into_response());
-    };
-    if !asset.path.exists() {
-        return Ok((StatusCode::NOT_FOUND, "missing asset").into_response());
-    }
     let rendition = query.rendition();
-    rendition_response(
-        state.cache_root(),
-        &asset.id.0,
-        asset.rotation_quarters,
-        &asset.path,
-        rendition,
-    )
+    let span = info_span!(
+        "media.asset",
+        asset_id = %asset_id,
+        rendition = rendition.as_str(),
+    );
+    async move {
+        let Some(state) = state.ready_app() else {
+            return Ok(service_unavailable_response());
+        };
+        let Some(asset) = state.maybe_image_asset(&AssetId(asset_id.clone()))? else {
+            warn!(asset_id = %asset_id, "asset image missing from corpus");
+            return Ok((StatusCode::NOT_FOUND, "missing asset").into_response());
+        };
+        if !asset.path.exists() {
+            warn!(asset_id = %asset_id, path = %asset.path.display(), "asset image path missing");
+            return Ok((StatusCode::NOT_FOUND, "missing asset").into_response());
+        }
+        rendition_response(
+            state.cache_root(),
+            &asset.id.0,
+            asset.rotation_quarters,
+            &asset.path,
+            rendition,
+        )
+        .await
+    }
+    .instrument(span)
     .await
 }
 
@@ -30,23 +45,38 @@ pub(super) async fn remote_image(
     Path(item_id): Path<i64>,
     Query(query): Query<AssetQuery>,
 ) -> WebResult<Response> {
-    let Some(state) = state.ready_app() else {
-        return Ok(service_unavailable_response());
-    };
-    let Some(item) = state.maybe_remote_item(RemoteItemId(item_id))? else {
-        return Ok((StatusCode::NOT_FOUND, "missing remote").into_response());
-    };
-    if !item.path.exists() {
-        return Ok((StatusCode::NOT_FOUND, "missing remote").into_response());
-    }
     let rendition = query.rendition();
-    rendition_response(
-        state.cache_root(),
-        &format!("remote-{}", item.id.0),
-        item.rotation_quarters,
-        &item.path,
-        rendition,
-    )
+    let span = info_span!(
+        "media.remote",
+        remote_item_id = item_id,
+        rendition = rendition.as_str(),
+    );
+    async move {
+        let Some(state) = state.ready_app() else {
+            return Ok(service_unavailable_response());
+        };
+        let Some(item) = state.maybe_remote_item(RemoteItemId(item_id))? else {
+            warn!(remote_item_id = item_id, "remote image missing from store");
+            return Ok((StatusCode::NOT_FOUND, "missing remote").into_response());
+        };
+        if !item.path.exists() {
+            warn!(
+                remote_item_id = item_id,
+                path = %item.path.display(),
+                "remote image path missing"
+            );
+            return Ok((StatusCode::NOT_FOUND, "missing remote").into_response());
+        }
+        rendition_response(
+            state.cache_root(),
+            &format!("remote-{}", item.id.0),
+            item.rotation_quarters,
+            &item.path,
+            rendition,
+        )
+        .await
+    }
+    .instrument(span)
     .await
 }
 
@@ -345,69 +375,104 @@ async fn rendition_response(
     source_path: &FsPath,
     rendition: AssetRendition,
 ) -> WebResult<Response> {
-    let cache_path =
-        rendition_cache_path_for_key(cache_root, cache_key, rotation_quarters, rendition);
-    let failure_marker_path =
-        rendition_failure_marker_path_for_key(cache_root, cache_key, rotation_quarters, rendition);
-    if let Ok(body) = fs::read(&cache_path).await {
-        return Ok(cached_image_response(
-            body,
-            HeaderValue::from_static("image/png"),
-        ));
-    }
+    let started = Instant::now();
+    let span = info_span!(
+        "media.rendition",
+        cache_key,
+        rendition = rendition.as_str(),
+        rotation_quarters,
+        source_path = %source_path.display(),
+    );
+    async move {
+        let cache_path =
+            rendition_cache_path_for_key(cache_root, cache_key, rotation_quarters, rendition);
+        let failure_marker_path = rendition_failure_marker_path_for_key(
+            cache_root,
+            cache_key,
+            rotation_quarters,
+            rendition,
+        );
+        if let Ok(body) = fs::read(&cache_path).await {
+            return Ok(cached_image_response(
+                body,
+                HeaderValue::from_static("image/png"),
+            ));
+        }
 
-    let bytes = match fs::read(source_path).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((StatusCode::NOT_FOUND, "missing image").into_response());
-        }
-        Err(error) => {
-            return Err(anyhow::Error::from(error)
-                .context(format!("reading image payload {}", source_path.display()))
-                .into());
-        }
-    };
-    let original_mime = header_value_for_path(source_path);
-    let fallback_bytes = bytes.clone();
-    let fallback_path = source_path.to_path_buf();
-    if has_rendition_failure_marker_for_key(cache_root, cache_key, rotation_quarters, rendition)
-        .await
-    {
-        return Ok(cached_image_response(fallback_bytes, original_mime));
-    }
-    let payload =
-        tokio::task::spawn_blocking(move || normalize_payload(bytes, rotation_quarters, rendition))
+        let bytes = match fs::read(source_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                warn!(path = %source_path.display(), "media source path missing during rendition");
+                return Ok((StatusCode::NOT_FOUND, "missing image").into_response());
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("reading image payload {}", source_path.display()))
+                    .into());
+            }
+        };
+        let original_mime = header_value_for_path(source_path);
+        let fallback_bytes = bytes.clone();
+        let fallback_path = source_path.to_path_buf();
+        if has_rendition_failure_marker_for_key(cache_root, cache_key, rotation_quarters, rendition)
             .await
-            .context("joining normalized image task")?;
-
-    let (body, mime) = match payload {
-        Ok(bytes) => {
-            if let Err(error) = write_rendition_cache(&cache_path, &bytes).await {
-                warn!(
-                    "failed to persist rendition cache {}: {error:#}",
-                    cache_path.display()
-                );
-            }
-            (bytes, HeaderValue::from_static("image/png"))
-        }
-        Err(error) => {
+        {
             warn!(
-                "failed to normalize asset {}: {error:#}; serving original bytes",
-                fallback_path.display()
+                cache_key,
+                rendition = rendition.as_str(),
+                path = %fallback_path.display(),
+                "serving original media after cached rendition failure"
             );
-            if let Err(marker_error) =
-                write_rendition_failure_marker(&failure_marker_path, &error.to_string()).await
-            {
-                warn!(
-                    "failed to persist rendition failure marker {}: {marker_error:#}",
-                    failure_marker_path.display()
-                );
-            }
-            (fallback_bytes, original_mime)
+            return Ok(cached_image_response(fallback_bytes, original_mime));
         }
-    };
+        let payload = tokio::task::spawn_blocking(move || {
+            normalize_payload(bytes, rotation_quarters, rendition)
+        })
+        .await
+        .context("joining normalized image task")?;
 
-    Ok(cached_image_response(body, mime))
+        let (body, mime) = match payload {
+            Ok(bytes) => {
+                if let Err(error) = write_rendition_cache(&cache_path, &bytes).await {
+                    warn!(
+                        "failed to persist rendition cache {}: {error:#}",
+                        cache_path.display()
+                    );
+                }
+                (bytes, HeaderValue::from_static("image/png"))
+            }
+            Err(error) => {
+                warn!(
+                    "failed to normalize asset {}: {error:#}; serving original bytes",
+                    fallback_path.display()
+                );
+                if let Err(marker_error) =
+                    write_rendition_failure_marker(&failure_marker_path, &error.to_string()).await
+                {
+                    warn!(
+                        "failed to persist rendition failure marker {}: {marker_error:#}",
+                        failure_marker_path.display()
+                    );
+                }
+                (fallback_bytes, original_mime)
+            }
+        };
+
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms > SLOW_MEDIA_RESPONSE_MS {
+            warn!(
+                elapsed_ms,
+                cache_key,
+                rendition = rendition.as_str(),
+                path = %source_path.display(),
+                "slow media response"
+            );
+        }
+
+        Ok(cached_image_response(body, mime))
+    }
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]
