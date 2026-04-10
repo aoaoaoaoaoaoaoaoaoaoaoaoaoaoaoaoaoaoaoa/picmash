@@ -1,4 +1,5 @@
 use super::*;
+use crate::identity::VisualKey;
 
 impl Store {
     /// Ensure the corpus exists in the DB without scanning images.
@@ -133,6 +134,7 @@ impl Store {
                 resolve_asset_id_for_identity(&tx, &identity)?.unwrap_or_else(mint_asset_id);
             let hidden = preserved_hidden_state_tx(&tx, corpus_id, &path_string, &asset_id)?;
             upsert_asset_identity_tx(&tx, &asset_id, &identity, 0)?;
+            resolve_external_aliases_for_asset_identity_tx(&tx, &asset_id, &identity)?;
             upsert_corpus_variant_tx(&tx, corpus_id, &path_string, &asset_id, &identity, hidden)?;
             let needs_embedding = !embedding_exists_tx(&tx, &asset_id, &model_name)?;
             tx.commit().context("committing ingest transaction")?;
@@ -281,13 +283,19 @@ impl Store {
                    a.win_count,
                    a.heart_count,
                    a.hearted,
-                   ca.hidden,
+                   CASE
+                       WHEN ca.hidden != 0 OR tombstone.visual_key IS NOT NULL THEN 1
+                       ELSE 0
+                   END,
                    a.preferred_blob_id,
                    ca.blob_id,
                    ca.blob_width,
-                   ca.blob_height
+                   ca.blob_height,
+                   a.visual_key
             FROM corpus_assets ca
             JOIN assets a ON a.id = ca.asset_id
+            LEFT JOIN external_item_tombstones tombstone
+              ON tombstone.visual_key = a.visual_key
             WHERE ca.corpus_id = ?1
               AND ca.asset_id = ?2
             "
@@ -304,13 +312,19 @@ impl Store {
                    a.win_count,
                    a.heart_count,
                    a.hearted,
-                   ca.hidden,
+                   CASE
+                       WHEN ca.hidden != 0 OR tombstone.visual_key IS NOT NULL THEN 1
+                       ELSE 0
+                   END,
                    a.preferred_blob_id,
                    ca.blob_id,
                    ca.blob_width,
-                   ca.blob_height
+                   ca.blob_height,
+                   a.visual_key
             FROM corpus_assets ca
             JOIN assets a ON a.id = ca.asset_id
+            LEFT JOIN external_item_tombstones tombstone
+              ON tombstone.visual_key = a.visual_key
             WHERE ca.corpus_id = ?1
             "
         };
@@ -320,6 +334,7 @@ impl Store {
                 asset: AssetRecord {
                     id: AssetId(row.get(0)?),
                     path: PathBuf::from(row.get::<_, String>(1)?),
+                    visual_key: row.get::<_, Option<String>>(16)?.map(VisualKey),
                     width: u32::try_from(row.get::<_, i64>(14)?).unwrap_or_default(),
                     height: u32::try_from(row.get::<_, i64>(15)?).unwrap_or_default(),
                     alpha: row.get(2)?,
@@ -491,6 +506,7 @@ impl Store {
         let asset_id = resolve_asset_id_for_identity(&tx, identity)?.unwrap_or_else(mint_asset_id);
         let hidden = preserved_hidden_state_tx(&tx, corpus_id, &path_string, &asset_id)?;
         upsert_asset_identity_tx(&tx, &asset_id, identity, rotation_quarters.rem_euclid(4))?;
+        resolve_external_aliases_for_asset_identity_tx(&tx, &asset_id, identity)?;
         upsert_corpus_variant_tx(&tx, corpus_id, &path_string, &asset_id, identity, hidden)?;
         if let Some(embedding) = embedding {
             upsert_embedding_tx(&tx, &asset_id, embedding)?;

@@ -530,6 +530,31 @@ details.rail-menu > .menu-panel {
   white-space: nowrap;
   padding: 0.22rem 0.42rem;
 }
+.remote-thread-banner-rail {
+  position: absolute;
+  top: var(--picmash-overlay-inset);
+  left: var(--picmash-overlay-inset);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: var(--picmash-control-gap);
+  max-width: min(44ch, calc(100% - (2 * var(--picmash-overlay-inset)) - 9rem));
+}
+.remote-thread-lock-box {
+  margin: 0;
+  flex: 0 0 auto;
+}
+.remote-thread-banner {
+  position: static;
+  min-width: 0;
+  max-width: none;
+}
+.remote-thread-banner-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .cluster-strip {
   position: absolute;
   right: var(--picmash-overlay-inset);

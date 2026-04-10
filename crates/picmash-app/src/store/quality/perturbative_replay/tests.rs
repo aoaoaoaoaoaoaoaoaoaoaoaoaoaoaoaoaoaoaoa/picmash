@@ -16,6 +16,7 @@ fn synth_asset(
         asset: AssetRecord {
             id: AssetId(id.to_owned()),
             path: PathBuf::new(),
+            visual_key: None,
             width: 0,
             height: 0,
             alpha: 0.0,

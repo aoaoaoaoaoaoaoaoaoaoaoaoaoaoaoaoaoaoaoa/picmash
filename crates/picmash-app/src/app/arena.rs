@@ -1,26 +1,25 @@
 use super::*;
+use crate::identity::VisualKey;
+use std::collections::HashSet;
 
 impl AppState {
     pub fn arena_target(&self) -> anyhow::Result<RedirectTarget> {
-        self.redirect_target_for_next_pair()
+        self.redirect_target_for_next_pair(&HashSet::new())
     }
 
     pub fn arena_prefetch_target(&self) -> anyhow::Result<RedirectTarget> {
-        redirect_target_for_pair(self.choose_next_pair(LockExhaustionPolicy::PreserveAndStop)?)
+        self.arena_prefetch_target_excluding(&HashSet::new())
     }
 
     pub fn arena_prefetch_target_preserving_local_anchor(
         &self,
         local_anchor: Option<&AssetId>,
     ) -> anyhow::Result<RedirectTarget> {
-        redirect_target_for_pair(self.choose_next_pair_preserving_local_anchor(
-            local_anchor,
-            LockExhaustionPolicy::PreserveAndStop,
-        )?)
+        self.arena_prefetch_target_preserving_local_anchor_excluding(local_anchor, &HashSet::new())
     }
 
     pub fn arena_empty(&self) -> anyhow::Result<ArenaView> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let _field = self.session_field(&store)?;
         Ok(ArenaView {
             pair: None,
@@ -33,7 +32,7 @@ impl AppState {
         left: &ArenaHandle,
         right: &ArenaHandle,
     ) -> anyhow::Result<Option<ArenaView>> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let field = self.session_field(&store)?;
         let Some(left) = self.load_arena_card(&store, &field, left)? else {
             return Ok(None);
@@ -58,7 +57,7 @@ impl AppState {
     }
 
     pub fn board(&self) -> anyhow::Result<BoardView> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let field = self.session_field(&store)?;
         let mut entries = visible_assets(&store, self.active.corpus_id)?
             .into_iter()
@@ -78,53 +77,57 @@ impl AppState {
         if self.maybe_image_asset(asset_id)?.is_none() {
             return Ok(());
         }
-        self.with_locked_store_write(|store| {
-            store.rotate_asset(asset_id, direction)?;
-            store.touch_session(self.active.session_id)
+        let asset_id = asset_id.clone();
+        let session_id = self.active.session_id;
+        self.with_write_store("rotate_asset", move |store| {
+            store.rotate_asset(&asset_id, direction)?;
+            store.touch_session(session_id)
         })
     }
 
     pub fn rotate_arena_handle(&self, handle: &ArenaHandle, direction: i32) -> anyhow::Result<()> {
-        self.with_locked_store_write(|store| {
+        let handle = handle.clone();
+        let corpus_id = self.active.corpus_id;
+        let session_id = self.active.session_id;
+        self.with_write_store("rotate_arena_handle", move |store| {
             match handle {
                 ArenaHandle::Local(asset_id) => {
-                    if store
-                        .corpus_asset(self.active.corpus_id, asset_id)?
-                        .is_none()
-                    {
+                    if store.corpus_asset(corpus_id, &asset_id)?.is_none() {
                         return Ok(());
                     }
-                    store.rotate_asset(asset_id, direction)?;
+                    store.rotate_asset(&asset_id, direction)?;
                 }
                 ArenaHandle::Remote(item_id) => {
-                    if store.remote_item(*item_id)?.is_none() {
+                    if store.remote_item(item_id)?.is_none() {
                         return Ok(());
                     }
-                    store.rotate_external_item(*item_id, direction)?;
+                    store.rotate_external_item(item_id, direction)?;
                 }
             }
-            store.touch_session(self.active.session_id)
+            store.touch_session(session_id)
         })
     }
 
     pub fn hide_asset(&self, asset_id: &AssetId, hidden: bool) -> anyhow::Result<RedirectTarget> {
-        let present = self.with_locked_store_write(|store| {
-            let present = store
-                .corpus_asset(self.active.corpus_id, asset_id)?
-                .is_some();
+        let asset_id = asset_id.clone();
+        let corpus_id = self.active.corpus_id;
+        let session_id = self.active.session_id;
+        let present = self.with_write_store("hide_asset", move |store| {
+            let present = store.corpus_asset(corpus_id, &asset_id)?.is_some();
             if !present {
                 return Ok(false);
             }
-            store.set_hidden(self.active.corpus_id, asset_id, hidden)?;
-            self.purge_explore_vectors();
-            self.purge_all_explore_layouts();
-            store.touch_session(self.active.session_id)?;
+            store.set_hidden(corpus_id, &asset_id, hidden)?;
+            store.touch_session(session_id)?;
             Ok(true)
         })?;
         if !present {
             return redirect_target_for_pair(None);
         }
-        self.redirect_target_for_next_pair()
+        self.purge_explore_vectors();
+        self.purge_all_explore_layouts();
+        self.invalidate_session_field_cache();
+        self.redirect_target_for_next_pair(&HashSet::new())
     }
 
     pub fn hide_arena_handle(
@@ -137,31 +140,42 @@ impl AppState {
     ) -> anyhow::Result<RedirectTarget> {
         match handle {
             ArenaHandle::Local(asset_id) => self.hide_asset(asset_id, hidden),
-            ArenaHandle::Remote(item_id) => {
+            ArenaHandle::Remote(_item_id) => {
                 let local_anchor = surviving_local_anchor(handle, pair_left, pair_right).cloned();
-                self.with_fresh_store_write(|store| {
+                let lock_handle = handle.clone();
+                let cluster_ids = cluster_ids.to_vec();
+                let anchor_for_write = local_anchor.clone();
+                let session_id = self.active.session_id;
+                let corpus_id = self.active.corpus_id;
+                self.with_write_store("hide_remote_handle", move |store| {
                     if hidden {
                         store.reject_external_item(
-                            self.active.session_id,
-                            self.active.corpus_id,
-                            *item_id,
-                            local_anchor.as_ref(),
+                            session_id,
+                            corpus_id,
+                            match lock_handle {
+                                ArenaHandle::Remote(item_id) => item_id,
+                                ArenaHandle::Local(_) => unreachable!("remote branch required"),
+                            },
+                            anchor_for_write.as_ref(),
                             ExternalEventKind::Rejected,
                         )?;
-                        for satellite_id in cluster_ids {
+                        for satellite_id in &cluster_ids {
                             store.reject_external_item(
-                                self.active.session_id,
-                                self.active.corpus_id,
+                                session_id,
+                                corpus_id,
                                 *satellite_id,
-                                local_anchor.as_ref(),
+                                anchor_for_write.as_ref(),
                                 ExternalEventKind::Rejected,
                             )?;
                         }
-                        self.purge_duplicate_frontier();
                     }
-                    store.touch_session(self.active.session_id)?;
+                    store.touch_session(session_id)?;
                     Ok(())
                 })?;
+                if hidden {
+                    self.purge_duplicate_frontier();
+                }
+                self.invalidate_session_field_cache();
                 self.redirect_target_preserving_local_anchor(local_anchor.as_ref())
             }
         }
@@ -183,23 +197,52 @@ impl AppState {
                 .with_context(|| format!("missing remote item {}", item_id.0))?
         };
         let local_anchor = surviving_local_anchor(handle, pair_left, pair_right).cloned();
-        self.with_fresh_store_write(|store| {
+        let item_id = *item_id;
+        let anchor_for_write = local_anchor.clone();
+        let session_id = self.active.session_id;
+        let corpus_id = self.active.corpus_id;
+        let locked_source_key = item.source_key.clone();
+        let locked_source_key_for_check = locked_source_key.clone();
+        let locked_stream_id = item.stream_id;
+        let cleared_lock = self.with_write_store("veto_external_thread", move |store| {
+            let cleared_lock = store
+                .session_subsource_lock(session_id)?
+                .is_some_and(|lock| {
+                    lock.source_key == locked_source_key_for_check
+                        && lock.stream_id == locked_stream_id
+                });
             store.block_external_stream(
-                self.active.session_id,
-                self.active.corpus_id,
-                *item_id,
-                local_anchor.as_ref(),
+                session_id,
+                corpus_id,
+                item_id,
+                anchor_for_write.as_ref(),
             )?;
-            self.purge_duplicate_frontier();
+            if cleared_lock {
+                store.clear_session_subsource_lock(session_id)?;
+                info!(
+                    source = %item.source_key,
+                    stream_id = item.stream_id,
+                    "cleared arena external subsource lock after veto"
+                );
+            }
             info!(
                 source = %item.source_key,
                 thread_no = item.thread_no,
                 title = %item.stream_title,
                 "blocked external stream"
             );
-            store.touch_session(self.active.session_id)?;
-            Ok(())
+            store.touch_session(session_id)?;
+            Ok(cleared_lock)
         })?;
+        self.purge_duplicate_frontier();
+        self.invalidate_session_field_cache();
+        if cleared_lock {
+            info!(
+                source = %locked_source_key,
+                stream_id = locked_stream_id,
+                "veto lifted the active subsource lock"
+            );
+        }
         self.redirect_target_preserving_local_anchor(local_anchor.as_ref())
     }
 
@@ -229,12 +272,17 @@ impl AppState {
         if self.maybe_image_asset(asset_id)?.is_none() {
             return Ok(());
         }
-        self.with_locked_store_write(|store| {
-            store.set_hidden(self.active.corpus_id, asset_id, true)?;
-            self.purge_explore_vectors();
-            self.purge_all_explore_layouts();
-            store.touch_session(self.active.session_id)
-        })
+        let asset_id = asset_id.clone();
+        let corpus_id = self.active.corpus_id;
+        let session_id = self.active.session_id;
+        self.with_write_store("hide_asset_from_board", move |store| {
+            store.set_hidden(corpus_id, &asset_id, true)?;
+            store.touch_session(session_id)
+        })?;
+        self.purge_explore_vectors();
+        self.purge_all_explore_layouts();
+        self.invalidate_session_field_cache();
+        Ok(())
     }
 
     pub fn set_asset_domain_label(
@@ -245,12 +293,16 @@ impl AppState {
         if self.maybe_image_asset(asset_id)?.is_none() {
             return Ok(());
         }
-        let status = self.with_locked_store_write(|store| {
-            store.set_asset_domain_label(asset_id, label)?;
-            let oracle = self.retrain_asset_domain_oracle(store)?;
-            store.touch_session(self.active.session_id)?;
-            Ok(oracle.status())
+        let asset_id = asset_id.clone();
+        let asset_id_for_write = asset_id.clone();
+        let session_id = self.active.session_id;
+        self.with_write_store("set_asset_domain_label", move |store| {
+            store.set_asset_domain_label(&asset_id_for_write, label)?;
+            store.touch_session(session_id)
         })?;
+        let status = self
+            .retrain_asset_domain_oracle(&self.read_store()?)?
+            .status();
         info!(
             asset_id = %asset_id.0,
             label = label.as_str(),
@@ -267,9 +319,9 @@ impl AppState {
     }
 
     pub fn set_heart_asset(&self, asset_id: &AssetId, active: bool) -> anyhow::Result<()> {
-        self.with_locked_store_write(|store| {
+        let updated = self.with_locked_store_write(|store| {
             if !active {
-                return Ok(());
+                return Ok(None);
             }
             let mut field = self.session_field(store)?;
             let Some(mut asset) = store
@@ -277,11 +329,11 @@ impl AppState {
                 .into_iter()
                 .find(|candidate| candidate.id == *asset_id)
             else {
-                return Ok(());
+                return Ok(None);
             };
 
             if asset.is_hearted {
-                return Ok(());
+                return Ok(None);
             }
 
             asset.is_hearted = true;
@@ -290,8 +342,12 @@ impl AppState {
             field.hearted_assets.insert(asset_id.clone());
 
             store.persist_heart_step(&field.session, &asset, asset_id, active)?;
-            Ok(())
-        })
+            Ok(Some(field))
+        })?;
+        if let Some(field) = updated {
+            self.replace_session_field_cache(field);
+        }
+        Ok(())
     }
 
     pub fn set_heart_arena_handle(
@@ -318,14 +374,14 @@ impl AppState {
         asset_id: &AssetId,
         feedback: UnaryFeedback,
     ) -> anyhow::Result<()> {
-        self.with_locked_store_write(|store| {
+        let updated = self.with_locked_store_write(|store| {
             let mut field = self.session_field(store)?;
             let Some(mut asset) = store
                 .corpus_assets(self.active.corpus_id)?
                 .into_iter()
                 .find(|candidate| candidate.id == *asset_id)
             else {
-                return Ok(());
+                return Ok(None);
             };
 
             let exact_offset = field.exact_offset(asset_id);
@@ -362,7 +418,7 @@ impl AppState {
                     None,
                     None,
                 )?;
-                return Ok(());
+                return Ok(Some(field));
             }
 
             if matches!(
@@ -430,7 +486,7 @@ impl AppState {
                 }
                 field.embedding_head = embedding_head;
                 field.hierarchical_session = Some(session_quality);
-                return Ok(());
+                return Ok(Some(field));
             }
 
             let embedding = field.embedding(asset_id).map(ToOwned::to_owned);
@@ -502,13 +558,16 @@ impl AppState {
                 field.exact_offsets.insert(asset_id.clone(), next_offset);
             }
             field.embedding_head = embedding_head;
-            Ok(())
-        })
+            Ok(Some(field))
+        })?;
+        if let Some(field) = updated {
+            self.replace_session_field_cache(field);
+        }
+        Ok(())
     }
 
     pub fn image_asset(&self, asset_id: &AssetId) -> anyhow::Result<AssetRecord> {
-        self.store
-            .lock()
+        self.read_store()?
             .corpus_asset(self.active.corpus_id, asset_id)?
             .with_context(|| {
                 format!(
@@ -519,20 +578,19 @@ impl AppState {
     }
 
     pub fn maybe_image_asset(&self, asset_id: &AssetId) -> anyhow::Result<Option<AssetRecord>> {
-        self.store
-            .lock()
+        self.read_store()?
             .corpus_asset(self.active.corpus_id, asset_id)
     }
 
     pub fn arena_handle_is_live(&self, handle: &ArenaHandle) -> anyhow::Result<bool> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         Ok(match handle {
             ArenaHandle::Local(asset_id) => store
                 .corpus_asset(self.active.corpus_id, asset_id)?
                 .filter(|asset| !asset.hidden && asset.path.exists())
                 .is_some(),
             ArenaHandle::Remote(item_id) => store
-                .remote_item(*item_id)?
+                .arena_remote_item(*item_id)?
                 .is_some_and(|item| item.path.exists()),
         })
     }
@@ -541,11 +599,11 @@ impl AppState {
         &self,
         item_id: RemoteItemId,
     ) -> anyhow::Result<Option<crate::model::RemoteItemRecord>> {
-        self.store.lock().remote_item(item_id)
+        self.read_store()?.remote_item(item_id)
     }
 
     pub fn hearted_assets(&self) -> anyhow::Result<HashSet<AssetId>> {
-        self.store.lock().hearted_assets()
+        self.read_store()?.hearted_assets()
     }
 
     pub fn vote(
@@ -577,7 +635,7 @@ impl AppState {
         right_id: &AssetId,
         winner_id: &AssetId,
     ) -> anyhow::Result<RedirectTarget> {
-        self.with_locked_store_write(|store| {
+        let updated = self.with_locked_store_write(|store| {
             let corpus_id = self.active.corpus_id;
             let mut field = self.session_field(store)?;
             let assets = store.corpus_assets(corpus_id)?;
@@ -629,7 +687,7 @@ impl AppState {
                     None,
                     None,
                 )?;
-                return Ok(());
+                return Ok(Some(field));
             }
 
             if matches!(
@@ -789,8 +847,7 @@ impl AppState {
                                 outcome,
                                 moments,
                             );
-                            for entry in field
-                                .dominant_faces
+                            for entry in Arc::make_mut(&mut field.dominant_faces)
                                 .values_mut()
                                 .filter(|entry| entry.id == left_id)
                             {
@@ -813,8 +870,7 @@ impl AppState {
                                 outcome,
                                 moments,
                             );
-                            for entry in field
-                                .dominant_faces
+                            for entry in Arc::make_mut(&mut field.dominant_faces)
                                 .values_mut()
                                 .filter(|entry| entry.id == right_id)
                             {
@@ -849,8 +905,7 @@ impl AppState {
                                 outcome,
                                 moments,
                             );
-                            for entry in field
-                                .dominant_faces
+                            for entry in Arc::make_mut(&mut field.dominant_faces)
                                 .values_mut()
                                 .filter(|entry| entry.id == identity_id)
                             {
@@ -936,14 +991,11 @@ impl AppState {
                     &hierarchical_session_cache(&session_quality),
                 )?;
                 field.embedding_head = embedding_head;
-                field
-                    .hierarchical_assets
-                    .insert(left.id.clone(), left_quality);
-                field
-                    .hierarchical_assets
+                Arc::make_mut(&mut field.hierarchical_assets).insert(left.id.clone(), left_quality);
+                Arc::make_mut(&mut field.hierarchical_assets)
                     .insert(right.id.clone(), right_quality);
                 field.hierarchical_session = Some(session_quality);
-                return Ok(());
+                return Ok(Some(field));
             }
 
             let left_before = left.clone();
@@ -1048,99 +1100,19 @@ impl AppState {
                 embedding_head.as_ref(),
             )?;
             field.embedding_head = embedding_head;
-            Ok(())
+            Ok(Some(field))
         })?;
-        self.redirect_target_for_next_pair()
+        if let Some(field) = updated {
+            self.replace_session_field_cache(field);
+        }
+        self.redirect_target_for_next_pair(&HashSet::new())
     }
 
     fn session_with_store(&self, store: &Store) -> anyhow::Result<SessionRecord> {
         store.session(self.active.session_id)
     }
 
-    fn choose_next_pair(
-        &self,
-        lock_exhaustion: LockExhaustionPolicy,
-    ) -> anyhow::Result<Option<ArenaPair>> {
-        for _ in 0..2 {
-            let store = self.store.lock();
-            let field = self.session_field(&store)?;
-            let assets = visible_assets(&store, self.active.corpus_id)?;
-            if field.subsource_lock.is_some() {
-                let pair =
-                    self.choose_pair_in_locked_subsource_with_store(&store, &field, &assets, None)?;
-                drop(store);
-                if pair.is_some() {
-                    return Ok(pair);
-                }
-                if lock_exhaustion == LockExhaustionPolicy::PreserveAndStop {
-                    return Ok(None);
-                }
-                self.clear_external_subsource_lock()?;
-                continue;
-            }
-            return self.choose_pair_with_store(&store, &field, &assets);
-        }
-        Ok(None)
-    }
-
-    fn choose_next_pair_preserving_local_anchor(
-        &self,
-        local_anchor: Option<&AssetId>,
-        lock_exhaustion: LockExhaustionPolicy,
-    ) -> anyhow::Result<Option<ArenaPair>> {
-        for _ in 0..2 {
-            let store = self.store.lock();
-            let field = self.session_field(&store)?;
-            if field.subsource_lock.is_some() {
-                let assets = visible_assets(&store, self.active.corpus_id)?;
-                let pair = self.choose_pair_in_locked_subsource_with_store(
-                    &store,
-                    &field,
-                    &assets,
-                    local_anchor,
-                )?;
-                drop(store);
-                if pair.is_some() {
-                    return Ok(pair);
-                }
-                if lock_exhaustion == LockExhaustionPolicy::PreserveAndStop {
-                    return Ok(None);
-                }
-                self.clear_external_subsource_lock()?;
-                continue;
-            }
-            return self.choose_pair_preserving_local_anchor_with_store(
-                &store,
-                &field,
-                local_anchor,
-            );
-        }
-        Ok(None)
-    }
-
-    fn redirect_target_for_next_pair(&self) -> anyhow::Result<RedirectTarget> {
-        let pair = self.choose_next_pair(LockExhaustionPolicy::ClearAndRetry)?;
-        if let Some(pair_ref) = pair.as_ref() {
-            self.note_remote_pair_selected(pair_ref)?;
-        }
-        redirect_target_for_pair(pair)
-    }
-
-    pub(super) fn redirect_target_preserving_local_anchor(
-        &self,
-        local_anchor: Option<&AssetId>,
-    ) -> anyhow::Result<RedirectTarget> {
-        let pair = self.choose_next_pair_preserving_local_anchor(
-            local_anchor,
-            LockExhaustionPolicy::ClearAndRetry,
-        )?;
-        if let Some(pair_ref) = pair.as_ref() {
-            self.note_remote_pair_selected(pair_ref)?;
-        }
-        redirect_target_for_pair(pair)
-    }
-
-    pub(super) fn session_field(&self, store: &Store) -> anyhow::Result<SessionField> {
+    fn rebuild_session_field(&self, store: &Store) -> anyhow::Result<SessionField> {
         let quality_model = store.active_quality_model()?.formal_version;
         let hierarchical_assets = match quality_model {
             QualityFormalVersion::LegacyIndependentV1 => HashMap::new(),
@@ -1191,16 +1163,142 @@ impl AppState {
             exact_offsets: store.session_asset_offsets(self.active.session_id)?,
             hearted_assets: store.hearted_assets()?,
             subsource_lock: store.session_subsource_lock(self.active.session_id)?,
-            embeddings: store
-                .corpus_embeddings(self.active.corpus_id, self.embedder.model_name())?,
+            embeddings: Arc::new(
+                store.corpus_embeddings(self.active.corpus_id, self.embedder.model_name())?,
+            ),
             embedding_head: store
                 .session_embedding_head(self.active.session_id, self.embedder.model_name())?,
-            hierarchical_assets,
-            dominant_faces: store.dominant_local_face_identities(self.active.corpus_id)?,
+            hierarchical_assets: Arc::new(hierarchical_assets),
+            dominant_faces: Arc::new(store.dominant_local_face_identities(self.active.corpus_id)?),
             hierarchical_session,
-            perturbative_assets,
+            perturbative_assets: Arc::new(perturbative_assets),
             perturbative_session,
             perturbative_hyper,
         })
+    }
+
+    fn choose_next_pair(
+        &self,
+        lock_exhaustion: LockExhaustionPolicy,
+        excluded_visual_keys: &HashSet<VisualKey>,
+    ) -> anyhow::Result<Option<ArenaPair>> {
+        for _ in 0..2 {
+            let store = self.read_store()?;
+            let field = self.session_field(&store)?;
+            let assets = visible_assets(&store, self.active.corpus_id)?;
+            if field.subsource_lock.is_some() {
+                let pair = self.choose_pair_in_locked_subsource_with_store(
+                    &store,
+                    &field,
+                    &assets,
+                    None,
+                    excluded_visual_keys,
+                )?;
+                if pair.is_some() {
+                    return Ok(pair);
+                }
+                if lock_exhaustion == LockExhaustionPolicy::PreserveAndStop {
+                    return Ok(None);
+                }
+                self.clear_external_subsource_lock()?;
+                continue;
+            }
+            return self.choose_pair_with_store(&store, &field, &assets, excluded_visual_keys);
+        }
+        Ok(None)
+    }
+
+    fn choose_next_pair_preserving_local_anchor(
+        &self,
+        local_anchor: Option<&AssetId>,
+        lock_exhaustion: LockExhaustionPolicy,
+        excluded_visual_keys: &HashSet<VisualKey>,
+    ) -> anyhow::Result<Option<ArenaPair>> {
+        for _ in 0..2 {
+            let store = self.read_store()?;
+            let field = self.session_field(&store)?;
+            if field.subsource_lock.is_some() {
+                let assets = visible_assets(&store, self.active.corpus_id)?;
+                let pair = self.choose_pair_in_locked_subsource_with_store(
+                    &store,
+                    &field,
+                    &assets,
+                    local_anchor,
+                    excluded_visual_keys,
+                )?;
+                if pair.is_some() {
+                    return Ok(pair);
+                }
+                if lock_exhaustion == LockExhaustionPolicy::PreserveAndStop {
+                    return Ok(None);
+                }
+                self.clear_external_subsource_lock()?;
+                continue;
+            }
+            return self.choose_pair_preserving_local_anchor_with_store(
+                &store,
+                &field,
+                local_anchor,
+                excluded_visual_keys,
+            );
+        }
+        Ok(None)
+    }
+
+    fn redirect_target_for_next_pair(
+        &self,
+        excluded_visual_keys: &HashSet<VisualKey>,
+    ) -> anyhow::Result<RedirectTarget> {
+        let pair =
+            self.choose_next_pair(LockExhaustionPolicy::ClearAndRetry, excluded_visual_keys)?;
+        if let Some(pair_ref) = pair.as_ref() {
+            self.note_remote_pair_selected(pair_ref)?;
+        }
+        redirect_target_for_pair(pair)
+    }
+
+    pub(super) fn redirect_target_preserving_local_anchor(
+        &self,
+        local_anchor: Option<&AssetId>,
+    ) -> anyhow::Result<RedirectTarget> {
+        let pair = self.choose_next_pair_preserving_local_anchor(
+            local_anchor,
+            LockExhaustionPolicy::ClearAndRetry,
+            &HashSet::new(),
+        )?;
+        if let Some(pair_ref) = pair.as_ref() {
+            self.note_remote_pair_selected(pair_ref)?;
+        }
+        redirect_target_for_pair(pair)
+    }
+
+    pub(crate) fn arena_prefetch_target_excluding(
+        &self,
+        excluded_visual_keys: &HashSet<VisualKey>,
+    ) -> anyhow::Result<RedirectTarget> {
+        redirect_target_for_pair(
+            self.choose_next_pair(LockExhaustionPolicy::PreserveAndStop, excluded_visual_keys)?,
+        )
+    }
+
+    pub(crate) fn arena_prefetch_target_preserving_local_anchor_excluding(
+        &self,
+        local_anchor: Option<&AssetId>,
+        excluded_visual_keys: &HashSet<VisualKey>,
+    ) -> anyhow::Result<RedirectTarget> {
+        redirect_target_for_pair(self.choose_next_pair_preserving_local_anchor(
+            local_anchor,
+            LockExhaustionPolicy::PreserveAndStop,
+            excluded_visual_keys,
+        )?)
+    }
+
+    pub(super) fn session_field(&self, store: &Store) -> anyhow::Result<SessionField> {
+        if let Some(field) = self.session_field_cache.read().clone() {
+            return Ok(field);
+        }
+        let field = self.rebuild_session_field(store)?;
+        self.replace_session_field_cache(field.clone());
+        Ok(field)
     }
 }

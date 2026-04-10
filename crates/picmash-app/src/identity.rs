@@ -21,9 +21,13 @@ pub struct BlobId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VisualKey(pub String);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RenderHash(pub String);
+
 #[derive(Debug, Clone)]
 pub struct ImageIdentity {
     pub blob_id: BlobId,
+    pub render_hash: RenderHash,
     pub visual_key: VisualKey,
     pub width: u32,
     pub height: u32,
@@ -41,9 +45,11 @@ pub fn inspect_image_bytes(bytes: &[u8]) -> anyhow::Result<ImageIdentity> {
     let blob_id = BlobId(blake3::hash(bytes).to_hex().to_string());
     let oriented = canonical_embedding_image(bytes)?;
     let (width, height) = oriented.dimensions();
+    let render_hash = exact_render_hash(&oriented);
     let visual_key = strict_visual_key(&oriented);
     Ok(ImageIdentity {
         blob_id,
+        render_hash,
         visual_key,
         width,
         height,
@@ -140,6 +146,17 @@ fn strict_visual_key(image: &DynamicImage) -> VisualKey {
     VisualKey(format!("{VISUAL_ALGO}:{digest}"))
 }
 
+fn exact_render_hash(image: &DynamicImage) -> RenderHash {
+    const RENDER_ALGO: &str = "render:v1";
+
+    let rgba = image.to_rgba8();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&image.width().to_le_bytes());
+    hasher.update(&image.height().to_le_bytes());
+    hasher.update(&rgba);
+    RenderHash(format!("{RENDER_ALGO}:{}", hasher.finalize().to_hex()))
+}
+
 fn contain_quantized_proxy(image: &DynamicImage, width: u32, height: u32) -> Vec<u8> {
     let fitted = image.resize(width, height, FilterType::Triangle).to_rgb8();
     let mut canvas = RgbImage::from_pixel(width, height, Rgb([0, 0, 0]));
@@ -190,5 +207,18 @@ mod tests {
         let left = inspect_image_bytes(&flat_png(96, 64, [120, 90, 30])).expect("identity");
         let right = inspect_image_bytes(&flat_png(640, 426, [120, 90, 30])).expect("identity");
         assert_eq!(left.visual_key, right.visual_key);
+    }
+
+    #[test]
+    fn render_identity_ignores_png_encoding_variants() {
+        let left = flat_png(96, 64, [120, 90, 30]);
+        let image = image::load_from_memory(&left).expect("decode png");
+        let mut right = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut right), image::ImageFormat::Png)
+            .expect("re-encode png");
+        let left = inspect_image_bytes(&left).expect("left identity");
+        let right = inspect_image_bytes(&right).expect("right identity");
+        assert_eq!(left.render_hash, right.render_hash);
     }
 }

@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, str::FromStr};
 
+use crate::identity::VisualKey;
 use crate::{quality::AssetQualityCachePayload, quality_features::AssetQualityFeatures};
+use anyhow::bail;
 
-use super::{AssetId, LATENT_DIM, RemoteItemId, SessionId};
+use super::{AssetId, CorpusId, LATENT_DIM, RemoteItemId, SessionId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalEventKind {
@@ -31,10 +33,37 @@ impl ExternalEventKind {
     }
 }
 
+impl FromStr for ExternalEventKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "selected" => Ok(Self::Selected),
+            "rejected" => Ok(Self::Rejected),
+            "stream_blocked" => Ok(Self::StreamBlocked),
+            "local_win" => Ok(Self::LocalWin),
+            "remote_win" => Ok(Self::RemoteWin),
+            "hearted" => Ok(Self::Hearted),
+            "imported" => Ok(Self::Imported),
+            "kept" => Ok(Self::Kept),
+            _ => bail!("unknown external event kind `{value}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingExternalImportOutcome {
+    pub item_id: RemoteItemId,
+    pub session_id: SessionId,
+    pub corpus_id: CorpusId,
+    pub outcome_kind: ExternalEventKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct AssetRecord {
     pub id: AssetId,
     pub path: PathBuf,
+    pub visual_key: Option<VisualKey>,
     pub width: u32,
     pub height: u32,
     pub alpha: f32,
@@ -76,6 +105,7 @@ pub struct RemoteItemRecord {
     pub path: PathBuf,
     pub image_url: String,
     pub thumb_url: String,
+    pub visual_key: Option<VisualKey>,
     pub rotation_quarters: i32,
 }
 

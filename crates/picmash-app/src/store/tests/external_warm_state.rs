@@ -5,7 +5,7 @@ use crate::{
 };
 use time::OffsetDateTime;
 
-use super::{Store, flat_png, remote_item, remote_stream, test_root};
+use super::{ExternalIdentityDisposition, Store, flat_png, remote_item, remote_stream, test_root};
 
 #[test]
 fn external_item_warm_state_tracks_inline_work_seams() {
@@ -46,6 +46,7 @@ fn external_item_warm_state_tracks_inline_work_seams() {
             QUALITY_FEATURE_REVISION,
         )
         .expect("cold warm state");
+    assert!(!cold.needs_materialization);
     assert!(cold.needs_identity);
     assert!(cold.needs_quality_features);
     assert!(cold.needs_embedding);
@@ -53,9 +54,12 @@ fn external_item_warm_state_tracks_inline_work_seams() {
     assert!(!cold.needs_clip_embedding);
     assert!(cold.needs_inline_work());
 
-    store
-        .save_external_item_identity(item_id, &identity, &cache_path)
-        .expect("save identity");
+    assert_eq!(
+        store
+            .save_external_item_identity(item_id, &identity, &cache_path)
+            .expect("save identity"),
+        ExternalIdentityDisposition::Active
+    );
     store
         .save_external_embedding(
             item_id,
@@ -86,12 +90,83 @@ fn external_item_warm_state_tracks_inline_work_seams() {
             QUALITY_FEATURE_REVISION,
         )
         .expect("warm state");
+    assert!(!warm.needs_materialization);
     assert!(!warm.needs_identity);
     assert!(!warm.needs_quality_features);
     assert!(!warm.needs_embedding);
     assert!(!warm.needs_clip_embedding);
     assert!(!warm.needs_face_embedding);
     assert!(!warm.needs_inline_work());
+}
+
+#[test]
+fn external_source_ready_profile_ignores_missing_cached_files() {
+    let root = test_root("external-ready-profile-missing-cache");
+    let corpus_root = root.join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+    let db_path = root.join("picmash.sqlite3");
+    let store = Store::open(&db_path).expect("open store");
+
+    store
+        .upsert_external_source("4chan:s", "s", "4chan_board", "s", None)
+        .expect("upsert source");
+    let (stream_id, blocked) = store
+        .upsert_external_stream("4chan:s", &remote_stream(2001, 1))
+        .expect("upsert stream");
+    assert!(!blocked);
+
+    let bytes = flat_png(256, 256, [30, 90, 170]);
+    let cache_path = root.join("missing-cache.png");
+    std::fs::write(&cache_path, &bytes).expect("write cache");
+    let item_id = store
+        .upsert_external_item(
+            "4chan:s",
+            stream_id,
+            "thread 2001",
+            &remote_item(2001, 2002, None),
+            Some(&cache_path),
+        )
+        .expect("upsert item");
+    store
+        .save_external_embedding(
+            item_id,
+            &EmbeddingRecord {
+                model_name: "test-model".to_owned(),
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            &cache_path,
+        )
+        .expect("save embedding");
+
+    let (ready_before, by_stream_before) = store
+        .external_source_ready_profile("4chan:s", "test-model")
+        .expect("ready profile before missing cache");
+    assert_eq!(ready_before, 1);
+    assert_eq!(by_stream_before.get(&stream_id), Some(&1));
+
+    std::fs::remove_file(&cache_path).expect("remove cache");
+
+    let warm = store
+        .external_item_warm_state(
+            item_id,
+            "test-model",
+            None,
+            "face-model",
+            QUALITY_FEATURE_REVISION,
+        )
+        .expect("warm state after missing cache");
+    assert!(!warm.needs_materialization);
+
+    let (ready_after, by_stream_after) = store
+        .external_source_ready_profile("4chan:s", "test-model")
+        .expect("ready profile after missing cache");
+    assert_eq!(ready_after, 0);
+    assert!(by_stream_after.is_empty());
+
+    let (_, _, cached_after) = store
+        .external_source_counts("4chan:s")
+        .expect("source counts after missing cache");
+    assert_eq!(cached_after, 0);
 }
 
 #[test]

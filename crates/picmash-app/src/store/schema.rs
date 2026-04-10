@@ -1,5 +1,6 @@
 use super::faces::{assign_face_identity_tx, create_face_identity_tx};
 use super::*;
+use crate::identity::{RenderHash, VisualKey};
 
 impl Store {
     pub(super) fn init_schema(&self) -> anyhow::Result<()> {
@@ -15,6 +16,7 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL,
                 preferred_blob_id TEXT,
+                render_hash TEXT,
                 visual_key TEXT,
                 pixel_width INTEGER NOT NULL DEFAULT 0,
                 pixel_height INTEGER NOT NULL DEFAULT 0,
@@ -307,13 +309,16 @@ impl Store {
                 height INTEGER NOT NULL DEFAULT 0,
                 cached_path TEXT,
                 blob_id TEXT,
+                render_hash TEXT,
                 visual_key TEXT,
                 embedding_model TEXT,
                 embedding_dim INTEGER,
                 embedding BLOB,
                 rotation_quarters INTEGER NOT NULL DEFAULT 0,
                 hidden INTEGER NOT NULL DEFAULT 0,
+                resolved_asset_id TEXT REFERENCES assets(id) ON DELETE SET NULL,
                 imported_asset_id TEXT REFERENCES assets(id) ON DELETE SET NULL,
+                import_pending INTEGER NOT NULL DEFAULT 0,
                 last_seen_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -324,6 +329,15 @@ impl Store {
                 win_count INTEGER NOT NULL DEFAULT 0,
                 loss_count INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (source_key, post_no)
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_external_import_outcomes (
+                item_id INTEGER PRIMARY KEY REFERENCES external_items(id) ON DELETE CASCADE,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                corpus_id INTEGER NOT NULL REFERENCES corpora(id) ON DELETE CASCADE,
+                outcome_kind TEXT NOT NULL,
+                queued_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS external_events (
@@ -359,6 +373,7 @@ impl Store {
         self.ensure_column("sessions", "nudges", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("sessions", "hearts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("assets", "preferred_blob_id", "TEXT")?;
+        self.ensure_column("assets", "render_hash", "TEXT")?;
         self.ensure_column("assets", "visual_key", "TEXT")?;
         self.ensure_column("assets", "pixel_width", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("assets", "pixel_height", "INTEGER NOT NULL DEFAULT 0")?;
@@ -413,6 +428,7 @@ impl Store {
         self.ensure_column("external_items", "stream_title", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("external_items", "cached_path", "TEXT")?;
         self.ensure_column("external_items", "blob_id", "TEXT")?;
+        self.ensure_column("external_items", "render_hash", "TEXT")?;
         self.ensure_column("external_items", "visual_key", "TEXT")?;
         self.ensure_column("external_items", "embedding_model", "TEXT")?;
         self.ensure_column("external_items", "embedding_dim", "INTEGER")?;
@@ -423,7 +439,13 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         self.ensure_column("external_items", "hidden", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("external_items", "resolved_asset_id", "TEXT")?;
         self.ensure_column("external_items", "imported_asset_id", "TEXT")?;
+        self.ensure_column(
+            "external_items",
+            "import_pending",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         self.ensure_column(
             "external_items",
             "selected_count",
@@ -492,11 +514,35 @@ impl Store {
             [],
         )?;
         self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_items_source_resolution_visibility ON external_items(source_key, hidden, resolved_asset_id, imported_asset_id, import_pending)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_items_import_pending ON external_items(import_pending) WHERE import_pending != 0",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assets_render_hash ON assets(render_hash) WHERE render_hash IS NOT NULL",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assets_visual_key ON assets(visual_key) WHERE visual_key IS NOT NULL",
+            [],
+        )?;
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_external_items_md5 ON external_items(md5) WHERE md5 IS NOT NULL",
             [],
         )?;
         self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_items_render_hash ON external_items(render_hash) WHERE render_hash IS NOT NULL",
+            [],
+        )?;
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_external_items_visual_key ON external_items(visual_key) WHERE visual_key IS NOT NULL",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_items_resolved_asset_id ON external_items(resolved_asset_id) WHERE resolved_asset_id IS NOT NULL",
             [],
         )?;
         self.conn.execute(
@@ -760,10 +806,83 @@ impl Store {
 
     pub(super) fn run_bootstrap_maintenance(&self) -> anyhow::Result<()> {
         self.backfill_asset_identity_metadata()?;
+        self.backfill_external_item_identity_metadata()?;
+        self.backfill_external_item_asset_resolution()?;
         self.backfill_hidden_external_item_tombstones()?;
         self.backfill_face_identity_rows()?;
         self.backfill_face_identity_bindings()?;
         Ok(())
+    }
+
+    pub(super) fn run_bootstrap_maintenance_batch(
+        &self,
+        phase: &str,
+        limit: usize,
+    ) -> anyhow::Result<BootstrapMaintenanceProgress> {
+        let limit = limit.max(1);
+        match phase {
+            BOOTSTRAP_PHASE_ASSET_IDENTITY => {
+                let (processed, more) = self.backfill_asset_identity_metadata_batch(limit)?;
+                Ok(bootstrap_progress(
+                    BOOTSTRAP_PHASE_ASSET_IDENTITY,
+                    processed,
+                    more,
+                    Some(BOOTSTRAP_PHASE_EXTERNAL_IDENTITY),
+                ))
+            }
+            BOOTSTRAP_PHASE_EXTERNAL_IDENTITY => {
+                let (processed, more) =
+                    self.backfill_external_item_identity_metadata_batch(limit)?;
+                Ok(bootstrap_progress(
+                    BOOTSTRAP_PHASE_EXTERNAL_IDENTITY,
+                    processed,
+                    more,
+                    Some(BOOTSTRAP_PHASE_EXTERNAL_RESOLUTION),
+                ))
+            }
+            BOOTSTRAP_PHASE_EXTERNAL_RESOLUTION => {
+                let (processed, more) =
+                    self.backfill_external_item_asset_resolution_batch(limit)?;
+                Ok(bootstrap_progress(
+                    BOOTSTRAP_PHASE_EXTERNAL_RESOLUTION,
+                    processed,
+                    more,
+                    Some(BOOTSTRAP_PHASE_HIDDEN_TOMBSTONES),
+                ))
+            }
+            BOOTSTRAP_PHASE_HIDDEN_TOMBSTONES => {
+                let (processed, more) =
+                    self.backfill_hidden_external_item_tombstones_batch(limit)?;
+                Ok(bootstrap_progress(
+                    BOOTSTRAP_PHASE_HIDDEN_TOMBSTONES,
+                    processed,
+                    more,
+                    Some(BOOTSTRAP_PHASE_FACE_IDENTITY_ROWS),
+                ))
+            }
+            BOOTSTRAP_PHASE_FACE_IDENTITY_ROWS => {
+                let (processed, more) = self.backfill_face_identity_rows_batch(limit)?;
+                Ok(bootstrap_progress(
+                    BOOTSTRAP_PHASE_FACE_IDENTITY_ROWS,
+                    processed,
+                    more,
+                    Some(BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS),
+                ))
+            }
+            BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS => {
+                let (processed, more) = self.backfill_face_identity_bindings_batch(limit)?;
+                Ok(bootstrap_progress(
+                    BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS,
+                    processed,
+                    more,
+                    None,
+                ))
+            }
+            _ => Ok(BootstrapMaintenanceProgress {
+                processed: 0,
+                requeue_phase: None,
+            }),
+        }
     }
 
     fn ensure_column(
@@ -885,7 +1004,9 @@ impl Store {
             r"
             SELECT a.id
             FROM assets a
-            WHERE a.visual_key IS NULL
+            WHERE a.render_hash IS NULL
+               OR a.render_hash = ''
+               OR a.visual_key IS NULL
                OR a.visual_key = ''
                OR a.preferred_blob_id IS NULL
                OR a.pixel_width = 0
@@ -906,14 +1027,16 @@ impl Store {
                 r"
                 UPDATE assets
                 SET preferred_blob_id = COALESCE(preferred_blob_id, ?2),
-                    visual_key = COALESCE(NULLIF(visual_key, ''), ?3),
-                    pixel_width = CASE WHEN pixel_width = 0 THEN ?4 ELSE pixel_width END,
-                    pixel_height = CASE WHEN pixel_height = 0 THEN ?5 ELSE pixel_height END
+                    render_hash = COALESCE(NULLIF(render_hash, ''), ?3),
+                    visual_key = COALESCE(NULLIF(visual_key, ''), ?4),
+                    pixel_width = CASE WHEN pixel_width = 0 THEN ?5 ELSE pixel_width END,
+                    pixel_height = CASE WHEN pixel_height = 0 THEN ?6 ELSE pixel_height END
                 WHERE id = ?1
                 ",
                 params![
                     asset_id,
                     identity.blob_id.0,
+                    identity.render_hash.0,
                     identity.visual_key.0,
                     i64::from(identity.width),
                     i64::from(identity.height),
@@ -921,6 +1044,266 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    fn backfill_asset_identity_metadata_batch(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<(usize, bool)> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT a.id
+            FROM assets a
+            WHERE a.render_hash IS NULL
+               OR a.render_hash = ''
+               OR a.visual_key IS NULL
+               OR a.visual_key = ''
+               OR a.preferred_blob_id IS NULL
+               OR a.pixel_width = 0
+               OR a.pixel_height = 0
+            ORDER BY a.created_at ASC, a.id ASC
+            LIMIT ?1
+            ",
+        )?;
+        let mut asset_ids = stmt
+            .query_map([i64::try_from(limit + 1)?], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = asset_ids.len() > limit;
+        asset_ids.truncate(limit);
+        let mut processed = 0usize;
+        for asset_id in asset_ids {
+            let Some(identity) = self.best_asset_identity_source(&AssetId(asset_id.clone()))?
+            else {
+                continue;
+            };
+            self.conn.execute(
+                r"
+                UPDATE assets
+                SET preferred_blob_id = COALESCE(preferred_blob_id, ?2),
+                    render_hash = COALESCE(NULLIF(render_hash, ''), ?3),
+                    visual_key = COALESCE(NULLIF(visual_key, ''), ?4),
+                    pixel_width = CASE WHEN pixel_width = 0 THEN ?5 ELSE pixel_width END,
+                    pixel_height = CASE WHEN pixel_height = 0 THEN ?6 ELSE pixel_height END
+                WHERE id = ?1
+                ",
+                params![
+                    asset_id,
+                    identity.blob_id.0,
+                    identity.render_hash.0,
+                    identity.visual_key.0,
+                    i64::from(identity.width),
+                    i64::from(identity.height),
+                ],
+            )?;
+            processed += 1;
+        }
+        Ok((processed, more))
+    }
+
+    fn backfill_external_item_identity_metadata(&self) -> anyhow::Result<()> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT id, cached_path
+            FROM external_items
+            WHERE cached_path IS NOT NULL
+              AND (
+                    blob_id IS NULL
+                 OR blob_id = ''
+                 OR render_hash IS NULL
+                 OR render_hash = ''
+                 OR visual_key IS NULL
+                 OR visual_key = ''
+              )
+            ORDER BY id ASC
+            ",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    RemoteItemId(row.get(0)?),
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (item_id, path) in rows {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(identity) = inspect_image_bytes(&bytes) else {
+                continue;
+            };
+            let _ = self.save_external_item_identity(item_id, &identity, &path)?;
+        }
+        Ok(())
+    }
+
+    fn backfill_external_item_identity_metadata_batch(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<(usize, bool)> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT id, cached_path
+            FROM external_items
+            WHERE cached_path IS NOT NULL
+              AND (
+                    blob_id IS NULL
+                 OR blob_id = ''
+                 OR render_hash IS NULL
+                 OR render_hash = ''
+                 OR visual_key IS NULL
+                 OR visual_key = ''
+              )
+            ORDER BY id ASC
+            LIMIT ?1
+            ",
+        )?;
+        let mut rows = stmt
+            .query_map([i64::try_from(limit + 1)?], |row| {
+                Ok((
+                    RemoteItemId(row.get(0)?),
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let mut processed = 0usize;
+        for (item_id, path) in rows {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(identity) = inspect_image_bytes(&bytes) else {
+                continue;
+            };
+            let _ = self.save_external_item_identity(item_id, &identity, &path)?;
+            processed += 1;
+        }
+        Ok((processed, more))
+    }
+
+    fn backfill_external_item_asset_resolution(&self) -> anyhow::Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("opening external identity resolution backfill transaction")?;
+        let rows = tx
+            .prepare(
+                r"
+                SELECT id, blob_id, render_hash, visual_key
+                FROM external_items
+                WHERE resolved_asset_id IS NULL
+                  AND imported_asset_id IS NULL
+                  AND blob_id IS NOT NULL
+                  AND blob_id <> ''
+                  AND render_hash IS NOT NULL
+                  AND render_hash <> ''
+                  AND visual_key IS NOT NULL
+                  AND visual_key <> ''
+                ORDER BY id ASC
+                ",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    RemoteItemId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (item_id, blob_id, render_hash, visual_key) in rows {
+            let identity = ImageIdentity {
+                blob_id: BlobId(blob_id),
+                render_hash: RenderHash(render_hash),
+                visual_key: VisualKey(visual_key),
+                width: 0,
+                height: 0,
+                byte_len: 0,
+            };
+            let Some(asset_id) = resolve_asset_id_for_identity(&tx, &identity)? else {
+                continue;
+            };
+            tx.execute(
+                r"
+                UPDATE external_items
+                SET resolved_asset_id = ?2,
+                    updated_at = ?3
+                WHERE id = ?1
+                ",
+                params![item_id.0, asset_id.0, now_ts()],
+            )?;
+        }
+        tx.commit()
+            .context("committing external identity resolution backfill transaction")?;
+        Ok(())
+    }
+
+    fn backfill_external_item_asset_resolution_batch(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<(usize, bool)> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("opening external identity resolution backfill batch transaction")?;
+        let mut rows = tx
+            .prepare(
+                r"
+                SELECT id, blob_id, render_hash, visual_key
+                FROM external_items
+                WHERE resolved_asset_id IS NULL
+                  AND imported_asset_id IS NULL
+                  AND blob_id IS NOT NULL
+                  AND blob_id <> ''
+                  AND render_hash IS NOT NULL
+                  AND render_hash <> ''
+                  AND visual_key IS NOT NULL
+                  AND visual_key <> ''
+                ORDER BY id ASC
+                LIMIT ?1
+                ",
+            )?
+            .query_map([i64::try_from(limit + 1)?], |row| {
+                Ok((
+                    RemoteItemId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let mut processed = 0usize;
+        for (item_id, blob_id, render_hash, visual_key) in rows {
+            let identity = ImageIdentity {
+                blob_id: BlobId(blob_id),
+                render_hash: RenderHash(render_hash),
+                visual_key: VisualKey(visual_key),
+                width: 0,
+                height: 0,
+                byte_len: 0,
+            };
+            let Some(asset_id) = resolve_asset_id_for_identity(&tx, &identity)? else {
+                continue;
+            };
+            tx.execute(
+                r"
+                UPDATE external_items
+                SET resolved_asset_id = ?2,
+                    updated_at = ?3
+                WHERE id = ?1
+                ",
+                params![item_id.0, asset_id.0, now_ts()],
+            )?;
+            processed += 1;
+        }
+        tx.commit()
+            .context("committing external identity resolution backfill batch transaction")?;
+        Ok((processed, more))
     }
 
     fn best_asset_identity_source(
@@ -977,6 +1360,27 @@ impl Store {
         tx.commit()
             .context("committing face identity backfill transaction")?;
         Ok(())
+    }
+
+    fn backfill_face_identity_rows_batch(&self, limit: usize) -> anyhow::Result<(usize, bool)> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("opening face identity backfill batch transaction")?;
+        let mut missing_faces = tx
+            .prepare("SELECT id FROM faces WHERE identity_id IS NULL ORDER BY id ASC LIMIT ?1")?
+            .query_map([i64::try_from(limit + 1)?], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = missing_faces.len() > limit;
+        missing_faces.truncate(limit);
+        let processed = missing_faces.len();
+        for face_id in missing_faces {
+            let identity_id = create_face_identity_tx(&tx, None)?;
+            assign_face_identity_tx(&tx, FaceId(face_id), identity_id)?;
+        }
+        tx.commit()
+            .context("committing face identity backfill batch transaction")?;
+        Ok((processed, more))
     }
 
     fn backfill_face_identity_bindings(&self) -> anyhow::Result<()> {
@@ -1046,10 +1450,81 @@ impl Store {
         Ok(())
     }
 
+    fn backfill_face_identity_bindings_batch(&self, limit: usize) -> anyhow::Result<(usize, bool)> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("opening face identity binding backfill batch transaction")?;
+
+        let mut stmt = tx.prepare(
+            r"
+            SELECT asset_id, remote_item_id, geometry_key, identity_id
+            FROM faces
+            WHERE identity_id IS NOT NULL
+              AND geometry_key IS NOT NULL
+              AND geometry_key <> ''
+            ORDER BY id ASC
+            LIMIT ?1
+            ",
+        )?;
+        let mut rows = stmt
+            .query_map([i64::try_from(limit + 1)?], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let processed = rows.len();
+        for (asset_id, remote_item_id, geometry_key, identity_id) in rows {
+            match (asset_id, remote_item_id) {
+                (Some(asset_id), None) => {
+                    tx.execute(
+                        r"
+                        INSERT OR IGNORE INTO face_identity_bindings (
+                            asset_id,
+                            remote_item_id,
+                            geometry_key,
+                            identity_id,
+                            created_at
+                        ) VALUES (?1, NULL, ?2, ?3, ?4)
+                        ",
+                        params![asset_id, geometry_key, identity_id, now_ts()],
+                    )?;
+                }
+                (None, Some(remote_item_id)) => {
+                    tx.execute(
+                        r"
+                        INSERT OR IGNORE INTO face_identity_bindings (
+                            asset_id,
+                            remote_item_id,
+                            geometry_key,
+                            identity_id,
+                            created_at
+                        ) VALUES (NULL, ?1, ?2, ?3, ?4)
+                        ",
+                        params![remote_item_id, geometry_key, identity_id, now_ts()],
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        tx.commit()
+            .context("committing face identity binding backfill batch transaction")?;
+        Ok((processed, more))
+    }
+
     fn backfill_hidden_external_item_tombstones(&self) -> anyhow::Result<()> {
         let mut stmt = self.conn.prepare(
             r"
-            SELECT id, cached_path, blob_id, visual_key
+            SELECT id, cached_path, blob_id, render_hash, visual_key
             FROM external_items ei
             WHERE ei.hidden = 1
               AND ei.cached_path IS NOT NULL
@@ -1075,16 +1550,20 @@ impl Store {
                 PathBuf::from(row.get::<_, String>(1)?),
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
 
         let mut recovered = 0usize;
         let mut propagated = 0usize;
         for row in rows {
-            let (item_id, cached_path, blob_id, visual_key) = row?;
-            let identity = if let (Some(blob_id), Some(visual_key)) = (blob_id, visual_key) {
+            let (item_id, cached_path, blob_id, render_hash, visual_key) = row?;
+            let identity = if let (Some(blob_id), Some(render_hash), Some(visual_key)) =
+                (blob_id, render_hash, visual_key)
+            {
                 ImageIdentity {
                     blob_id: BlobId(blob_id),
+                    render_hash: RenderHash(render_hash),
                     visual_key: crate::identity::VisualKey(visual_key),
                     width: 0,
                     height: 0,
@@ -1166,5 +1645,162 @@ impl Store {
             );
         }
         Ok(())
+    }
+
+    fn backfill_hidden_external_item_tombstones_batch(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<(usize, bool)> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT id, cached_path, blob_id, render_hash, visual_key
+            FROM external_items ei
+            WHERE ei.hidden = 1
+              AND ei.cached_path IS NOT NULL
+              AND (
+                    ei.blob_id IS NULL
+                 OR ei.visual_key IS NULL
+                 OR NOT EXISTS (
+                        SELECT 1
+                        FROM external_item_tombstones t
+                        WHERE t.blob_id = ei.blob_id
+                    )
+                 OR NOT EXISTS (
+                        SELECT 1
+                        FROM external_item_tombstones t
+                        WHERE t.visual_key = ei.visual_key
+                    )
+              )
+            ORDER BY ei.id ASC
+            LIMIT ?1
+            ",
+        )?;
+        let mut rows = stmt
+            .query_map([i64::try_from(limit + 1)?], |row| {
+                Ok((
+                    RemoteItemId(row.get(0)?),
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+
+        let mut processed = 0usize;
+        for (item_id, cached_path, blob_id, render_hash, visual_key) in rows {
+            let identity = if let (Some(blob_id), Some(render_hash), Some(visual_key)) =
+                (blob_id, render_hash, visual_key)
+            {
+                ImageIdentity {
+                    blob_id: BlobId(blob_id),
+                    render_hash: RenderHash(render_hash),
+                    visual_key: crate::identity::VisualKey(visual_key),
+                    width: 0,
+                    height: 0,
+                    byte_len: 0,
+                }
+            } else {
+                let bytes = match fs::read(&cached_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        warn!(
+                            item_id = item_id.0,
+                            path = %cached_path.display(),
+                            error = %error,
+                            "failed to read hidden remote for tombstone backfill"
+                        );
+                        continue;
+                    }
+                };
+                let identity = match inspect_image_bytes(&bytes) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(
+                            item_id = item_id.0,
+                            path = %cached_path.display(),
+                            error = %format!("{error:#}"),
+                            "failed to inspect hidden remote for tombstone backfill"
+                        );
+                        continue;
+                    }
+                };
+                self.conn.execute(
+                    r"
+                    UPDATE external_items
+                    SET blob_id = ?2,
+                        visual_key = ?3,
+                        updated_at = ?4
+                    WHERE id = ?1
+                    ",
+                    params![
+                        item_id.0,
+                        identity.blob_id.0.as_str(),
+                        identity.visual_key.0.as_str(),
+                        now_ts()
+                    ],
+                )?;
+                identity
+            };
+            let blob_id = identity.blob_id.0.clone();
+            let visual_key = identity.visual_key.0.clone();
+
+            self.conn.execute(
+                r"
+                INSERT OR IGNORE INTO external_item_tombstones (blob_id, visual_key, created_at)
+                VALUES (?1, ?2, ?3)
+                ",
+                params![blob_id.as_str(), visual_key.as_str(), now_ts()],
+            )?;
+            self.conn.execute(
+                r"
+                UPDATE external_items
+                SET hidden = 1,
+                    updated_at = ?3
+                WHERE hidden = 0
+                  AND imported_asset_id IS NULL
+                  AND (
+                    blob_id = ?1
+                    OR visual_key = ?2
+                  )
+                ",
+                params![blob_id.as_str(), visual_key.as_str(), now_ts()],
+            )?;
+            processed += 1;
+        }
+        Ok((processed, more))
+    }
+}
+
+pub const BOOTSTRAP_PHASE_INITIAL: &str = BOOTSTRAP_PHASE_ASSET_IDENTITY;
+const BOOTSTRAP_PHASE_ASSET_IDENTITY: &str = "asset_identity";
+const BOOTSTRAP_PHASE_EXTERNAL_IDENTITY: &str = "external_identity";
+const BOOTSTRAP_PHASE_EXTERNAL_RESOLUTION: &str = "external_resolution";
+const BOOTSTRAP_PHASE_HIDDEN_TOMBSTONES: &str = "hidden_tombstones";
+const BOOTSTRAP_PHASE_FACE_IDENTITY_ROWS: &str = "face_identity_rows";
+pub const BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS: &str = "face_identity_bindings";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapMaintenanceProgress {
+    pub processed: usize,
+    pub requeue_phase: Option<&'static str>,
+}
+
+fn bootstrap_progress(
+    current_phase: &'static str,
+    processed: usize,
+    more_in_phase: bool,
+    next_phase: Option<&'static str>,
+) -> BootstrapMaintenanceProgress {
+    let requeue_phase = if more_in_phase && processed > 0 {
+        Some(current_phase)
+    } else {
+        next_phase
+    };
+    BootstrapMaintenanceProgress {
+        processed,
+        requeue_phase,
     }
 }

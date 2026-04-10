@@ -1,14 +1,19 @@
 use std::{
     fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     time::Duration as StdDuration,
 };
 
 use anyhow::Context;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use html_escape::decode_html_entities;
 use image::{ImageDecoder, image_dimensions};
 use jxl_oxide::integration::JxlDecoder;
+use md5::compute as md5_digest;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer};
+use tempfile::NamedTempFile;
 use tracing::info;
 use walkdir::WalkDir;
 
@@ -302,8 +307,12 @@ impl SourceScanner {
             item.post_no,
             ext
         ));
-        if cache_path.exists() {
+        if cached_remote_image_is_sound(&cache_path, item)? {
             return Ok(cache_path);
+        }
+        if cache_path.exists() {
+            fs::remove_file(&cache_path)
+                .with_context(|| format!("removing stale remote cache {}", cache_path.display()))?;
         }
 
         let bytes = self
@@ -315,9 +324,79 @@ impl SourceScanner {
             .with_context(|| format!("reading remote image {}", item.image_url))?
             .bytes()
             .with_context(|| format!("collecting remote image {}", item.image_url))?;
-        fs::write(&cache_path, &bytes)
-            .with_context(|| format!("writing remote cache {}", cache_path.display()))?;
+        ensure_remote_payload_matches_snapshot(bytes.as_ref(), item).with_context(|| {
+            format!(
+                "validating fetched remote image {} against source snapshot",
+                item.image_url
+            )
+        })?;
+        persist_remote_cache_atomically(&source_dir, &cache_path, bytes.as_ref())?;
         Ok(cache_path)
+    }
+}
+
+fn cached_remote_image_is_sound(path: &Path, item: &RemoteItemSnapshot) -> anyhow::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if item.file_size > 0 {
+        let cached_len = fs::metadata(path)
+            .with_context(|| format!("reading remote cache metadata {}", path.display()))?
+            .len();
+        if cached_len != item.file_size {
+            return Ok(false);
+        }
+    }
+    if item.md5.is_none() {
+        return Ok(true);
+    }
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading cached remote image {}", path.display()))?;
+    Ok(remote_payload_matches_snapshot(&bytes, item))
+}
+
+fn ensure_remote_payload_matches_snapshot(
+    bytes: &[u8],
+    item: &RemoteItemSnapshot,
+) -> anyhow::Result<()> {
+    if remote_payload_matches_snapshot(bytes, item) {
+        Ok(())
+    } else {
+        anyhow::bail!("remote payload does not match source snapshot");
+    }
+}
+
+fn remote_payload_matches_snapshot(bytes: &[u8], item: &RemoteItemSnapshot) -> bool {
+    if item.file_size > 0 && u64::try_from(bytes.len()).ok() != Some(item.file_size) {
+        return false;
+    }
+    item.md5.as_ref().is_none_or(|expected| {
+        let actual = BASE64_STANDARD.encode(md5_digest(bytes).0);
+        actual == *expected
+    })
+}
+
+fn persist_remote_cache_atomically(
+    source_dir: &Path,
+    cache_path: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let mut temp = NamedTempFile::new_in(source_dir)
+        .with_context(|| format!("allocating temp cache file in {}", source_dir.display()))?;
+    temp.write_all(bytes)
+        .with_context(|| format!("writing temp remote cache {}", temp.path().display()))?;
+    temp.flush()
+        .with_context(|| format!("flushing temp remote cache {}", temp.path().display()))?;
+    match temp.persist(cache_path) {
+        Ok(_) => Ok(()),
+        Err(_error) if cache_path.exists() => Ok(()),
+        Err(error) => Err(error.error).with_context(|| {
+            format!(
+                "persisting temp remote cache {} -> {}",
+                error.file.path().display(),
+                cache_path.display()
+            )
+        }),
     }
 }
 
@@ -450,9 +529,10 @@ fn thread_title(thread: &FourChanThreadResponse) -> String {
 
 fn post_title(post: &FourChanPost) -> String {
     post.sub
-        .clone()
-        .or_else(|| post.filename.clone())
-        .or_else(|| post.semantic_url.clone())
+        .as_deref()
+        .map(decode_4chan_text)
+        .or_else(|| post.filename.as_deref().map(decode_4chan_text))
+        .or_else(|| post.semantic_url.as_deref().map(decode_4chan_text))
         .unwrap_or_else(|| {
             if post.resto == 0 {
                 format!("thread {}", post.no)
@@ -460,6 +540,14 @@ fn post_title(post: &FourChanPost) -> String {
                 format!("post {}", post.no)
             }
         })
+}
+
+fn decode_4chan_text(text: &str) -> String {
+    if text.contains('&') {
+        decode_html_entities(text).into_owned()
+    } else {
+        text.to_owned()
+    }
 }
 
 fn sanitize_source_key(source_key: &str) -> String {
@@ -540,7 +628,10 @@ mod tests {
     use image::{Rgb, RgbImage};
     use ulid::Ulid;
 
-    use super::{SourceScanner, supported_ext};
+    use super::{
+        FourChanPost, FourChanThreadResponse, SourceScanner, post_title, supported_ext,
+        thread_title,
+    };
     use crate::config::{
         ImportPolicy, LocalDirectorySource, RemoteImageFilterConfig, SourceConfig, UpstreamSource,
     };
@@ -566,6 +657,67 @@ mod tests {
         assert!(supported_ext(".jxl", false));
         assert!(!supported_ext(".webm", false));
         assert!(supported_ext(".webm", true));
+    }
+
+    #[test]
+    fn post_title_decodes_html_entities_in_subjects() {
+        let post = FourChanPost {
+            no: 42,
+            resto: 0,
+            sub: Some("Tom &amp; Jerry &#039;96".to_owned()),
+            filename: None,
+            semantic_url: None,
+            tim: None,
+            ext: None,
+            file_size: 0,
+            width: 0,
+            height: 0,
+            md5: None,
+        };
+
+        assert_eq!(post_title(&post), "Tom & Jerry '96");
+    }
+
+    #[test]
+    fn thread_title_decodes_html_entities_in_fallback_title_fields() {
+        let thread = FourChanThreadResponse {
+            posts: vec![FourChanPost {
+                no: 777,
+                resto: 0,
+                sub: None,
+                filename: Some("A &amp; B".to_owned()),
+                semantic_url: Some("ignored".to_owned()),
+                tim: None,
+                ext: None,
+                file_size: 0,
+                width: 0,
+                height: 0,
+                md5: None,
+            }],
+        };
+
+        assert_eq!(thread_title(&thread), "A & B");
+    }
+
+    #[test]
+    fn remote_payload_matching_rejects_truncated_or_tampered_bytes() {
+        let item = super::RemoteItemSnapshot {
+            thread_no: 1,
+            post_no: 2,
+            title: "post 2".to_owned(),
+            image_url: "https://example.invalid/thread/2.jpg".to_owned(),
+            thumb_url: "https://example.invalid/thread/2s.jpg".to_owned(),
+            ext: ".jpg".to_owned(),
+            md5: Some("XUFAKrxLKna5cZ2REBfFkg==".to_owned()),
+            width: 1,
+            height: 1,
+            file_size: 5,
+            materialized_path: None,
+        };
+
+        assert!(super::remote_payload_matches_snapshot(b"hello", &item));
+        assert!(!super::remote_payload_matches_snapshot(b"hell", &item));
+        assert!(!super::remote_payload_matches_snapshot(b"world", &item));
     }
 
     #[test]

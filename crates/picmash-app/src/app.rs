@@ -1,10 +1,10 @@
 use std::{
+    any::Any,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     thread,
-    time::Instant,
 };
 
 use anyhow::{Context, bail};
@@ -25,15 +25,15 @@ use crate::{
         ClaimedMaintenanceJob, MaintenanceJobKind, MaintenanceJobSpec, MaintenancePriority,
     },
     model::{
-        ARENA_RECENT_REPEAT_EXCLUDE, ArenaCard, ArenaHandle, ArenaLocalCard, ArenaPair,
-        ArenaRemoteCard, ArenaView, AssetDomainView, AssetId, AssetQualitySummary, AssetRecord,
-        BoardEntry, ClusterSatellite, CorpusId, DuplicateCluster, ExploreEntry, ExploreMapMode,
-        ExploreNeighbor, ExplorePanels, ExploreSelection, ExploreTriad, ExploreView,
-        ExternalArenaStatus, ExternalEventKind, FaceId, FaceIdentityId, LATENT_DIM, MAP_DIM,
-        PosteriorSummary, ProjectionModel, RemoteCandidate, RemoteItemId, SIMILARITY_DIM,
-        SessionEmbeddingHead, SessionId, SessionRecord, SimilarityChoice, SimilarityModel,
-        certainty, dot, learned_reduce_points, prepare_raw_layout_space, sample_softmax_index,
-        session_utility, sigmoid, subtract, weighted_choice_index,
+        ARENA_RECENT_REPEAT_EXCLUDE, ARENA_RECENT_VISUAL_EXCLUDE, ArenaCard, ArenaHandle,
+        ArenaLocalCard, ArenaPair, ArenaRemoteCard, ArenaView, AssetDomainView, AssetId,
+        AssetQualitySummary, AssetRecord, BoardEntry, ClusterSatellite, CorpusId, DuplicateCluster,
+        ExploreEntry, ExploreMapMode, ExploreNeighbor, ExplorePanels, ExploreSelection,
+        ExploreTriad, ExploreView, ExternalArenaStatus, ExternalEventKind, FaceId, FaceIdentityId,
+        LATENT_DIM, MAP_DIM, PosteriorSummary, ProjectionModel, RemoteCandidate, RemoteItemId,
+        SIMILARITY_DIM, SessionEmbeddingHead, SessionId, SessionRecord, SimilarityChoice,
+        SimilarityModel, certainty, dot, learned_reduce_points, prepare_raw_layout_space,
+        sample_softmax_index, session_utility, sigmoid, subtract, weighted_choice_index,
     },
     onnx::OnnxEngine,
     quality::{
@@ -54,7 +54,6 @@ mod arena;
 mod explore;
 mod external;
 mod facemash;
-mod gate;
 mod identities;
 mod lifecycle;
 mod maintenance;
@@ -65,6 +64,7 @@ mod state;
 mod support;
 #[cfg(test)]
 mod tests;
+mod writer;
 
 use self::ready_frontier::{
     REMOTE_SOURCE_IDLE_SCAN_GRACE, ReadyTargetProfile, SourceReadyFrontier,
@@ -190,8 +190,7 @@ impl UnaryFeedback {
 }
 
 pub struct AppState {
-    store: Mutex<Store>,
-    db_write_gate: gate::DbWriteGate,
+    writer: writer::DbWriter,
     db_path: PathBuf,
     config: RwLock<AppConfig>,
     config_path: PathBuf,
@@ -201,6 +200,7 @@ pub struct AppState {
     active: ActiveArena,
     root_path: PathBuf,
     cache_root: std::path::PathBuf,
+    session_field_cache: RwLock<Option<SessionField>>,
     explore_layouts: RwLock<HashMap<ExploreMapMode, ExploreLayoutCache>>,
     explore_vectors: RwLock<Option<ExploreVectorCache>>,
     asset_domain_oracle: RwLock<Option<AssetDomainOracle>>,

@@ -10,6 +10,7 @@ pub const LATENT_DIM: usize = 3;
 pub const SIMILARITY_DIM: usize = 5;
 pub const MAP_DIM: usize = 2;
 pub const ARENA_RECENT_REPEAT_EXCLUDE: usize = 100;
+pub const ARENA_RECENT_VISUAL_EXCLUDE: usize = 150;
 pub const ORDINAL_BOOTSTRAP_TRIADS: usize = 24;
 
 pub use self::{
@@ -19,8 +20,8 @@ pub use self::{
     },
     projection::{EmbeddingRecord, ProjectionModel, SessionEmbeddingHead},
     records::{
-        AssetRecord, ExternalEventKind, RemoteCandidate, RemoteItemRecord, SessionRecord,
-        SessionSubsourceLock,
+        AssetRecord, ExternalEventKind, PendingExternalImportOutcome, RemoteCandidate,
+        RemoteItemRecord, SessionRecord, SessionSubsourceLock,
     },
     scoring::{
         canonical_utility, certainty, dot, sample_softmax_index, session_focus, session_utility,

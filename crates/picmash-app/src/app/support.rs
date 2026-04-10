@@ -1,4 +1,6 @@
 use super::*;
+use crate::identity::VisualKey;
+use std::collections::HashSet;
 
 impl SessionField {
     pub(super) fn fallback_quality_summary(&self, asset: &AssetRecord) -> AssetQualitySummary {
@@ -501,6 +503,7 @@ pub(super) fn choose_local_pair(
     field: &SessionField,
     store: &Store,
     explore: f32,
+    excluded_visual_keys: &HashSet<VisualKey>,
 ) -> anyhow::Result<Option<ArenaPair>> {
     if assets.len() < 2 {
         return Ok(None);
@@ -516,13 +519,13 @@ pub(super) fn choose_local_pair(
     let usable = assets
         .iter()
         .filter(|asset| !recent.contains(&asset.id))
+        .filter(|asset| !asset_visual_key_excluded(asset, excluded_visual_keys))
         .cloned()
         .collect::<Vec<_>>();
-    let pool = if usable.len() >= 2 {
-        usable
-    } else {
-        assets.to_vec()
-    };
+    if usable.len() < 2 {
+        return Ok(None);
+    }
+    let pool = usable;
     let mut rng = rng();
     let temperature = arena_sampling_temperature(explore);
     let uniform_mix = arena_uniform_mix(explore);
@@ -578,6 +581,7 @@ pub(super) fn choose_local_pair_against_anchor(
     field: &SessionField,
     store: &Store,
     explore: f32,
+    excluded_visual_keys: &HashSet<VisualKey>,
 ) -> anyhow::Result<Option<ArenaPair>> {
     if assets.len() < 2 {
         return Ok(None);
@@ -594,17 +598,10 @@ pub(super) fn choose_local_pair_against_anchor(
     let usable = assets
         .iter()
         .filter(|asset| asset.id != anchor.id && !recent.contains(&asset.id))
+        .filter(|asset| !asset_visual_key_excluded(asset, excluded_visual_keys))
         .cloned()
         .collect::<Vec<_>>();
-    let pool = if usable.is_empty() {
-        assets
-            .iter()
-            .filter(|asset| asset.id != anchor.id)
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        usable
-    };
+    let pool = usable;
     if pool.is_empty() {
         return Ok(None);
     }
@@ -714,6 +711,16 @@ pub(super) fn visible_assets(
     Ok(assets)
 }
 
+pub(super) fn asset_visual_key_excluded(
+    asset: &AssetRecord,
+    excluded_visual_keys: &HashSet<VisualKey>,
+) -> bool {
+    asset
+        .visual_key
+        .as_ref()
+        .is_some_and(|visual_key| excluded_visual_keys.contains(visual_key))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -739,18 +746,19 @@ mod tests {
             exact_offsets: HashMap::new(),
             hearted_assets: HashSet::new(),
             subsource_lock: None,
-            embeddings: HashMap::new(),
+            embeddings: HashMap::new().into(),
             embedding_head: None,
-            hierarchical_assets: HashMap::new(),
-            dominant_faces: HashMap::new(),
+            hierarchical_assets: HashMap::new().into(),
+            dominant_faces: HashMap::new().into(),
             hierarchical_session: None,
-            perturbative_assets: HashMap::new(),
+            perturbative_assets: HashMap::new().into(),
             perturbative_session: None,
             perturbative_hyper: PerturbativeHyperParamsV3::default(),
         };
         let asset = AssetRecord {
             id: AssetId("asset_test".to_owned()),
             path: PathBuf::from("/tmp/asset_test.png"),
+            visual_key: None,
             width: 1024,
             height: 1024,
             alpha: 1.25,

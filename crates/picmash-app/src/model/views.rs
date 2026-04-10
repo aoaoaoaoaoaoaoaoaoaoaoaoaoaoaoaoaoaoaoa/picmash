@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use ts_rs::TS;
 
 use crate::asset_domain::{AssetDomainLabel, AssetDomainPrediction};
+use crate::identity::VisualKey;
 
 use super::{ArenaHandle, AssetRecord, MAP_DIM, RemoteItemRecord, SIMILARITY_DIM};
 
@@ -37,12 +39,40 @@ impl ArenaCard {
             Self::Remote(card) => ArenaHandle::Remote(card.item.id),
         }
     }
+
+    #[must_use]
+    pub fn visual_key(&self) -> Option<&VisualKey> {
+        match self {
+            Self::Local(card) => card.asset.visual_key.as_ref(),
+            Self::Remote(card) => card.item.visual_key.as_ref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ArenaPair {
     pub left: ArenaCard,
     pub right: ArenaCard,
+}
+
+impl ArenaPair {
+    #[must_use]
+    pub fn visual_keys(&self) -> HashSet<VisualKey> {
+        [self.left.visual_key(), self.right.visual_key()]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn local_anchor_visual_key(&self) -> Option<&VisualKey> {
+        match (&self.left, &self.right) {
+            (ArenaCard::Local(card), ArenaCard::Remote(_))
+            | (ArenaCard::Remote(_), ArenaCard::Local(card)) => card.asset.visual_key.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

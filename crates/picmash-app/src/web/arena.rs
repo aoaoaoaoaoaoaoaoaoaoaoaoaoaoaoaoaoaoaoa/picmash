@@ -1,4 +1,6 @@
 use super::*;
+use crate::identity::VisualKey;
+use std::collections::HashSet;
 
 pub(super) async fn arena_root(State(state): State<SharedRuntimeState>) -> WebResult<Response> {
     let state = match ready_app_or_snapshot(&state) {
@@ -15,7 +17,7 @@ pub(super) async fn arena_root(State(state): State<SharedRuntimeState>) -> WebRe
             Some(arena_mode_menu(state.external_status()?)),
             arena_markup(
                 state.arena_empty()?,
-                arena_lookahead_markup(&state, None)?,
+                arena_lookahead_markup(&state, None, &HashSet::new())?,
                 None,
                 state.external_status()?,
             ),
@@ -47,12 +49,31 @@ pub(super) async fn arena(
         let target = state.arena_target()?;
         return Ok(Redirect::to(&target.href()).into_response());
     };
+    let current_excluded = view
+        .pair
+        .as_ref()
+        .map(crate::model::ArenaPair::visual_keys)
+        .unwrap_or_default();
+    let lookahead = arena_lookahead_markup(&state, None, &current_excluded)?;
+    let mut preserved_excluded = current_excluded.clone();
+    if let Some(lookahead_keys) = lookahead.as_ref() {
+        preserved_excluded.extend(lookahead_keys.visual_keys.iter().cloned().map(VisualKey));
+    }
     let preserved_lookahead = view
         .pair
         .as_ref()
         .and_then(arena_pair_local_anchor)
         .map_or(Ok(None), |anchor| {
-            arena_lookahead_markup(&state, Some(anchor))
+            let mut excluded = preserved_excluded.clone();
+            let anchor_visual_key = view
+                .pair
+                .as_ref()
+                .and_then(crate::model::ArenaPair::local_anchor_visual_key)
+                .cloned();
+            if let Some(anchor_visual_key) = anchor_visual_key {
+                excluded.remove(&anchor_visual_key);
+            }
+            arena_lookahead_markup(&state, Some(anchor), &excluded)
         })?;
     Ok(render_markup(routed_layout(
         "arena-page",
@@ -61,7 +82,7 @@ pub(super) async fn arena(
         Some(arena_mode_menu(state.external_status()?)),
         arena_markup(
             view,
-            arena_lookahead_markup(&state, None)?,
+            lookahead,
             preserved_lookahead,
             state.external_status()?,
         ),
@@ -110,9 +131,17 @@ pub(super) async fn api_arena_next(
         return Ok(service_unavailable_response());
     };
     let local_anchor = query.anchor.as_deref().map(|slug| AssetId(slug.to_owned()));
+    let excluded_visual_keys = query
+        .exclude_visual_keys()
+        .into_iter()
+        .map(VisualKey)
+        .collect::<HashSet<_>>();
     let target = match local_anchor.as_ref() {
-        Some(anchor) => state.arena_prefetch_target_preserving_local_anchor(Some(anchor))?,
-        None => state.arena_prefetch_target()?,
+        Some(anchor) => state.arena_prefetch_target_preserving_local_anchor_excluding(
+            Some(anchor),
+            &excluded_visual_keys,
+        )?,
+        None => state.arena_prefetch_target_excluding(&excluded_visual_keys)?,
     };
     Ok(no_store_response(
         axum::Json(arena_target_payload(&state, &target)?).into_response(),
@@ -267,12 +296,30 @@ pub(super) async fn lock_thread(
 struct ArenaLookaheadMarkup {
     href: String,
     local_anchor: String,
+    local_anchor_visual_key: String,
+    visual_keys: Vec<String>,
     stage: Markup,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct ArenaNextQuery {
     anchor: Option<String>,
+    exclude_visual_keys: Option<String>,
+}
+
+impl ArenaNextQuery {
+    fn exclude_visual_keys(&self) -> Vec<String> {
+        self.exclude_visual_keys
+            .as_deref()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter(|entry| !entry.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 fn arena_pair_local_anchor(pair: &crate::model::ArenaPair) -> Option<&AssetId> {
@@ -313,6 +360,8 @@ fn arena_target_payload(
         "empty": false,
         "href": target.href(),
         "localAnchor": arena_pair_local_anchor(&pair).map(|asset_id| asset_id.0.clone()).unwrap_or_default(),
+        "localAnchorVisualKey": pair.local_anchor_visual_key().map(|visual_key| visual_key.0.clone()).unwrap_or_default(),
+        "visualKeys": pair.visual_keys().into_iter().map(|visual_key| visual_key.0).collect::<Vec<_>>(),
         "html": arena_stage_markup(&pair, view.cluster.as_ref()).into_string(),
     }))
 }
@@ -320,10 +369,14 @@ fn arena_target_payload(
 fn arena_lookahead_markup(
     state: &SharedAppState,
     local_anchor: Option<&AssetId>,
+    excluded_visual_keys: &HashSet<VisualKey>,
 ) -> anyhow::Result<Option<ArenaLookaheadMarkup>> {
     let target = match local_anchor {
-        Some(anchor) => state.arena_prefetch_target_preserving_local_anchor(Some(anchor))?,
-        None => state.arena_prefetch_target()?,
+        Some(anchor) => state.arena_prefetch_target_preserving_local_anchor_excluding(
+            Some(anchor),
+            excluded_visual_keys,
+        )?,
+        None => state.arena_prefetch_target_excluding(excluded_visual_keys)?,
     };
     let RedirectTarget::ArenaPair {
         ref left,
@@ -343,6 +396,15 @@ fn arena_lookahead_markup(
         local_anchor: arena_pair_local_anchor(&pair)
             .map(|asset_id| asset_id.0.clone())
             .unwrap_or_default(),
+        local_anchor_visual_key: pair
+            .local_anchor_visual_key()
+            .map(|visual_key| visual_key.0.clone())
+            .unwrap_or_default(),
+        visual_keys: pair
+            .visual_keys()
+            .into_iter()
+            .map(|visual_key| visual_key.0)
+            .collect(),
         stage: arena_stage_markup(&pair, view.cluster.as_ref()),
     }))
 }
@@ -357,16 +419,20 @@ fn arena_markup(
         @if let Some(pair) = view.pair {
             @let pair_href = arena_pair_href(&pair);
             @let local_anchor = arena_pair_local_anchor(&pair).map_or("", |asset_id| asset_id.0.as_str());
+            @let current_visual_keys = pair.visual_keys().into_iter().map(|visual_key| visual_key.0).collect::<Vec<_>>().join(",");
+            @let local_anchor_visual_key = pair.local_anchor_visual_key().map_or("", |visual_key| visual_key.0.as_str());
+            @let lookahead_visual_keys = lookahead.as_ref().map(|next| next.visual_keys.join(",")).unwrap_or_default();
+            @let preserved_visual_keys = preserved_lookahead.as_ref().map(|next| next.visual_keys.join(",")).unwrap_or_default();
             div.arena-stage-shell {
-                div.arena-stage-layer.is-current data-href=(pair_href) data-local-anchor=(local_anchor) {
+                div.arena-stage-layer.is-current data-href=(pair_href) data-local-anchor=(local_anchor) data-local-anchor-visual-key=(local_anchor_visual_key) data-visual-keys=(current_visual_keys) {
                     (arena_stage_markup(&pair, view.cluster.as_ref()))
                 }
-                div.arena-stage-layer.is-lookahead.is-hidden data-href=(lookahead.as_ref().map_or("", |next| next.href.as_str())) data-local-anchor=(lookahead.as_ref().map_or("", |next| next.local_anchor.as_str())) aria-hidden="true" {
+                div.arena-stage-layer.is-lookahead.is-hidden data-href=(lookahead.as_ref().map_or("", |next| next.href.as_str())) data-local-anchor=(lookahead.as_ref().map_or("", |next| next.local_anchor.as_str())) data-local-anchor-visual-key=(lookahead.as_ref().map_or("", |next| next.local_anchor_visual_key.as_str())) data-visual-keys=(lookahead_visual_keys) aria-hidden="true" {
                     @if let Some(lookahead) = lookahead {
                         (lookahead.stage)
                     }
                 }
-                div.arena-stage-layer.is-preserved-lookahead.is-hidden data-href=(preserved_lookahead.as_ref().map_or("", |next| next.href.as_str())) data-local-anchor=(preserved_lookahead.as_ref().map_or("", |next| next.local_anchor.as_str())) aria-hidden="true" {
+                div.arena-stage-layer.is-preserved-lookahead.is-hidden data-href=(preserved_lookahead.as_ref().map_or("", |next| next.href.as_str())) data-local-anchor=(preserved_lookahead.as_ref().map_or("", |next| next.local_anchor.as_str())) data-local-anchor-visual-key=(preserved_lookahead.as_ref().map_or("", |next| next.local_anchor_visual_key.as_str())) data-visual-keys=(preserved_visual_keys) aria-hidden="true" {
                     @if let Some(lookahead) = preserved_lookahead {
                         (lookahead.stage)
                     }
@@ -438,8 +504,21 @@ fn arena_panel(
                     draggable="false";
             }
             @if let Some(thread_title) = remote_thread_title {
-                div.frame-banner.remote-thread-banner.swarm-frame-header title=(thread_title) {
-                    (thread_title)
+                @let stream_locked = match card {
+                    ArenaCard::Remote(card) => card.stream_locked,
+                    ArenaCard::Local(_) => false,
+                };
+                div.remote-thread-banner-rail title=(thread_title) {
+                    @if matches!(card, ArenaCard::Remote(_)) {
+                        form.remote-thread-lock-box.arena-lock-thread-form data-arena-advance="refresh-current" action=(format!("{pair_href}/lock-thread")) method="post" {
+                            input type="hidden" name="asset_id" value=(handle.slug());
+                            input type="hidden" name="active" value=(if stream_locked { "false" } else { "true" });
+                            (tool_button(ImageToolKind::LockThread, true, stream_locked))
+                        }
+                    }
+                    div.frame-banner.remote-thread-banner.swarm-frame-header {
+                        span.remote-thread-banner-label { (thread_title) }
+                    }
                 }
             }
             @if let Some(cluster) = cluster {
@@ -486,7 +565,11 @@ fn arena_panel(
                     input type="hidden" name="active" value="true";
                     (tool_button(ImageToolKind::Heart, false, hearted))
                 }
-                form.arena-hide-form data-arena-advance="authoritative" action=(format!("{pair_href}/hide")) method="post" {
+                @let hide_advance = match card {
+                    ArenaCard::Remote(_) => "buffered-preserve",
+                    ArenaCard::Local(_) => "authoritative",
+                };
+                form.arena-hide-form data-arena-advance=(hide_advance) action=(format!("{pair_href}/hide")) method="post" {
                     input type="hidden" name="asset_id" value=(handle.slug());
                     input type="hidden" name="hide" value=(if arena_card_hidden(card) { "false" } else { "true" });
                     @if let Some(cluster) = cluster {
@@ -505,16 +588,12 @@ fn arena_panel(
                     (asset_domain_controls(&card.asset.id, card.domain, false, false))
                 }
                 @if matches!(card, ArenaCard::Remote(_)) {
-                    @let stream_locked = match card {
-                        ArenaCard::Remote(card) => card.stream_locked,
-                        ArenaCard::Local(_) => false,
+                    @let veto_advance = match card {
+                        ArenaCard::Remote(card) if card.stream_locked => "authoritative",
+                        ArenaCard::Remote(_) => "buffered-preserve",
+                        ArenaCard::Local(_) => "authoritative",
                     };
-                    form.arena-lock-thread-form data-arena-advance="refresh-current" action=(format!("{pair_href}/lock-thread")) method="post" {
-                        input type="hidden" name="asset_id" value=(handle.slug());
-                        input type="hidden" name="active" value=(if stream_locked { "false" } else { "true" });
-                        (tool_button(ImageToolKind::LockThread, false, stream_locked))
-                    }
-                    form.arena-veto-thread-form data-arena-advance="authoritative" action=(format!("{pair_href}/veto-thread")) method="post" {
+                    form.arena-veto-thread-form data-arena-advance=(veto_advance) action=(format!("{pair_href}/veto-thread")) method="post" {
                         input type="hidden" name="asset_id" value=(handle.slug());
                         (tool_button(ImageToolKind::VetoThread, false, false))
                     }

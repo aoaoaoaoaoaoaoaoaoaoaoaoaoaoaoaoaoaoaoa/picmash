@@ -123,7 +123,7 @@ impl AppState {
     ) -> anyhow::Result<Option<(crate::store::FaceRecord, crate::store::FaceRecord)>> {
         let detector_model = self.embedder.face_detection_model_name();
         let min_face_side = self.facemash_min_face_side();
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let candidates = store.facemash_identity_candidates(
             self.active.corpus_id,
             detector_model,
@@ -377,7 +377,7 @@ impl AppState {
         if left_face_id == right_face_id {
             return Ok(None);
         }
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let Some(left) = store.face_by_id(left_face_id)? else {
             return Ok(None);
         };
@@ -446,7 +446,7 @@ impl AppState {
     }
 
     pub fn face_record(&self, face_id: FaceId) -> anyhow::Result<Option<crate::store::FaceRecord>> {
-        self.store.lock().face_by_id(face_id)
+        self.read_store()?.face_by_id(face_id)
     }
 
     fn face_source_path_for_record(
@@ -462,8 +462,7 @@ impl AppState {
         }
         if let Some(remote_item_id) = face.remote_item_id {
             return Ok(self
-                .store
-                .lock()
+                .read_store()?
                 .remote_item(remote_item_id)?
                 .map(|item| item.path)
                 .filter(|path| path.exists()));
@@ -715,8 +714,9 @@ impl AppState {
             .crop
             .save(&crop_path)
             .with_context(|| format!("writing face crop {}", crop_path.display()))?;
-        self.with_locked_store_write(|store| {
-            store.set_face_aligned_path(face_id, &crop_path.to_string_lossy())
+        let persisted_crop_path = crop_path.clone();
+        self.with_write_store("set_face_aligned_path", move |store| {
+            store.set_face_aligned_path(face_id, &persisted_crop_path.to_string_lossy())
         })?;
         Ok(Some(fs::read(&crop_path).with_context(|| {
             format!("reading face crop {}", crop_path.display())
@@ -729,8 +729,9 @@ impl AppState {
             return Ok(false);
         }
 
-        self.with_locked_store_write(|store| {
-            let detector_model = self.embedder.face_detection_model_name();
+        let detector_model = self.embedder.face_detection_model_name().to_owned();
+        let active_session_id = self.active.session_id;
+        let retrain = self.with_write_store("record_face_comparison", move |store| {
             let winner = store
                 .face_by_id(winner_id)?
                 .with_context(|| format!("missing face {}", winner_id.0))?;
@@ -744,7 +745,7 @@ impl AppState {
             let (new_winner_beauty, new_loser_beauty) =
                 rate_face_win(winner.identity.beauty, loser.identity.beauty);
             store.record_face_comparison(
-                self.active.session_id,
+                active_session_id,
                 winner_id,
                 loser_id,
                 new_winner_beauty,
@@ -752,17 +753,19 @@ impl AppState {
             )?;
 
             let total = store.face_comparison_count()?;
-            if total % 10 == 0 {
-                self.retrain_face_oracle(store)?;
-            }
-
-            store.touch_session(self.active.session_id)?;
-            Ok(true)
-        })
+            store.touch_session(active_session_id)?;
+            Ok(total % 10 == 0)
+        })?;
+        if retrain {
+            let store = self.read_store()?;
+            self.retrain_face_oracle(&store)?;
+        }
+        Ok(true)
     }
 
     pub fn facemash_hide_face(&self, face_id: FaceId) -> anyhow::Result<bool> {
-        self.with_locked_store_write(|store| {
+        let active_session_id = self.active.session_id;
+        self.with_write_store("tombstone_face", move |store| {
             let Some(face) = store.face_by_id(face_id)? else {
                 return Ok(false);
             };
@@ -771,7 +774,7 @@ impl AppState {
             }
             let changed = store.tombstone_face(face_id)?;
             if changed {
-                store.touch_session(self.active.session_id)?;
+                store.touch_session(active_session_id)?;
             }
             Ok(changed)
         })
@@ -779,7 +782,7 @@ impl AppState {
 
     /// Facemash status for the UI.
     pub fn facemash_status(&self) -> anyhow::Result<FacemashStatus> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let min_face_side = self.facemash_min_face_side();
         let total_identities = store.facemash_identity_count(
             self.active.corpus_id,
@@ -845,7 +848,7 @@ impl AppState {
         left: crate::store::FaceRecord,
         right: crate::store::FaceRecord,
     ) -> anyhow::Result<Option<FacemashPairView>> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let oracle = self.ensure_face_oracle(&store)?;
         let field = self.session_field(&store)?;
         let Some(left) =

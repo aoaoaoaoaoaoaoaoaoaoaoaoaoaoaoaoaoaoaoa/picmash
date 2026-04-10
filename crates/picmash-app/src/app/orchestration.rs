@@ -14,7 +14,7 @@ impl AppState {
     }
 
     pub fn quality_refresh_is_inline(&self) -> anyhow::Result<bool> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         Ok(matches!(
             store.active_quality_model()?.formal_version,
             QualityFormalVersion::LegacyIndependentV1
@@ -91,7 +91,7 @@ impl AppState {
                 weight: source.weight,
             })
             .collect::<Vec<_>>();
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let (active_streams, blocked_streams, cached_items) =
             config
                 .sources
@@ -157,7 +157,7 @@ impl AppState {
     pub fn refresh_external_sources_if_due(&self, force: bool) -> anyhow::Result<()> {
         let mut due_sources = Vec::new();
         let mut due_local_sources = Vec::new();
-        let store = self.store.lock();
+        let store = self.read_store()?;
         for source in self.configured_sources() {
             let source_key = source.source_key();
             let due = force
@@ -241,8 +241,9 @@ impl AppState {
             {
                 let message = format!("{error:#}");
                 warn!(source = %source_key, error = %message, "external source scan failed");
-                self.with_db_write_gate(|| {
-                    self.store.lock().external_scan_fault(&source_key, &message)
+                let source_key = source_key.clone();
+                self.with_write_store("external_scan_fault", move |store| {
+                    store.external_scan_fault(&source_key, &message)
                 })?;
             }
         }
@@ -250,7 +251,10 @@ impl AppState {
     }
 
     pub fn close(&self) -> anyhow::Result<()> {
-        self.with_locked_store_write(|store| store.close_session(self.active.session_id))
+        let session_id = self.active.session_id;
+        self.with_write_store("close_session", move |store| {
+            store.close_session(session_id)
+        })
     }
 
     pub(super) fn source_config_for_key(&self, source_key: &str) -> Option<SourceConfig> {
@@ -360,7 +364,11 @@ impl AppState {
     pub fn rescan(&self) -> anyhow::Result<StartupSummary> {
         let mut store = Store::open_hot(&self.db_path)?;
         store.ingest_corpus(&self.root_path, self.active.corpus_id, &self.embedder)?;
-        self.with_locked_store_write(|store| store.touch_session(self.active.session_id))?;
+        let session_id = self.active.session_id;
+        self.with_write_store("touch_session", move |store| {
+            store.touch_session(session_id)
+        })?;
+        self.invalidate_session_field_cache();
         self.purge_explore_vectors();
         self.purge_all_explore_layouts();
         self.refresh_external_sources_if_due(true)?;
@@ -399,7 +407,7 @@ impl AppState {
     }
 
     pub fn startup_summary(&self) -> anyhow::Result<StartupSummary> {
-        let store = self.store.lock();
+        let store = self.read_store()?;
         let visible_assets = visible_assets(&store, self.active.corpus_id)?.len();
         let embedded_assets = store
             .corpus_embeddings(self.active.corpus_id, self.embedder.model_name())?
