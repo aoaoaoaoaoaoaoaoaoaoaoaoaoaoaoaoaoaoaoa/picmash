@@ -52,13 +52,12 @@ pub(super) async fn arena(
         Ok(state) => state,
         Err(snapshot) => return Ok(boot_response(snapshot)),
     };
-    log_site_loaded("/arena/pair");
     let left = ArenaHandle::from_str(&left_id).map_err(anyhow::Error::msg)?;
     let right = ArenaHandle::from_str(&right_id).map_err(anyhow::Error::msg)?;
     let Some(view) = state.arena_pair(&left, &right)? else {
-        let target = state.arena_target()?;
-        return Ok(Redirect::to(&target.href()).into_response());
+        return Ok(Redirect::to("/arena").into_response());
     };
+    log_site_loaded("/arena/pair");
     let current_excluded = view
         .pair
         .as_ref()
