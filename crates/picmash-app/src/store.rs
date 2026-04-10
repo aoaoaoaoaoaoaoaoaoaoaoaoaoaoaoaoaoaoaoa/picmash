@@ -45,7 +45,7 @@ mod session;
 mod tests;
 mod vectors;
 
-pub use external::ExternalIdentityDisposition;
+pub use external::{ExternalIdentityDisposition, UpsertedExternalStreamBatchEntry};
 pub use faces::{FaceIdentityRecord, FaceRecord, FacemashIdentityCandidate};
 pub use schema::{
     BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS, BOOTSTRAP_PHASE_INITIAL, BootstrapMaintenanceProgress,

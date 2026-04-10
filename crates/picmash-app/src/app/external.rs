@@ -13,6 +13,9 @@ use crate::{
 };
 use time::OffsetDateTime;
 
+const EXTERNAL_STREAM_WRITE_STREAM_CAP: usize = 8;
+const EXTERNAL_STREAM_WRITE_ITEM_BUDGET: usize = 512;
+
 struct PreparedRemoteImport {
     import_path: PathBuf,
     identity: ImageIdentity,
@@ -281,144 +284,161 @@ impl AppState {
         );
         let mut needs_face_backfill = false;
 
-        for stream in &harvest.streams {
-            let (stream_id, blocked, item_ids) =
-                self.with_write_store("upsert_external_stream_batch", {
-                    let source_key = source_key.clone();
-                    let title = stream.title.clone();
-                    let stream = stream.clone();
-                    move |store| {
-                        let (stream_id, blocked) =
-                            store.upsert_external_stream(&source_key, &stream)?;
-                        let item_ids = if blocked {
-                            HashMap::new()
-                        } else {
-                            store.upsert_external_items(
-                                &source_key,
-                                stream_id,
-                                &title,
-                                &stream.items,
-                            )?
-                        };
-                        Ok((stream_id, blocked, item_ids))
-                    }
-                })?;
-            if blocked {
-                continue;
+        let mut chunk_start = 0usize;
+        while chunk_start < harvest.streams.len() {
+            let mut chunk_end = chunk_start;
+            let mut chunk_items = 0usize;
+            while chunk_end < harvest.streams.len()
+                && chunk_end - chunk_start < EXTERNAL_STREAM_WRITE_STREAM_CAP
+            {
+                let next_items = harvest.streams[chunk_end].items.len();
+                if chunk_end > chunk_start
+                    && chunk_items + next_items > EXTERNAL_STREAM_WRITE_ITEM_BUDGET
+                {
+                    break;
+                }
+                chunk_items += next_items;
+                chunk_end += 1;
             }
+            let stream_chunk = &harvest.streams[chunk_start..chunk_end];
+            let batch_streams = stream_chunk.to_vec();
+            let outcomes = self.with_write_store("upsert_external_stream_batch", {
+                let source_key = source_key.clone();
+                move |store| store.upsert_external_streams_batch(&source_key, &batch_streams)
+            })?;
 
-            for item in &stream.items {
-                let item_id = item_ids.get(&item.post_no).copied().with_context(|| {
-                    format!(
-                        "missing upserted external item mapping source={} post_no={}",
-                        source_key, item.post_no
-                    )
-                })?;
-                if store.external_item_hidden(item_id)? {
+            for (stream, outcome) in stream_chunk.iter().zip(outcomes) {
+                if outcome.blocked {
                     continue;
                 }
+                let stream_id = outcome.stream_id;
+                let item_ids = outcome.item_ids;
 
-                let already_ready =
-                    store.external_item_frontier_ready(item_id, self.embedder.model_name())?;
-                let should_devour = if already_ready {
-                    true
-                } else {
-                    !ready_frontier.source_saturated()
-                        || !ready_frontier.stream_saturated(stream_id)
-                };
-                if !should_devour {
-                    continue;
-                }
-
-                let warm = store.external_item_warm_state(
-                    item_id,
-                    self.embedder.model_name(),
-                    self.embedder
-                        .clip_enabled()
-                        .then_some(self.embedder.clip_model_name()),
-                    self.embedder.recognition_model_name(),
-                    QUALITY_FEATURE_REVISION,
-                )?;
-                needs_face_backfill |= warm.needs_face_embedding;
-                let cached_path = match item.materialized_path.as_ref() {
-                    Some(path) if path.exists() => path.clone(),
-                    Some(_) if source.local_directory().is_some() => continue,
-                    Some(_) | None => self.source_scanner.cache_remote_image(&source_key, item)?,
-                };
-                if !cached_path.exists() {
-                    continue;
-                }
-
-                if !warm.needs_inline_work() {
-                    continue;
-                }
-
-                let bytes = if warm.needs_identity || warm.needs_quality_features {
-                    Some(fs::read(&cached_path).with_context(|| {
-                        format!("reading cached remote {}", cached_path.display())
-                    })?)
-                } else {
-                    None
-                };
-
-                if warm.needs_identity {
-                    let bytes = bytes
-                        .as_deref()
-                        .context("missing cached bytes for identity")?;
-                    let identity = inspect_image_bytes(&bytes).with_context(|| {
+                for item in &stream.items {
+                    let item_id = item_ids.get(&item.post_no).copied().with_context(|| {
                         format!(
-                            "inspecting cached remote identity {}",
-                            cached_path.display()
+                            "missing upserted external item mapping source={} post_no={}",
+                            source_key, item.post_no
                         )
                     })?;
-                    let disposition = self.with_write_store("save_external_item_identity", {
-                        let cached_path = cached_path.clone();
-                        move |store| {
-                            store.save_external_item_identity(item_id, &identity, &cached_path)
-                        }
-                    })?;
-                    if disposition != crate::store::ExternalIdentityDisposition::Active {
+                    if store.external_item_hidden(item_id)? {
                         continue;
                     }
-                }
 
-                if warm.needs_quality_features
-                    && let Some(bytes) = bytes.as_deref()
-                    && let Ok(features) =
-                        crate::quality_features::extract_asset_quality_features(bytes)
-                {
-                    self.with_write_store("save_external_item_quality_features", move |store| {
-                        store.save_external_item_quality_features(
-                            item_id,
-                            QUALITY_FEATURE_REVISION,
-                            &features,
-                        )
-                    })?;
-                }
+                    let already_ready =
+                        store.external_item_frontier_ready(item_id, self.embedder.model_name())?;
+                    let should_devour = if already_ready {
+                        true
+                    } else {
+                        !ready_frontier.source_saturated()
+                            || !ready_frontier.stream_saturated(stream_id)
+                    };
+                    if !should_devour {
+                        continue;
+                    }
 
-                if warm.needs_embedding
-                    && let Some(embedding) = self.embedder.embed(&cached_path)?
-                {
-                    let cached_path = cached_path.clone();
-                    self.with_write_store("save_external_embedding", move |store| {
-                        store.save_external_embedding(item_id, &embedding, &cached_path)
-                    })?;
-                }
+                    let warm = store.external_item_warm_state(
+                        item_id,
+                        self.embedder.model_name(),
+                        self.embedder
+                            .clip_enabled()
+                            .then_some(self.embedder.clip_model_name()),
+                        self.embedder.recognition_model_name(),
+                        QUALITY_FEATURE_REVISION,
+                    )?;
+                    needs_face_backfill |= warm.needs_face_embedding;
+                    let cached_path = match item.materialized_path.as_ref() {
+                        Some(path) if path.exists() => path.clone(),
+                        Some(_) if source.local_directory().is_some() => continue,
+                        Some(_) | None => {
+                            self.source_scanner.cache_remote_image(&source_key, item)?
+                        }
+                    };
+                    if !cached_path.exists() {
+                        continue;
+                    }
 
-                if warm.needs_clip_embedding
-                    && let Some(embedding) = self.embedder.clip_embed(&cached_path)?
-                {
-                    self.with_write_store("save_external_clip_embedding", move |store| {
-                        store.save_external_clip_embedding(item_id, &embedding)
-                    })?;
-                }
+                    if !warm.needs_inline_work() {
+                        continue;
+                    }
 
-                if !already_ready
-                    && store.external_item_frontier_ready(item_id, self.embedder.model_name())?
-                {
-                    ready_frontier.note_ready(stream_id);
+                    let bytes = if warm.needs_identity || warm.needs_quality_features {
+                        Some(fs::read(&cached_path).with_context(|| {
+                            format!("reading cached remote {}", cached_path.display())
+                        })?)
+                    } else {
+                        None
+                    };
+
+                    if warm.needs_identity {
+                        let bytes = bytes
+                            .as_deref()
+                            .context("missing cached bytes for identity")?;
+                        let identity = inspect_image_bytes(bytes).with_context(|| {
+                            format!(
+                                "inspecting cached remote identity {}",
+                                cached_path.display()
+                            )
+                        })?;
+                        let disposition =
+                            self.with_write_store("save_external_item_identity", {
+                                let cached_path = cached_path.clone();
+                                move |store| {
+                                    store.save_external_item_identity(
+                                        item_id,
+                                        &identity,
+                                        &cached_path,
+                                    )
+                                }
+                            })?;
+                        if disposition != crate::store::ExternalIdentityDisposition::Active {
+                            continue;
+                        }
+                    }
+
+                    if warm.needs_quality_features
+                        && let Some(bytes) = bytes.as_deref()
+                        && let Ok(features) =
+                            crate::quality_features::extract_asset_quality_features(bytes)
+                    {
+                        self.with_write_store(
+                            "save_external_item_quality_features",
+                            move |store| {
+                                store.save_external_item_quality_features(
+                                    item_id,
+                                    QUALITY_FEATURE_REVISION,
+                                    &features,
+                                )
+                            },
+                        )?;
+                    }
+
+                    if warm.needs_embedding
+                        && let Some(embedding) = self.embedder.embed(&cached_path)?
+                    {
+                        let cached_path = cached_path.clone();
+                        self.with_write_store("save_external_embedding", move |store| {
+                            store.save_external_embedding(item_id, &embedding, &cached_path)
+                        })?;
+                    }
+
+                    if warm.needs_clip_embedding
+                        && let Some(embedding) = self.embedder.clip_embed(&cached_path)?
+                    {
+                        self.with_write_store("save_external_clip_embedding", move |store| {
+                            store.save_external_clip_embedding(item_id, &embedding)
+                        })?;
+                    }
+
+                    if !already_ready
+                        && store
+                            .external_item_frontier_ready(item_id, self.embedder.model_name())?
+                    {
+                        ready_frontier.note_ready(stream_id);
+                    }
                 }
             }
+            chunk_start = chunk_end;
         }
 
         if needs_face_backfill {
