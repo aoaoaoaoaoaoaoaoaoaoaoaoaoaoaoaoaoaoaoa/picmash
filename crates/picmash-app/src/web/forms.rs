@@ -13,7 +13,9 @@ pub(super) struct ArenaCommandFields {
     pub(super) command_id: String,
     pub(super) turn_id: String,
     pub(super) action_token: String,
+    #[serde(deserialize_with = "deserialize_form_u64")]
     pub(super) arena_revision: u64,
+    #[serde(deserialize_with = "deserialize_form_u64")]
     pub(super) arena_sampler_epoch: u64,
 }
 
@@ -112,6 +114,14 @@ where
         .collect()
 }
 
+fn deserialize_form_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    raw.parse::<u64>().map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct HandleForm {
     #[serde(flatten)]
@@ -192,4 +202,24 @@ fn parse_triad_query(raw: &str) -> anyhow::Result<[AssetId; 3]> {
         bail!("triad query must contain distinct asset ids");
     }
     Ok([parts[0].clone(), parts[1].clone(), parts[2].clone()])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arena_command_fields_accept_stringified_form_numbers() {
+        let fields: ArenaCommandFields = serde_json::from_value(serde_json::json!({
+            "command_id": "cmd",
+            "turn_id": "turn",
+            "action_token": "token",
+            "arena_revision": "42",
+            "arena_sampler_epoch": "7",
+        }))
+        .expect("deserialize arena command fields");
+
+        assert_eq!(fields.arena_revision, 42);
+        assert_eq!(fields.arena_sampler_epoch, 7);
+    }
 }
