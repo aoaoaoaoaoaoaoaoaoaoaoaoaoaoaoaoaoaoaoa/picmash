@@ -1,6 +1,19 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
+macro_rules! external_frontier_identity_predicate {
+    () => {
+        r"
+              AND i.blob_id IS NOT NULL
+              AND i.blob_id <> ''
+              AND i.render_hash IS NOT NULL
+              AND i.render_hash <> ''
+              AND i.visual_key IS NOT NULL
+              AND i.visual_key <> ''
+        "
+    };
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExternalItemWarmState {
     pub(crate) needs_materialization: bool,
@@ -172,7 +185,7 @@ impl Store {
         source_key: &str,
         model_name: &str,
     ) -> anyhow::Result<(usize, HashMap<i64, usize>)> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(concat!(
             r"
             SELECT i.stream_id, i.cached_path
             FROM external_items i
@@ -188,7 +201,8 @@ impl Store {
               AND i.embedding IS NOT NULL
               AND i.embedding_model = ?2
             ",
-        )?;
+            external_frontier_identity_predicate!(),
+        ))?;
         let mut by_stream = HashMap::new();
         let mut total = 0usize;
         let rows = stmt.query_map(params![source_key, model_name], |row| {
@@ -848,7 +862,7 @@ impl Store {
         face_model_name: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(RemoteItemId, PathBuf)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(concat!(
             r"
             SELECT i.id, i.cached_path
             FROM external_items i
@@ -863,6 +877,9 @@ impl Store {
               AND i.cached_path IS NOT NULL
               AND i.embedding IS NOT NULL
               AND i.embedding_model = ?2
+            ",
+            external_frontier_identity_predicate!(),
+            r"
               AND (
                     i.face_embedding_model IS NULL
                     OR i.face_embedding_model != ?3
@@ -870,7 +887,7 @@ impl Store {
             ORDER BY s.last_modified DESC, i.post_no DESC
             LIMIT ?4
             ",
-        )?;
+        ))?;
         let rows = stmt.query_map(
             params![
                 source_key,
@@ -978,19 +995,24 @@ impl Store {
     ) -> anyhow::Result<bool> {
         self.conn
             .query_row(
-                r"
+                concat!(
+                    r"
                 SELECT 1
-                FROM external_items
-                WHERE id = ?1
-                  AND hidden = 0
-                  AND import_pending = 0
-                  AND resolved_asset_id IS NULL
-                  AND imported_asset_id IS NULL
-                  AND cached_path IS NOT NULL
-                  AND embedding IS NOT NULL
-                  AND embedding_model = ?2
+                FROM external_items i
+                WHERE i.id = ?1
+                  AND i.hidden = 0
+                  AND i.import_pending = 0
+                  AND i.resolved_asset_id IS NULL
+                  AND i.imported_asset_id IS NULL
+                  AND i.cached_path IS NOT NULL
+                  AND i.embedding IS NOT NULL
+                  AND i.embedding_model = ?2
+                ",
+                    external_frontier_identity_predicate!(),
+                    r"
                 LIMIT 1
                 ",
+                ),
                 params![item_id.0, model_name],
                 |_| Ok(()),
             )
@@ -1436,7 +1458,8 @@ impl Store {
     ) -> anyhow::Result<Option<RemoteItemRecord>> {
         self.conn
             .query_row(
-                r"
+                concat!(
+                    r"
                 SELECT
                     i.id,
                     i.source_key,
@@ -1460,6 +1483,8 @@ impl Store {
                   AND s.active = 1
                   AND s.blocked = 0
                 ",
+                    external_frontier_identity_predicate!(),
+                ),
                 params![item_id.0],
                 |row| {
                     let Some(path) = row.get::<_, Option<String>>(7)? else {
@@ -1495,7 +1520,7 @@ impl Store {
         face_model_name: &str,
         formal_version: QualityFormalVersion,
     ) -> anyhow::Result<Vec<RemoteCandidate>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(concat!(
             r"
             SELECT
                 i.id,
@@ -1548,6 +1573,9 @@ impl Store {
               AND i.cached_path IS NOT NULL
               AND i.embedding IS NOT NULL
               AND i.embedding_model = ?2
+            ",
+            external_frontier_identity_predicate!(),
+            r"
               AND NOT EXISTS (
                   SELECT 1
                   FROM external_item_tombstones tombstone
@@ -1555,7 +1583,7 @@ impl Store {
               )
             ORDER BY s.last_modified DESC, i.post_no DESC
             ",
-        )?;
+        ))?;
         let rows = stmt.query_map(
             params![
                 source_key,
@@ -1637,7 +1665,7 @@ impl Store {
         &self,
         model_name: &str,
     ) -> anyhow::Result<Vec<(RemoteItemId, Vec<f32>)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(concat!(
             r"
             SELECT i.id, i.embedding
             FROM external_items i
@@ -1652,7 +1680,8 @@ impl Store {
               AND i.embedding IS NOT NULL
               AND i.embedding_model = ?1
             ",
-        )?;
+            external_frontier_identity_predicate!(),
+        ))?;
         let rows = stmt.query_map(params![model_name], |row| {
             let id = RemoteItemId(row.get(0)?);
             let raw = decode_vec_f32(&row.get::<_, Vec<u8>>(1)?);

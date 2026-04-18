@@ -8,10 +8,12 @@ use ulid::Ulid;
 
 use crate::{
     identity::VisualKey,
-    model::{ArenaHandle, ArenaPair, ArenaView, RemoteItemId},
+    model::{ArenaHandle, ArenaPair, ArenaView, AssetId, RemoteItemId},
 };
 
-use super::{AppState, LockExhaustionPolicy, PipelineDisposition, RedirectTarget};
+use super::{
+    AppState, LockExhaustionPolicy, PipelineDisposition, RedirectTarget, surviving_local_anchor,
+};
 
 const ARENA_PIPELINE_LIMIT: usize = 6;
 const ARENA_COMMAND_REPLAY_LIMIT: usize = 512;
@@ -337,6 +339,31 @@ pub enum SamplerInvalidation {
     Immediate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArenaCommandAdvance {
+    Preserve,
+    Reset { local_anchor: Option<AssetId> },
+}
+
+impl ArenaCommandAdvance {
+    fn reset() -> Self {
+        Self::Reset { local_anchor: None }
+    }
+
+    fn reset_preserving(local_anchor: Option<AssetId>) -> Self {
+        Self::Reset { local_anchor }
+    }
+}
+
+impl From<PipelineDisposition> for ArenaCommandAdvance {
+    fn from(disposition: PipelineDisposition) -> Self {
+        match disposition {
+            PipelineDisposition::Preserve => Self::Preserve,
+            PipelineDisposition::Reset => Self::reset(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ArenaSessionRuntime {
     revision: ArenaRevision,
@@ -562,11 +589,11 @@ impl AppState {
             .current()
             .map(|turn| turn.pair().clone())
             .context("arena command accepted without a current turn")?;
-        let disposition = self.devour_arena_command_effect(&command, &current_pair)?;
+        let advance = self.devour_arena_command_effect(&command, &current_pair)?;
         runtime.remember(command.command_id().clone());
 
-        match disposition {
-            PipelineDisposition::Preserve => {
+        match advance {
+            ArenaCommandAdvance::Preserve => {
                 runtime.advance_revision();
                 if runtime.promote_pipeline().is_none() {
                     let turn = self.sample_arena_turn(
@@ -578,12 +605,13 @@ impl AppState {
                     runtime.current = turn;
                 }
             }
-            PipelineDisposition::Reset => {
-                let next_turn = self.sample_arena_turn(
+            ArenaCommandAdvance::Reset { local_anchor } => {
+                let next_turn = self.sample_arena_turn_preserving_local_anchor(
                     runtime.revision().next(),
                     runtime.sampler_epoch(),
                     &HashSet::new(),
                     LockExhaustionPolicy::ClearAndRetry,
+                    local_anchor.as_ref(),
                 )?;
                 runtime.reset_to(next_turn);
             }
@@ -626,12 +654,12 @@ impl AppState {
         &self,
         command: &ArenaCommand,
         current_pair: &ArenaPairRef,
-    ) -> anyhow::Result<PipelineDisposition> {
+    ) -> anyhow::Result<ArenaCommandAdvance> {
         match command {
             ArenaCommand::Vote { winner, .. } => {
                 ensure_pair_member(current_pair, winner, "winner")?;
                 self.apply_arena_vote_effect(&current_pair.left, &current_pair.right, winner)?;
-                Ok(PipelineDisposition::Preserve)
+                Ok(ArenaCommandAdvance::Preserve)
             }
             ArenaCommand::Hide {
                 handle,
@@ -647,7 +675,13 @@ impl AppState {
                     &current_pair.left,
                     &current_pair.right,
                 )?;
-                Ok(PipelineDisposition::Reset)
+                Ok(match handle {
+                    ArenaHandle::Remote(_) => ArenaCommandAdvance::reset_preserving(
+                        surviving_local_anchor(handle, &current_pair.left, &current_pair.right)
+                            .cloned(),
+                    ),
+                    ArenaHandle::Local(_) => ArenaCommandAdvance::reset(),
+                })
             }
             ArenaCommand::LockThread { handle, active, .. } => {
                 ensure_pair_member(current_pair, handle, "locked handle")?;
@@ -655,6 +689,7 @@ impl AppState {
                     bail!("thread lock requires a remote arena handle");
                 };
                 self.set_external_subsource_lock(*item_id, *active)
+                    .map(Into::into)
             }
             ArenaCommand::VetoThread { handle, .. } => {
                 ensure_pair_member(current_pair, handle, "vetoed handle")?;
@@ -663,7 +698,7 @@ impl AppState {
                     &current_pair.left,
                     &current_pair.right,
                 )?;
-                Ok(disposition)
+                Ok(disposition.into())
             }
         }
     }
@@ -726,6 +761,24 @@ impl AppState {
     ) -> anyhow::Result<Option<ArenaTurn>> {
         Ok(self
             .choose_next_pair(lock_exhaustion, excluded_visual_keys)?
+            .as_ref()
+            .map(|pair| ArenaTurn::forge(revision, sampler_epoch, pair)))
+    }
+
+    fn sample_arena_turn_preserving_local_anchor(
+        &self,
+        revision: ArenaRevision,
+        sampler_epoch: ArenaSamplerEpoch,
+        excluded_visual_keys: &HashSet<VisualKey>,
+        lock_exhaustion: LockExhaustionPolicy,
+        local_anchor: Option<&AssetId>,
+    ) -> anyhow::Result<Option<ArenaTurn>> {
+        Ok(self
+            .choose_next_pair_preserving_local_anchor(
+                local_anchor,
+                lock_exhaustion,
+                excluded_visual_keys,
+            )?
             .as_ref()
             .map(|pair| ArenaTurn::forge(revision, sampler_epoch, pair)))
     }

@@ -1262,7 +1262,7 @@ impl AppState {
         Ok(None)
     }
 
-    fn choose_next_pair_preserving_local_anchor(
+    pub(super) fn choose_next_pair_preserving_local_anchor(
         &self,
         local_anchor: Option<&AssetId>,
         lock_exhaustion: LockExhaustionPolicy,

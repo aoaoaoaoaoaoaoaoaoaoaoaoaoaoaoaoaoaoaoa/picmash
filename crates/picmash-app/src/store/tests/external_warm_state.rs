@@ -127,6 +127,13 @@ fn external_source_ready_profile_ignores_missing_cached_files() {
             Some(&cache_path),
         )
         .expect("upsert item");
+    let identity = inspect_image_bytes(&bytes).expect("inspect identity");
+    assert_eq!(
+        store
+            .save_external_item_identity(item_id, &identity, &cache_path)
+            .expect("save identity"),
+        ExternalIdentityDisposition::Active
+    );
     store
         .save_external_embedding(
             item_id,
@@ -167,6 +174,75 @@ fn external_source_ready_profile_ignores_missing_cached_files() {
         .external_source_counts("4chan:s")
         .expect("source counts after missing cache");
     assert_eq!(cached_after, 0);
+}
+
+#[test]
+fn external_frontier_ready_requires_canonical_identity() {
+    let root = test_root("external-frontier-requires-identity");
+    let corpus_root = root.join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+    let db_path = root.join("picmash.sqlite3");
+    let store = Store::open(&db_path).expect("open store");
+
+    store
+        .upsert_external_source("4chan:s", "s", "4chan_board", "s", None)
+        .expect("upsert source");
+    let (stream_id, blocked) = store
+        .upsert_external_stream("4chan:s", &remote_stream(2101, 1))
+        .expect("upsert stream");
+    assert!(!blocked);
+
+    let bytes = flat_png(256, 256, [130, 40, 210]);
+    let cache_path = root.join("half-warmed.png");
+    std::fs::write(&cache_path, &bytes).expect("write cache");
+    let item_id = store
+        .upsert_external_item(
+            "4chan:s",
+            stream_id,
+            "thread 2101",
+            &remote_item(2101, 2102, None),
+            Some(&cache_path),
+        )
+        .expect("upsert item");
+    store
+        .save_external_embedding(
+            item_id,
+            &EmbeddingRecord {
+                model_name: "test-model".to_owned(),
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            &cache_path,
+        )
+        .expect("save embedding");
+
+    assert!(
+        !store
+            .external_item_frontier_ready(item_id, "test-model")
+            .expect("frontier state before identity"),
+        "a half-warmed remote must not enter the arena before visual tombstoning works"
+    );
+    assert_eq!(
+        store
+            .external_source_ready_profile("4chan:s", "test-model")
+            .expect("ready profile before identity")
+            .0,
+        0,
+        "ready source accounting must not count half-warmed remotes",
+    );
+
+    let identity = inspect_image_bytes(&bytes).expect("inspect identity");
+    assert_eq!(
+        store
+            .save_external_item_identity(item_id, &identity, &cache_path)
+            .expect("save identity"),
+        ExternalIdentityDisposition::Active
+    );
+    assert!(
+        store
+            .external_item_frontier_ready(item_id, "test-model")
+            .expect("frontier state after identity"),
+        "identity completion should release the remote into the frontier"
+    );
 }
 
 #[test]
