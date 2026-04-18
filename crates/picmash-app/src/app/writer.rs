@@ -139,10 +139,10 @@ impl DbWriter {
 
     fn shutdown(&self) {
         let _ = self.tx.send(WriterMessage::Shutdown);
-        if let Some(join) = self.join.lock().take() {
-            if let Err(error) = join.join() {
-                warn!(?error, "db writer thread panicked during shutdown");
-            }
+        if let Some(join) = self.join.lock().take()
+            && let Err(error) = join.join()
+        {
+            warn!(?error, "db writer thread panicked during shutdown");
         }
     }
 }

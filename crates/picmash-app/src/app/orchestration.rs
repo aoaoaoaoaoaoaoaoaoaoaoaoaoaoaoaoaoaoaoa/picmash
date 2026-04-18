@@ -118,16 +118,22 @@ impl AppState {
 
     pub fn set_external_probability_percent(&self, percent: u8) -> anyhow::Result<()> {
         let probability = f32::from(percent) / 100.0;
-        let snapshot = {
+        let (old_probability, new_probability, snapshot) = {
             let mut config = self.config.write();
+            let old_probability = config.external_probability();
             config.shove_external_probability(probability);
             let snapshot = config.clone().normalized();
+            let new_probability = snapshot.external_probability();
             *config = snapshot.clone();
-            snapshot
+            (old_probability, new_probability, snapshot)
         };
         self.persist_live_config(&snapshot)?;
+        self.apply_arena_sampler_invalidation(external_probability_invalidation(
+            old_probability,
+            new_probability,
+        ));
         info!(
-            external_probability = probability,
+            external_probability = new_probability,
             "updated external sampling probability"
         );
         Ok(())
@@ -139,16 +145,18 @@ impl AppState {
 
     pub fn set_arena_explore_percent(&self, percent: u8) -> anyhow::Result<()> {
         let explore = f32::from(percent) / 100.0;
-        let snapshot = {
+        let (new_explore, snapshot) = {
             let mut config = self.config.write();
             config.shove_arena_explore(explore);
             let snapshot = config.clone().normalized();
+            let new_explore = snapshot.arena_explore();
             *config = snapshot.clone();
-            snapshot
+            (new_explore, snapshot)
         };
         self.persist_live_config(&snapshot)?;
+        self.apply_arena_sampler_invalidation(SamplerInvalidation::Eventual);
         info!(
-            arena_explore = explore,
+            arena_explore = new_explore,
             "updated arena exploration pressure"
         );
         Ok(())
@@ -208,7 +216,6 @@ impl AppState {
                         .join()
                         .map_err(|_| anyhow::anyhow!("external source worker panicked"))
                 })
-                .map(|handle| handle.map_err(anyhow::Error::from))
                 .collect::<anyhow::Result<Vec<_>>>()
         })?;
 
@@ -271,7 +278,8 @@ impl AppState {
     }
 
     pub(super) fn asset_domain_oracle(&self, store: &Store) -> anyhow::Result<AssetDomainOracle> {
-        if let Some(oracle) = self.asset_domain_oracle.read().as_ref().cloned() {
+        let cached_oracle = self.asset_domain_oracle.read().as_ref().cloned();
+        if let Some(oracle) = cached_oracle {
             return Ok(oracle);
         }
         let oracle = AssetDomainOracle::train(
@@ -396,14 +404,18 @@ impl AppState {
     }
 
     pub fn set_dedup_radius(&self, radius: f32) -> anyhow::Result<()> {
-        let snapshot = {
+        let (old_radius, new_radius, snapshot) = {
             let mut config = self.config.write();
+            let old_radius = config.dedup_radius();
             config.shove_dedup_radius(radius);
             let snapshot = config.clone().normalized();
+            let new_radius = snapshot.dedup_radius();
             *config = snapshot.clone();
-            snapshot
+            (old_radius, new_radius, snapshot)
         };
-        self.persist_live_config(&snapshot)
+        self.persist_live_config(&snapshot)?;
+        self.apply_arena_sampler_invalidation(dedup_radius_invalidation(old_radius, new_radius));
+        Ok(())
     }
 
     pub fn startup_summary(&self) -> anyhow::Result<StartupSummary> {
@@ -418,5 +430,38 @@ impl AppState {
             visible_assets,
             embedded_assets,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceMixRegime {
+    LocalOnly,
+    Mixed,
+    RemoteOnly,
+}
+
+fn external_probability_invalidation(old: f32, new: f32) -> SamplerInvalidation {
+    if source_mix_regime(old) == source_mix_regime(new) {
+        SamplerInvalidation::Eventual
+    } else {
+        SamplerInvalidation::Immediate
+    }
+}
+
+fn source_mix_regime(probability: f32) -> SourceMixRegime {
+    if probability <= f32::EPSILON {
+        SourceMixRegime::LocalOnly
+    } else if probability >= 1.0 - f32::EPSILON {
+        SourceMixRegime::RemoteOnly
+    } else {
+        SourceMixRegime::Mixed
+    }
+}
+
+fn dedup_radius_invalidation(old: f32, new: f32) -> SamplerInvalidation {
+    if (old - new).abs() <= f32::EPSILON {
+        SamplerInvalidation::Eventual
+    } else {
+        SamplerInvalidation::Immediate
     }
 }

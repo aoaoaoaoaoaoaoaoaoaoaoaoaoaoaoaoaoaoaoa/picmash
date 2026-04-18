@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{
         HeaderMap, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, REFERER},
+        header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue},
     },
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -21,7 +21,7 @@ use image::{
     codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
     imageops::{self, FilterType},
 };
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use tokio::fs;
 use tower_http::{
@@ -38,8 +38,10 @@ use crate::{
         TriadTrainRequestDto,
     },
     app::{
-        FacemashFaceView, FacemashLocalAssetView, FacemashPairView, FacemashStatus,
-        IdentityReviewStatus, IdentityReviewView,
+        ArenaActionToken, ArenaCommand, ArenaCommandId, ArenaCommandOutcome, ArenaCommandStatus,
+        ArenaPairRef, ArenaRevision, ArenaSamplerEpoch, ArenaTurn, ArenaTurnId, FacemashFaceView,
+        FacemashLocalAssetView, FacemashPairView, FacemashStatus, IdentityReviewStatus,
+        IdentityReviewView,
     },
     app::{RedirectTarget, RuntimePhase, RuntimeSnapshot, SharedAppState, SharedRuntimeState},
     asset_domain::AssetDomainLabel,
@@ -67,7 +69,7 @@ mod vocab;
 use self::{
     arena::{
         api_arena_next, arena, arena_reroll, arena_root, heart, hide, lock_thread, rotate,
-        veto_thread, vote,
+        veto_thread, vote, vote_get,
     },
     board::{
         asset_domain, asset_heart, asset_hide, asset_rotate, board, board_nudge, rescan,
@@ -103,7 +105,7 @@ pub fn router(state: SharedRuntimeState) -> Router {
         .route("/arena", get(arena_root))
         .route("/arena/reroll", get(arena_reroll))
         .route("/arena/{left_id}/{right_id}", get(arena))
-        .route("/arena/{left_id}/{right_id}/vote", post(vote))
+        .route("/arena/{left_id}/{right_id}/vote", post(vote).get(vote_get))
         .route("/api/arena/next", get(api_arena_next))
         .route("/arena/{left_id}/{right_id}/rotate", post(rotate))
         .route("/arena/{left_id}/{right_id}/heart", post(heart))

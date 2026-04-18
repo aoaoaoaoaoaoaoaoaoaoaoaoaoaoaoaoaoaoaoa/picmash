@@ -1,10 +1,11 @@
 [workspace]
 members = ["crates/picmash-app"]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
+rust-version = "1.94"
 version = "0.1.0"
 
 [workspace.lints.rust]
@@ -15,6 +16,9 @@ unused_crate_dependencies = "warn"
 all = { level = "deny", priority = -2 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -3 }
+
+enum_glob_use = "allow"
+wildcard_imports = "allow"
 
 expect_used = "allow"
 missing_errors_doc = "allow"
@@ -31,14 +35,31 @@ cast_sign_loss = "allow"
 cast_lossless = "allow"
 float_cmp = "allow"
 future_not_send = "allow"
+ignored_unit_patterns = "allow"
+implicit_hasher = "allow"
+items_after_statements = "allow"
+manual_let_else = "allow"
+many_single_char_names = "allow"
+map_unwrap_or = "allow"
+match_same_arms = "allow"
 missing_const_for_fn = "allow"
 must_use_candidate = "allow"
 needless_raw_string_hashes = "allow"
+no_effect_underscore_binding = "allow"
+option_if_let_else = "allow"
 redundant_closure_for_method_calls = "allow"
+ref_option = "allow"
+return_self_not_must_use = "allow"
+similar_names = "allow"
 significant_drop_tightening = "allow"
+single_option_map = "allow"
+struct_excessive_bools = "allow"
 suboptimal_flops = "allow"
+trivially_copy_pass_by_ref = "allow"
 unnecessary_wraps = "allow"
 unused_async = "allow"
+unused_self = "allow"
+used_underscore_binding = "allow"
 
 [workspace.metadata.rust-starter]
 format_command = ["cargo", "fmt", "--all", "--check"]

@@ -65,7 +65,7 @@ pub(super) struct PerturbativeReplayState {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PreparedPerturbativeReplay {
+pub struct PreparedPerturbativeReplay {
     pub(super) frontier: ReplayFrontier,
     pub(super) model: crate::quality::QualityModelRecord,
     pub(super) state: PerturbativeReplayState,

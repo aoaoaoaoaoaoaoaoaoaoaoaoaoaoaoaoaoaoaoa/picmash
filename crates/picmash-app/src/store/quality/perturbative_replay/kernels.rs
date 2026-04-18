@@ -83,9 +83,8 @@ pub(super) fn standardized_vibe(
         return [0.0; crate::quality_features::VIBE_DESCRIPTOR_DIM];
     }
     let mut standardized = [0.0; crate::quality_features::VIBE_DESCRIPTOR_DIM];
-    for axis in 0..crate::quality_features::VIBE_DESCRIPTOR_DIM {
-        standardized[axis] =
-            (feature.vibe[axis] - standardization.mean[axis]) / standardization.scale[axis];
+    for (axis, slot) in standardized.iter_mut().enumerate() {
+        *slot = (feature.vibe[axis] - standardization.mean[axis]) / standardization.scale[axis];
     }
     standardized
 }
@@ -241,11 +240,11 @@ pub(super) fn apply_perturbative_session_projection_update(
     hyper: crate::quality::PerturbativeHyperParamsV3,
 ) {
     let importance = crate::quality::perturbative_importance(session.importance_raw_mean);
-    for axis in 0..crate::quality::PERTURBATIVE_DIM {
+    for (axis, basis_value) in basis.iter().copied().enumerate() {
         let scaled_basis = if axis < crate::model::LATENT_DIM {
-            basis[axis]
+            basis_value
         } else {
-            hyper.vibe_scale_real * basis[axis]
+            hyper.vibe_scale_real * basis_value
         };
         crate::quality::diagonal_adf_update(
             &mut session.perturbation_weight_mean[axis],

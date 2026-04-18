@@ -775,7 +775,7 @@ impl Store {
         let model = self.active_quality_model().ok();
         let updated_at = now();
         if let Some(model) = model {
-            let write_cache = |store: &Store,
+            let write_cache = |store: &Self,
                                identity_id: FaceIdentityId,
                                beauty: FaceBeauty,
                                duel_count: u32|

@@ -737,7 +737,7 @@ mod tests {
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 600,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: root.clone(),
+                root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 800,

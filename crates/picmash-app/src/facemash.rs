@@ -310,9 +310,7 @@ fn train_bradley_terry(
             let curvature = probability * (1.0 - probability);
             precision += (row * row.transpose()).scale(curvature);
         }
-        let Some(cholesky) = precision.clone().cholesky() else {
-            return None;
-        };
+        let cholesky = precision.clone().cholesky()?;
         let step = cholesky.solve(&gradient);
         if step.iter().any(|value| !value.is_finite()) {
             return None;
@@ -404,7 +402,7 @@ fn calibrate_oracle(
         .iter()
         .map(|(_, target, weight)| weight * target)
         .sum::<f64>();
-    let det = a00 * a11 - a01 * a01;
+    let det = a00.mul_add(a11, -(a01 * a01));
     let (scale, bias) = if det.abs() <= 1e-9 {
         (FACE_BEAUTY_BETA, f64::from(FACE_BEAUTY_MEAN))
     } else {

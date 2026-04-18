@@ -171,12 +171,11 @@ impl AppState {
                         identity
                             .faces
                             .iter()
-                            .filter_map(|face| {
+                            .find_map(|face| {
                                 face.asset_id
                                     .as_ref()
                                     .and_then(|asset_id| domains.get(asset_id).copied())
                             })
-                            .next()
                             .map(|label| (identity.identity.id, label))
                     })
                     .collect::<HashMap<_, _>>()
@@ -237,7 +236,7 @@ impl AppState {
                 let belief = beliefs
                     .get(&identity.identity.id)
                     .copied()
-                    .unwrap_or(FacemashBelief::forge(&identity.identity, None));
+                    .unwrap_or_else(|| FacemashBelief::forge(&identity.identity, None));
                 (
                     index,
                     self.facemash_frontier_score(
@@ -279,7 +278,7 @@ impl AppState {
                 let belief = beliefs
                     .get(&identity.identity.id)
                     .copied()
-                    .unwrap_or(FacemashBelief::forge(&identity.identity, None));
+                    .unwrap_or_else(|| FacemashBelief::forge(&identity.identity, None));
                 (
                     index,
                     self.facemash_coverage_score(
@@ -316,7 +315,7 @@ impl AppState {
             let left_belief = beliefs
                 .get(&left.identity.id)
                 .copied()
-                .unwrap_or(FacemashBelief::forge(&left.identity, None));
+                .unwrap_or_else(|| FacemashBelief::forge(&left.identity, None));
             for &right_index in shortlist.iter().skip(offset + 1) {
                 let right = &viable[right_index];
                 if identity_domains.as_ref().is_some_and(|domains| {
@@ -333,7 +332,7 @@ impl AppState {
                 let right_belief = beliefs
                     .get(&right.identity.id)
                     .copied()
-                    .unwrap_or(FacemashBelief::forge(&right.identity, None));
+                    .unwrap_or_else(|| FacemashBelief::forge(&right.identity, None));
                 let score = self.facemash_pair_score(
                     &left.identity,
                     &right.identity,
@@ -615,11 +614,12 @@ impl AppState {
         let win_probability = sigmoid(margin).clamp(1e-4, 1.0 - 1e-4);
         let entropy = -(win_probability * win_probability.ln()
             + (1.0 - win_probability) * (1.0 - win_probability).ln());
-        let posterior_uncertainty =
-            (left_belief.posterior_sigma.powi(2) + right_belief.posterior_sigma.powi(2)).sqrt();
-        let model_uncertainty = (left_belief.model_uncertainty().powi(2)
-            + right_belief.model_uncertainty().powi(2))
-        .sqrt();
+        let posterior_uncertainty = left_belief
+            .posterior_sigma
+            .hypot(right_belief.posterior_sigma);
+        let model_uncertainty = left_belief
+            .model_uncertainty()
+            .hypot(right_belief.model_uncertainty());
         let uncertainty = FACEMASH_PAIR_POSTERIOR_SIGMA_WEIGHT * posterior_uncertainty
             + FACEMASH_PAIR_MODEL_SIGMA_WEIGHT * model_uncertainty;
         let topness = FacemashBelief::topness_bias(left_topness.max(right_topness));
@@ -640,7 +640,7 @@ impl AppState {
                     beliefs
                         .get(&identity.identity.id)
                         .copied()
-                        .unwrap_or(FacemashBelief::forge(&identity.identity, None))
+                        .unwrap_or_else(|| FacemashBelief::forge(&identity.identity, None))
                         .prettiness_signal(),
                 )
             })
