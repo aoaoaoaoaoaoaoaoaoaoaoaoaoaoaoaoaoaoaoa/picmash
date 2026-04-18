@@ -8,8 +8,8 @@ import {
   setExploreAssetDomain,
   writeExploreRoute,
   type ExploreRouteState,
-} from "./api";
-import { overlayChipRail, overlayDomainButtons, overlayMeta, overlayToolRail } from "./media-frame";
+} from "./api.js";
+import { overlayChipRail, overlayDomainButtons, overlayMeta, overlayToolRail } from "./media-frame.js";
 import type {
   AssetQualitySummaryDto,
   ExploreBootstrapDto,

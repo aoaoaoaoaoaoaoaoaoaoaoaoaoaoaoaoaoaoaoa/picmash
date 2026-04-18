@@ -1,7 +1,5 @@
-import "./styles.css";
-
-import { mountExplore } from "./explore";
-import { mountTriad } from "./triad";
+import { mountExplore } from "./explore.js";
+import { mountTriad } from "./triad.js";
 
 async function main(): Promise<void> {
   const root = ensureRoot();

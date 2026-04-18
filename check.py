@@ -7,7 +7,7 @@ import tomllib
 import re
 import os
 from pathlib import Path
-from shutil import copy2
+from shutil import copy2, rmtree, which
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE_MANIFEST = ROOT / "Cargo.toml"
@@ -26,10 +26,21 @@ DEFAULT_INSTALL = [
     "--locked",
 ]
 FRONTEND_ROOT = ROOT / "apps" / "web"
-NPM_CACHE = Path("/tmp/picmash-npm-cache")
+FRONTEND_ASSET_ROOT = ROOT / "crates" / "picmash-app" / "assets" / "web"
 LOCAL_BIN = Path.home() / ".local" / "bin"
 ORT_PROVIDER_GLOB = "libonnxruntime_providers*.so"
-SOURCE_FILE_EXCLUDES = {"target", ".git", "node_modules"}
+SOURCE_FILE_EXCLUDES = {"target", ".git"}
+FORBIDDEN_JS_SUPPLY_CHAIN_PATHS = (
+    FRONTEND_ROOT / "node_modules",
+    FRONTEND_ROOT / "package.json",
+    FRONTEND_ROOT / "package-lock.json",
+    FRONTEND_ROOT / "npm-shrinkwrap.json",
+    FRONTEND_ROOT / "pnpm-lock.yaml",
+    FRONTEND_ROOT / "yarn.lock",
+    FRONTEND_ROOT / "bun.lockb",
+    FRONTEND_ROOT / "vite.config.ts",
+    FRONTEND_ROOT / "vite.config.js",
+)
 FRONTEND_SHELL_FORBIDDEN_PATTERNS = (
     r"(?m)(^|[^-\w])\.app-shell\b",
     r"(?m)(^|[^-\w])\.page-body\b",
@@ -46,9 +57,9 @@ FRONTEND_SHELL_FORBIDDEN_PATTERNS = (
 )
 
 
-def run(argv: list[str], *, env: dict[str, str] | None = None) -> None:
+def run(argv: list[str], *, env: dict[str, str] | None = None, cwd: Path = ROOT) -> None:
     print("+", " ".join(argv), flush=True)
-    proc = subprocess.run(argv, cwd=ROOT, env=env)
+    proc = subprocess.run(argv, cwd=cwd, env=env)
     if proc.returncode != 0:
         raise SystemExit(proc.returncode)
 
@@ -63,19 +74,19 @@ def user_systemd_env() -> dict[str, str]:
 def frontend() -> None:
     if not FRONTEND_ROOT.exists():
         return
+    enforce_no_third_party_js()
+    if which("tsc") is None:
+        raise SystemExit("system TypeScript compiler `tsc` is required")
     run(
-        [
-            "npm",
-            "ci",
-            "--prefix",
-            str(FRONTEND_ROOT),
-            "--no-fund",
-            "--no-audit",
-            "--cache",
-            str(NPM_CACHE),
-        ]
+        ["cargo", "run", "-q", "-p", "picmash-app", "--bin", "export-ts", "--", "src/generated"],
+        cwd=FRONTEND_ROOT,
     )
-    run(["npm", "run", "--prefix", str(FRONTEND_ROOT), "build"])
+    rmtree(FRONTEND_ASSET_ROOT, ignore_errors=True)
+    run(["tsc", "--project", "tsconfig.json"], cwd=FRONTEND_ROOT)
+    rmtree(FRONTEND_ASSET_ROOT / "generated", ignore_errors=True)
+    for stale_module in ("contracts.js", "picmash-client.js"):
+        (FRONTEND_ASSET_ROOT / stale_module).unlink(missing_ok=True)
+    copy2(FRONTEND_ROOT / "src" / "styles.css", FRONTEND_ASSET_ROOT / "picmash-client.css")
 
 
 def workspace_metadata() -> dict[str, object]:
@@ -141,6 +152,16 @@ def enforce_stylesheet_ownership() -> None:
     raise SystemExit(1)
 
 
+def enforce_no_third_party_js() -> None:
+    violations = [path for path in FORBIDDEN_JS_SUPPLY_CHAIN_PATHS if path.exists()]
+    if not violations:
+        return
+    print("third-party JavaScript supply-chain surfaces are forbidden:", file=sys.stderr)
+    for path in violations:
+        print(f"  {path.relative_to(ROOT)}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def configured_command(name: str, default: list[str]) -> list[str]:
     configured = workspace_metadata().get(name)
     if not (
@@ -182,6 +203,7 @@ def normalized_install_command() -> list[str]:
 def check() -> None:
     enforce_source_file_cap()
     enforce_stylesheet_ownership()
+    enforce_no_third_party_js()
     frontend()
     run(configured_command("format_command", DEFAULT_FORMAT))
     run(normalized_clippy_command())
@@ -191,6 +213,7 @@ def check() -> None:
 def install() -> None:
     enforce_source_file_cap()
     enforce_stylesheet_ownership()
+    enforce_no_third_party_js()
     frontend()
     run(normalized_install_command())
     install_ort_provider_dylibs()

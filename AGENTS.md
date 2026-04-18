@@ -4,6 +4,15 @@
 This repository inherits the local Rust style doctrine:
 [/home/main/programming/projects/rust_starter/docs/rust-style-doctrine.md](/home/main/programming/projects/rust_starter/docs/rust-style-doctrine.md).
 
+## JavaScript Supply Chain Doctrine
+
+First-party browser JavaScript and TypeScript are allowed. Third-party JavaScript
+or TypeScript packages are forbidden by default: no `node_modules`, no npm/pnpm/
+yarn/bun package manager surfaces, no JS bundlers, no CDN scripts, and no
+third-party browser libraries. TypeScript checking may use the system Arch
+`typescript` package (`tsc`) as part of the machine toolchain. Any exception
+requires an explicit design discussion and a committed rationale.
+
 <!-- forgejo-assimilation:start -->
 ## Forgejo Swarm Integration
 

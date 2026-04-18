@@ -7,8 +7,8 @@ import {
   setTriadAssetDomain,
   trainTriad,
   writeTriadRoute,
-} from "./api";
-import { overlayChipRail, overlayDomainButtons, overlayMeta, overlayToolRail } from "./media-frame";
+} from "./api.js";
+import { overlayChipRail, overlayDomainButtons, overlayMeta, overlayToolRail } from "./media-frame.js";
 import type {
   AssetQualitySummaryDto,
   SimilarityChoice,
