@@ -1612,6 +1612,108 @@ mod tests {
     }
 
     #[test]
+    fn arena_remote_hide_command_retires_clicked_remote_before_reroll() {
+        let _guard = test_guard();
+        let root = test_root("arena-command-remote-hide-retires");
+        let corpus_root = root.join("corpus");
+        let source_root = root.join("source");
+        let config_root = root.join("config");
+        let app_data_root = root.join("xdg-data");
+        let app_cache_root = root.join("xdg-cache");
+        std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+        std::fs::create_dir_all(&source_root).expect("create source root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&app_data_root).expect("create data root");
+        std::fs::create_dir_all(&app_cache_root).expect("create cache root");
+
+        solid_png(&corpus_root.join("seed-a.png"), [32, 48, 64]);
+        solid_png(&corpus_root.join("seed-b.png"), [64, 48, 32]);
+        solid_png(&source_root.join("remote-a.png"), [180, 40, 60]);
+
+        let mut config = app_config_with_source_mix(1.0);
+        config.sources = vec![SourceConfig {
+            weight: 1.0,
+            import_policy: ImportPolicy::NotX,
+            scan_interval_seconds: 0,
+            upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
+                root: source_root,
+                recurse: true,
+                filters: RemoteImageFilterConfig {
+                    min_shortest_edge: 0,
+                    ..RemoteImageFilterConfig::default()
+                },
+            }),
+        }];
+        let config_path = config_root.join("config.toml");
+        let config_digest = config.write(&config_path).expect("write config");
+        let app_paths = AppBootPaths {
+            db_path: app_data_root.join("picmash.sqlite3"),
+            model_cache_root: app_cache_root.clone(),
+            cache_root: app_cache_root.join("renditions"),
+            source_cache_root: app_cache_root.join("sources"),
+        };
+
+        let state =
+            AppState::boot_with_paths(&corpus_root, config, config_path, config_digest, app_paths)
+                .expect("boot app state");
+        state.schedule_corpus_ingest();
+        drain_maintenance(&state);
+        state
+            .refresh_external_sources_if_due(true)
+            .expect("harvest local-directory source");
+
+        let page = state.arena_page_state(None).expect("arena page state");
+        let current = page.current.expect("current turn");
+        let (local_handle, remote_handle) = match (&current.pair().left, &current.pair().right) {
+            (ArenaHandle::Local(asset_id), ArenaHandle::Remote(item_id))
+            | (ArenaHandle::Remote(item_id), ArenaHandle::Local(asset_id)) => (
+                ArenaHandle::Local(asset_id.clone()),
+                ArenaHandle::Remote(*item_id),
+            ),
+            _ => panic!("expected a remote arena pair"),
+        };
+        let ArenaHandle::Remote(remote_item_id) = remote_handle else {
+            panic!("expected remote handle")
+        };
+
+        let outcome = state
+            .apply_arena_command(ArenaCommand::Hide {
+                command_id: ArenaCommandId::forge(),
+                expected_revision: current.revision(),
+                expected_sampler_epoch: current.sampler_epoch(),
+                turn_id: current.id().clone(),
+                action_token: current.action_token().clone(),
+                handle: remote_handle.clone(),
+                hidden: true,
+                cluster_ids: Vec::new(),
+            })
+            .expect("hide remote through arena command");
+        assert_eq!(outcome.status, ArenaCommandStatus::Applied);
+        assert!(
+            state
+                .read_store()
+                .expect("open store after remote hide")
+                .external_item_hidden(remote_item_id)
+                .expect("reload hidden remote"),
+            "remote hide must retire the clicked item before selecting the next turn"
+        );
+        assert!(
+            outcome
+                .current
+                .as_ref()
+                .is_none_or(|turn| !turn.pair().contains(&remote_handle)),
+            "the authoritative reroll must not return the just-rejected remote"
+        );
+        assert!(
+            outcome
+                .current
+                .as_ref()
+                .is_none_or(|turn| turn.pair().contains(&local_handle)),
+            "remote hide should preserve the surviving local anchor while replacing the challenger"
+        );
+    }
+
+    #[test]
     fn vetoing_a_locked_thread_lifts_the_lock_before_rerolling() {
         let _guard = test_guard();
         let root = test_root("subsource-lock-veto-clears");
