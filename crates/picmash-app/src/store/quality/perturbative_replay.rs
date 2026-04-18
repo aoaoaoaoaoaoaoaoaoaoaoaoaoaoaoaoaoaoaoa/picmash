@@ -1250,10 +1250,7 @@ impl Store {
             .assets
             .values()
             .filter_map(|asset| {
-                let Some((mean, variance)) = asset.technical_mean.zip(asset.technical_variance)
-                else {
-                    return None;
-                };
+                let (mean, variance) = asset.technical_mean.zip(asset.technical_variance)?;
                 let descriptor = self
                     .asset_quality_features(
                         &asset.asset.id,
@@ -1271,9 +1268,7 @@ impl Store {
             })
             .collect::<Vec<_>>();
         samples.extend(state.external_items.iter().filter_map(|(item_id, item)| {
-            let Some((mean, variance)) = item.technical_mean.zip(item.technical_variance) else {
-                return None;
-            };
+            let (mean, variance) = item.technical_mean.zip(item.technical_variance)?;
             let descriptor = self
                 .external_item_quality_features(
                     *item_id,

@@ -1,4 +1,9 @@
 
+## Rust Style Doctrine
+
+This repository inherits the local Rust style doctrine:
+[/home/main/programming/projects/rust_starter/docs/rust-style-doctrine.md](/home/main/programming/projects/rust_starter/docs/rust-style-doctrine.md).
+
 <!-- forgejo-assimilation:start -->
 ## Forgejo Swarm Integration
 

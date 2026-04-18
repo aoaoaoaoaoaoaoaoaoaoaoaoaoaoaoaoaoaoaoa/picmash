@@ -51,6 +51,9 @@ use crate::{
 };
 
 mod arena;
+mod arena_scope;
+mod arena_session;
+mod cache;
 mod explore;
 mod external;
 mod facemash;
@@ -66,6 +69,13 @@ mod support;
 mod tests;
 mod writer;
 
+use self::arena_scope::{ArenaScope, ArenaScopeAction, PipelineDisposition, ThreadKey};
+use self::arena_session::ArenaSessionRuntime;
+pub use self::arena_session::{
+    ArenaActionToken, ArenaCommand, ArenaCommandId, ArenaCommandOutcome, ArenaCommandStatus,
+    ArenaPageState, ArenaPairRef, ArenaRevision, ArenaSamplerEpoch, ArenaTurn, ArenaTurnId,
+    SamplerInvalidation,
+};
 use self::ready_frontier::{
     REMOTE_SOURCE_IDLE_SCAN_GRACE, ReadyTargetProfile, SourceReadyFrontier,
 };
@@ -200,6 +210,7 @@ pub struct AppState {
     active: ActiveArena,
     root_path: PathBuf,
     cache_root: std::path::PathBuf,
+    source_cache_root: std::path::PathBuf,
     session_field_cache: RwLock<Option<SessionField>>,
     explore_layouts: RwLock<HashMap<ExploreMapMode, ExploreLayoutCache>>,
     explore_vectors: RwLock<Option<ExploreVectorCache>>,
@@ -207,6 +218,7 @@ pub struct AppState {
     duplicate_frontier: RwLock<Option<DuplicateFrontier>>,
     face_oracle: RwLock<Option<FaceOracle>>,
     maintenance_notify: Notify,
+    arena_session: Mutex<ArenaSessionRuntime>,
     recent_facemash_pairs: Mutex<VecDeque<FacemashPairKey>>,
     recent_facemash_identities: Mutex<VecDeque<FaceIdentityId>>,
     recent_facemash_faces: Mutex<VecDeque<FaceId>>,

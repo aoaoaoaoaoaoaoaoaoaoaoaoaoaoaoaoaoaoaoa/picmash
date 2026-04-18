@@ -3,36 +3,61 @@ use crate::identity::VisualKey;
 use std::collections::HashSet;
 use tracing::{Instrument, info_span};
 
-pub(super) async fn arena_root(State(state): State<SharedRuntimeState>) -> WebResult<Response> {
-    let _span = info_span!("arena.render.root").entered();
-    let state = match ready_app_or_snapshot(&state) {
-        Ok(state) => state,
-        Err(snapshot) => return Ok(boot_response(snapshot)),
-    };
-    log_site_loaded("/arena");
-    let target = state.arena_target()?;
-    match target {
-        RedirectTarget::ArenaRoot => Ok(render_markup(routed_layout(
-            "arena-page",
-            PageGeometry::Viewport,
-            NavPage::Arena,
-            Some(arena_mode_menu(state.external_status()?)),
-            arena_markup(
-                state.arena_empty()?,
-                arena_lookahead_markup(&state, None, &HashSet::new())?,
-                None,
-                state.external_status()?,
-            ),
-        ))),
-        RedirectTarget::ArenaPair { .. } => Ok(Redirect::to(&target.href()).into_response()),
-        RedirectTarget::FacemashRoot
-        | RedirectTarget::FacemashPair { .. }
-        | RedirectTarget::ExploreRoot { .. }
-        | RedirectTarget::ExploreTriad { .. } => Ok(Redirect::to("/arena").into_response()),
-    }
+enum ArenaRootRender {
+    Redirect(String),
+    Empty(Box<ArenaRootPage>),
 }
 
-pub(super) async fn arena_reroll() -> WebResult<Response> {
+struct ArenaRootPage {
+    view: ArenaView,
+    external_status: ExternalArenaStatus,
+}
+
+enum ArenaPairRender {
+    Redirect(String),
+    Pair(Box<ArenaPairPage>),
+}
+
+struct ArenaPairPage {
+    current: ArenaTurn,
+    view: ArenaView,
+    lookahead: Option<ArenaLookaheadMarkup>,
+    external_status: ExternalArenaStatus,
+}
+
+pub(super) async fn arena_root(State(state): State<SharedRuntimeState>) -> WebResult<Response> {
+    let span = info_span!("arena.render.root");
+    async move {
+        let state = match ready_app_or_snapshot(&state) {
+            Ok(state) => state,
+            Err(snapshot) => return Ok(boot_response(snapshot)),
+        };
+        log_site_loaded("/arena");
+        match arena_root_render_blocking(state).await? {
+            ArenaRootRender::Redirect(href) => Ok(Redirect::to(&href).into_response()),
+            ArenaRootRender::Empty(page) => {
+                let ArenaRootPage {
+                    view,
+                    external_status,
+                } = *page;
+                Ok(render_markup(routed_layout(
+                    "arena-page",
+                    PageGeometry::Viewport,
+                    NavPage::Arena,
+                    Some(arena_mode_menu(external_status.clone())),
+                    arena_markup(None, view, None, external_status),
+                )))
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
+pub(super) async fn arena_reroll(State(state): State<SharedRuntimeState>) -> WebResult<Response> {
+    if let Some(state) = state.ready_app() {
+        state.shatter_arena_session();
+    }
     Ok(Redirect::to("/arena").into_response())
 }
 
@@ -41,61 +66,41 @@ pub(super) async fn arena(
     Path((left_id, right_id)): Path<(String, String)>,
 ) -> WebResult<Response> {
     let pair_href = format!("/arena/{left_id}/{right_id}");
-    let _span = info_span!(
+    let span = info_span!(
         "arena.render.pair",
         pair_href = %pair_href,
         left_handle = %left_id,
         right_handle = %right_id,
-    )
-    .entered();
-    let state = match ready_app_or_snapshot(&state) {
-        Ok(state) => state,
-        Err(snapshot) => return Ok(boot_response(snapshot)),
-    };
-    let left = ArenaHandle::from_str(&left_id).map_err(anyhow::Error::msg)?;
-    let right = ArenaHandle::from_str(&right_id).map_err(anyhow::Error::msg)?;
-    let Some(view) = state.arena_pair(&left, &right)? else {
-        return Ok(Redirect::to("/arena").into_response());
-    };
-    log_site_loaded("/arena/pair");
-    let current_excluded = view
-        .pair
-        .as_ref()
-        .map(crate::model::ArenaPair::visual_keys)
-        .unwrap_or_default();
-    let lookahead = arena_lookahead_markup(&state, None, &current_excluded)?;
-    let mut preserved_excluded = current_excluded.clone();
-    if let Some(lookahead_keys) = lookahead.as_ref() {
-        preserved_excluded.extend(lookahead_keys.visual_keys.iter().cloned().map(VisualKey));
-    }
-    let preserved_lookahead = view
-        .pair
-        .as_ref()
-        .and_then(arena_pair_local_anchor)
-        .map_or(Ok(None), |anchor| {
-            let mut excluded = preserved_excluded.clone();
-            let anchor_visual_key = view
-                .pair
-                .as_ref()
-                .and_then(crate::model::ArenaPair::local_anchor_visual_key)
-                .cloned();
-            if let Some(anchor_visual_key) = anchor_visual_key {
-                excluded.remove(&anchor_visual_key);
+    );
+    async move {
+        let state = match ready_app_or_snapshot(&state) {
+            Ok(state) => state,
+            Err(snapshot) => return Ok(boot_response(snapshot)),
+        };
+        let left = ArenaHandle::from_str(&left_id).map_err(anyhow::Error::msg)?;
+        let right = ArenaHandle::from_str(&right_id).map_err(anyhow::Error::msg)?;
+        match arena_pair_render_blocking(state, ArenaPairRef::forge(left, right)).await? {
+            ArenaPairRender::Redirect(href) => Ok(Redirect::to(&href).into_response()),
+            ArenaPairRender::Pair(page) => {
+                let ArenaPairPage {
+                    current,
+                    view,
+                    lookahead,
+                    external_status,
+                } = *page;
+                log_site_loaded("/arena/pair");
+                Ok(render_markup(routed_layout(
+                    "arena-page",
+                    PageGeometry::Viewport,
+                    NavPage::Arena,
+                    Some(arena_mode_menu(external_status.clone())),
+                    arena_markup(Some(current), view, lookahead, external_status),
+                )))
             }
-            arena_lookahead_markup(&state, Some(anchor), &excluded)
-        })?;
-    Ok(render_markup(routed_layout(
-        "arena-page",
-        PageGeometry::Viewport,
-        NavPage::Arena,
-        Some(arena_mode_menu(state.external_status()?)),
-        arena_markup(
-            view,
-            lookahead,
-            preserved_lookahead,
-            state.external_status()?,
-        ),
-    )))
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 pub(super) async fn vote(
@@ -115,32 +120,106 @@ pub(super) async fn vote(
         let Some(state) = state.ready_app() else {
             return Ok(service_unavailable_response());
         };
-        let left = ArenaHandle::from_str(&form.left_id).map_err(anyhow::Error::msg)?;
-        let right = ArenaHandle::from_str(&form.right_id).map_err(anyhow::Error::msg)?;
         let winner = ArenaHandle::from_str(&form.winner_id).map_err(anyhow::Error::msg)?;
-        if let Some(response) = stale_arena_action_response(&state, [&left, &right, &winner])? {
-            return Ok(response);
-        }
+        let command = ArenaCommand::Vote {
+            command_id: ArenaCommandId(form.command.command_id),
+            expected_revision: ArenaRevision(form.command.arena_revision),
+            expected_sampler_epoch: ArenaSamplerEpoch(form.command.arena_sampler_epoch),
+            turn_id: ArenaTurnId(form.command.turn_id),
+            action_token: ArenaActionToken(form.command.action_token),
+            winner,
+        };
         let refresh_state = state.clone();
-        let target = tokio::task::spawn_blocking(move || state.vote(&left, &right, &winner))
-            .await
-            .map_err(|error| anyhow::anyhow!("joining arena vote task: {error:#}"))??;
+        let outcome = apply_arena_command_blocking(state, command, "vote").await?;
         if !refresh_state.quality_refresh_is_inline()? {
             refresh_state.schedule_quality_model_refresh();
         }
-        if headers
-            .get(axum::http::header::ACCEPT)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("application/json"))
-        {
-            return Ok(no_store_response(
-                axum::Json(serde_json::json!({ "ok": true })).into_response(),
-            ));
-        }
-        Ok(Redirect::to(&target.href()).into_response())
+        arena_command_response(refresh_state, outcome, accepts_json(&headers)).await
     }
     .instrument(span)
     .await
+}
+
+pub(super) async fn vote_get(
+    Path((left_id, right_id)): Path<(String, String)>,
+) -> WebResult<Response> {
+    Ok(Redirect::to(&format!("/arena/{left_id}/{right_id}")).into_response())
+}
+
+async fn apply_arena_command_blocking(
+    state: SharedAppState,
+    command: ArenaCommand,
+    action: &'static str,
+) -> anyhow::Result<ArenaCommandOutcome> {
+    tokio::task::spawn_blocking(move || state.apply_arena_command(command))
+        .await
+        .map_err(|error| anyhow::anyhow!("joining arena {action} task: {error:#}"))?
+}
+
+async fn arena_root_render_blocking(state: SharedAppState) -> anyhow::Result<ArenaRootRender> {
+    tokio::task::spawn_blocking(move || {
+        let target = state.arena_target()?;
+        match target {
+            RedirectTarget::ArenaRoot => Ok(ArenaRootRender::Empty(Box::new(ArenaRootPage {
+                view: state.arena_empty()?,
+                external_status: state.external_status()?,
+            }))),
+            RedirectTarget::ArenaPair { .. } => Ok(ArenaRootRender::Redirect(target.href())),
+            RedirectTarget::FacemashRoot
+            | RedirectTarget::FacemashPair { .. }
+            | RedirectTarget::ExploreRoot { .. }
+            | RedirectTarget::ExploreTriad { .. } => {
+                Ok(ArenaRootRender::Redirect("/arena".to_owned()))
+            }
+        }
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("joining arena root render task: {error:#}"))?
+}
+
+async fn arena_pair_render_blocking(
+    state: SharedAppState,
+    pair: ArenaPairRef,
+) -> anyhow::Result<ArenaPairRender> {
+    tokio::task::spawn_blocking(move || {
+        let page = state.arena_page_state(Some(pair))?;
+        if let Some(redirect) = page.redirect {
+            return Ok(ArenaPairRender::Redirect(redirect.href()));
+        }
+        let Some(current) = page.current else {
+            return Ok(ArenaPairRender::Redirect("/arena".to_owned()));
+        };
+        let Some(view) = state.arena_turn_view(&current)? else {
+            return Ok(ArenaPairRender::Redirect("/arena".to_owned()));
+        };
+        let lookahead = page
+            .lookahead
+            .as_ref()
+            .map(|turn| arena_lookahead_markup(&state, turn))
+            .transpose()?
+            .flatten();
+        Ok(ArenaPairRender::Pair(Box::new(ArenaPairPage {
+            current,
+            view,
+            lookahead,
+            external_status: state.external_status()?,
+        })))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("joining arena pair render task: {error:#}"))?
+}
+
+async fn arena_prefetch_payload_blocking(
+    state: SharedAppState,
+    known_turn_ids: HashSet<ArenaTurnId>,
+    excluded_visual_keys: HashSet<VisualKey>,
+) -> anyhow::Result<serde_json::Value> {
+    tokio::task::spawn_blocking(move || {
+        let turn = state.arena_prefetch_turn(&known_turn_ids, &excluded_visual_keys)?;
+        arena_optional_turn_payload(&state, turn.as_ref())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("joining arena prefetch task: {error:#}"))?
 }
 
 pub(super) async fn api_arena_next(
@@ -148,31 +227,32 @@ pub(super) async fn api_arena_next(
     Query(query): Query<ArenaNextQuery>,
 ) -> WebResult<Response> {
     let excluded_visual_count = query.exclude_visual_keys().len();
-    let _span = info_span!(
+    let known_turn_count = query.known_turn_ids().len();
+    let span = info_span!(
         "arena.prefetch.next",
-        anchor = %query.anchor.as_deref().unwrap_or(""),
         excluded_visual_count,
-    )
-    .entered();
-    let Some(state) = state.ready_app() else {
-        return Ok(service_unavailable_response());
-    };
-    let local_anchor = query.anchor.as_deref().map(|slug| AssetId(slug.to_owned()));
-    let excluded_visual_keys = query
-        .exclude_visual_keys()
-        .into_iter()
-        .map(VisualKey)
-        .collect::<HashSet<_>>();
-    let target = match local_anchor.as_ref() {
-        Some(anchor) => state.arena_prefetch_target_preserving_local_anchor_excluding(
-            Some(anchor),
-            &excluded_visual_keys,
-        )?,
-        None => state.arena_prefetch_target_excluding(&excluded_visual_keys)?,
-    };
-    Ok(no_store_response(
-        axum::Json(arena_target_payload(&state, &target)?).into_response(),
-    ))
+        known_turn_count,
+    );
+    async move {
+        let Some(state) = state.ready_app() else {
+            return Ok(service_unavailable_response());
+        };
+        let excluded_visual_keys = query
+            .exclude_visual_keys()
+            .into_iter()
+            .map(VisualKey)
+            .collect::<HashSet<_>>();
+        let known_turn_ids = query
+            .known_turn_ids()
+            .into_iter()
+            .map(ArenaTurnId)
+            .collect::<HashSet<_>>();
+        let payload =
+            arena_prefetch_payload_blocking(state, known_turn_ids, excluded_visual_keys).await?;
+        Ok(no_store_response(axum::Json(payload).into_response()))
+    }
+    .instrument(span)
+    .await
 }
 
 pub(super) async fn rotate(
@@ -186,7 +266,7 @@ pub(super) async fn rotate(
         pair_href = %pair_href,
         asset_handle = %form.asset_id,
         direction = form.direction,
-        next_rotation = form._next_rotation.unwrap_or_default(),
+        next_rotation = form.next_rotation.unwrap_or_default(),
     )
     .entered();
     let Some(state) = state.ready_app() else {
@@ -251,43 +331,44 @@ pub(super) async fn hide(
     Form(form): Form<HideForm>,
 ) -> WebResult<Response> {
     let pair_href = format!("/arena/{left_id}/{right_id}");
-    let _span = info_span!(
+    let accept_json = accepts_json(&headers);
+    let span = info_span!(
         "arena.action.hide",
         pair_href = %pair_href,
         asset_handle = %form.asset_id,
         cluster_size = form.cluster_ids.len(),
         hide = form.hide,
-        accept_json = %accepts_json(&headers),
-    )
-    .entered();
-    let Some(state) = state.ready_app() else {
-        return Ok(service_unavailable_response());
-    };
-    let handle = ArenaHandle::from_str(&form.asset_id).map_err(anyhow::Error::msg)?;
-    let left = ArenaHandle::from_str(&left_id).map_err(anyhow::Error::msg)?;
-    let right = ArenaHandle::from_str(&right_id).map_err(anyhow::Error::msg)?;
-    if let Some(response) = stale_arena_action_response(&state, [&left, &right, &handle])? {
-        return Ok(response);
+        accept_json = %accept_json,
+    );
+    async move {
+        let Some(state) = state.ready_app() else {
+            return Ok(service_unavailable_response());
+        };
+        let handle = ArenaHandle::from_str(&form.asset_id).map_err(anyhow::Error::msg)?;
+        let cluster_ids: Vec<RemoteItemId> = form
+            .cluster_ids
+            .iter()
+            .map(|&id| RemoteItemId(id))
+            .collect();
+        let remote_action = matches!(handle, ArenaHandle::Remote(_));
+        let command = ArenaCommand::Hide {
+            command_id: ArenaCommandId(form.command.command_id),
+            expected_revision: ArenaRevision(form.command.arena_revision),
+            expected_sampler_epoch: ArenaSamplerEpoch(form.command.arena_sampler_epoch),
+            turn_id: ArenaTurnId(form.command.turn_id),
+            action_token: ArenaActionToken(form.command.action_token),
+            handle,
+            hidden: form.hide,
+            cluster_ids,
+        };
+        let outcome = apply_arena_command_blocking(state.clone(), command, "hide").await?;
+        if remote_action {
+            state.schedule_quality_model_refresh();
+        }
+        arena_command_response(state, outcome, accept_json).await
     }
-    let cluster_ids: Vec<RemoteItemId> = form
-        .cluster_ids
-        .iter()
-        .map(|&id| RemoteItemId(id))
-        .collect();
-    let target = state.hide_arena_handle(&handle, form.hide, &cluster_ids, &left, &right)?;
-    if matches!(handle, ArenaHandle::Remote(_)) {
-        state.schedule_quality_model_refresh();
-    }
-    if headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("application/json"))
-    {
-        return Ok(no_store_response(
-            axum::Json(arena_target_payload(&state, &target)?).into_response(),
-        ));
-    }
-    Ok(Redirect::to(&target.href()).into_response())
+    .instrument(span)
+    .await
 }
 
 pub(super) async fn veto_thread(
@@ -297,33 +378,31 @@ pub(super) async fn veto_thread(
     Form(form): Form<HandleForm>,
 ) -> WebResult<Response> {
     let pair_href = format!("/arena/{left_id}/{right_id}");
-    let _span = info_span!(
+    let accept_json = accepts_json(&headers);
+    let span = info_span!(
         "arena.action.veto_thread",
         pair_href = %pair_href,
         asset_handle = %form.asset_id,
-        accept_json = %accepts_json(&headers),
-    )
-    .entered();
-    let Some(state) = state.ready_app() else {
-        return Ok(service_unavailable_response());
-    };
-    let handle = ArenaHandle::from_str(&form.asset_id).map_err(anyhow::Error::msg)?;
-    let left = ArenaHandle::from_str(&left_id).map_err(anyhow::Error::msg)?;
-    let right = ArenaHandle::from_str(&right_id).map_err(anyhow::Error::msg)?;
-    if let Some(response) = stale_arena_action_response(&state, [&left, &right, &handle])? {
-        return Ok(response);
+        accept_json = %accept_json,
+    );
+    async move {
+        let Some(state) = state.ready_app() else {
+            return Ok(service_unavailable_response());
+        };
+        let handle = ArenaHandle::from_str(&form.asset_id).map_err(anyhow::Error::msg)?;
+        let command = ArenaCommand::VetoThread {
+            command_id: ArenaCommandId(form.command.command_id),
+            expected_revision: ArenaRevision(form.command.arena_revision),
+            expected_sampler_epoch: ArenaSamplerEpoch(form.command.arena_sampler_epoch),
+            turn_id: ArenaTurnId(form.command.turn_id),
+            action_token: ArenaActionToken(form.command.action_token),
+            handle,
+        };
+        let outcome = apply_arena_command_blocking(state.clone(), command, "veto_thread").await?;
+        arena_command_response(state, outcome, accept_json).await
     }
-    let target = state.veto_external_thread_for_handle(&handle, &left, &right)?;
-    if headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("application/json"))
-    {
-        return Ok(no_store_response(
-            axum::Json(arena_target_payload(&state, &target)?).into_response(),
-        ));
-    }
-    Ok(Redirect::to(&target.href()).into_response())
+    .instrument(span)
+    .await
 }
 
 pub(super) async fn lock_thread(
@@ -333,54 +412,67 @@ pub(super) async fn lock_thread(
     Form(form): Form<ThreadLockForm>,
 ) -> WebResult<Response> {
     let pair_href = format!("/arena/{left_id}/{right_id}");
-    let _span = info_span!(
+    let accept_json = accepts_json(&headers);
+    let span = info_span!(
         "arena.action.lock_thread",
         pair_href = %pair_href,
         asset_handle = %form.asset_id,
         active = form.active,
-        accept_json = %accepts_json(&headers),
-    )
-    .entered();
-    let Some(state) = state.ready_app() else {
-        return Ok(service_unavailable_response());
-    };
-    let handle = ArenaHandle::from_str(&form.asset_id).map_err(anyhow::Error::msg)?;
-    let left = ArenaHandle::from_str(&left_id).map_err(anyhow::Error::msg)?;
-    let right = ArenaHandle::from_str(&right_id).map_err(anyhow::Error::msg)?;
-    if let Some(response) = stale_arena_action_response(&state, [&left, &right, &handle])? {
-        return Ok(response);
+        accept_json = %accept_json,
+    );
+    async move {
+        let Some(state) = state.ready_app() else {
+            return Ok(service_unavailable_response());
+        };
+        let handle = ArenaHandle::from_str(&form.asset_id).map_err(anyhow::Error::msg)?;
+        let command = ArenaCommand::LockThread {
+            command_id: ArenaCommandId(form.command.command_id),
+            expected_revision: ArenaRevision(form.command.arena_revision),
+            expected_sampler_epoch: ArenaSamplerEpoch(form.command.arena_sampler_epoch),
+            turn_id: ArenaTurnId(form.command.turn_id),
+            action_token: ArenaActionToken(form.command.action_token),
+            handle,
+            active: form.active,
+        };
+        let outcome = apply_arena_command_blocking(state.clone(), command, "lock_thread").await?;
+        arena_command_response(state, outcome, accept_json).await
     }
-    let target =
-        state.set_external_subsource_lock_for_handle(&handle, form.active, &left, &right)?;
-    if headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("application/json"))
-    {
-        return Ok(no_store_response(
-            axum::Json(arena_target_payload(&state, &target)?).into_response(),
-        ));
-    }
-    Ok(Redirect::to(&target.href()).into_response())
+    .instrument(span)
+    .await
 }
 
 struct ArenaLookaheadMarkup {
     href: String,
-    local_anchor: String,
-    local_anchor_visual_key: String,
+    turn_id: String,
+    action_token: String,
+    revision: u64,
+    sampler_epoch: u64,
     visual_keys: Vec<String>,
     stage: Markup,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct ArenaNextQuery {
-    anchor: Option<String>,
     exclude_visual_keys: Option<String>,
+    known_turn_ids: Option<String>,
 }
 
 impl ArenaNextQuery {
     fn exclude_visual_keys(&self) -> Vec<String> {
         self.exclude_visual_keys
+            .as_deref()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter(|entry| !entry.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn known_turn_ids(&self) -> Vec<String> {
+        self.known_turn_ids
             .as_deref()
             .map(|value| {
                 value
@@ -400,118 +492,136 @@ fn accepts_json(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("application/json"))
 }
 
-fn arena_pair_local_anchor(pair: &crate::model::ArenaPair) -> Option<&AssetId> {
-    match (&pair.left, &pair.right) {
-        (ArenaCard::Local(card), ArenaCard::Remote(_))
-        | (ArenaCard::Remote(_), ArenaCard::Local(card)) => Some(&card.asset.id),
-        _ => None,
+async fn arena_command_response(
+    state: SharedAppState,
+    outcome: ArenaCommandOutcome,
+    accept_json: bool,
+) -> WebResult<Response> {
+    let mut payload = arena_optional_turn_payload_blocking(state, outcome.current).await?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "status".to_owned(),
+            serde_json::json!(match outcome.status {
+                ArenaCommandStatus::Applied => "applied",
+                ArenaCommandStatus::Replayed => "replayed",
+                ArenaCommandStatus::Stale => "stale",
+            }),
+        );
+        object.insert(
+            "stale".to_owned(),
+            serde_json::json!(matches!(outcome.status, ArenaCommandStatus::Stale)),
+        );
     }
+    if !accept_json {
+        let href = payload
+            .get("href")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("/arena");
+        return Ok(Redirect::to(href).into_response());
+    }
+    let mut response = no_store_response(axum::Json(payload).into_response());
+    if matches!(outcome.status, ArenaCommandStatus::Stale) {
+        *response.status_mut() = StatusCode::CONFLICT;
+    }
+    Ok(response)
 }
 
-fn arena_target_payload(
-    state: &SharedAppState,
-    target: &RedirectTarget,
+async fn arena_optional_turn_payload_blocking(
+    state: SharedAppState,
+    turn: Option<ArenaTurn>,
 ) -> anyhow::Result<serde_json::Value> {
-    let RedirectTarget::ArenaPair { left, right } = target else {
+    tokio::task::spawn_blocking(move || arena_optional_turn_payload(&state, turn.as_ref()))
+        .await
+        .map_err(|error| anyhow::anyhow!("joining arena payload task: {error:#}"))?
+}
+
+fn arena_optional_turn_payload(
+    state: &SharedAppState,
+    turn: Option<&ArenaTurn>,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(turn) = turn else {
         return Ok(serde_json::json!({
             "ok": true,
             "empty": true,
-            "href": target.href(),
+            "href": "/arena",
         }));
     };
-    let Some(view) = state.arena_pair(left, right)? else {
+    arena_turn_payload(state, turn)
+}
+
+fn arena_turn_payload(
+    state: &SharedAppState,
+    turn: &ArenaTurn,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(view) = state.arena_turn_view(turn)? else {
         return Ok(serde_json::json!({
             "ok": true,
             "empty": true,
-            "href": target.href(),
+            "href": turn.href(),
         }));
     };
     let Some(pair) = view.pair else {
         return Ok(serde_json::json!({
             "ok": true,
             "empty": true,
-            "href": target.href(),
+            "href": turn.href(),
         }));
     };
     Ok(serde_json::json!({
         "ok": true,
         "empty": false,
-        "href": target.href(),
-        "localAnchor": arena_pair_local_anchor(&pair).map(|asset_id| asset_id.0.clone()).unwrap_or_default(),
-        "localAnchorVisualKey": pair.local_anchor_visual_key().map(|visual_key| visual_key.0.clone()).unwrap_or_default(),
+        "href": turn.href(),
+        "turnId": turn.id().0.clone(),
+        "actionToken": turn.action_token().0.clone(),
+        "revision": turn.revision().0,
+        "samplerEpoch": turn.sampler_epoch().0,
         "visualKeys": pair.visual_keys().into_iter().map(|visual_key| visual_key.0).collect::<Vec<_>>(),
-        "html": arena_stage_markup(&pair, view.cluster.as_ref()).into_string(),
+        "html": arena_stage_markup(turn, &pair, view.cluster.as_ref()).into_string(),
     }))
 }
 
 fn arena_lookahead_markup(
     state: &SharedAppState,
-    local_anchor: Option<&AssetId>,
-    excluded_visual_keys: &HashSet<VisualKey>,
+    turn: &ArenaTurn,
 ) -> anyhow::Result<Option<ArenaLookaheadMarkup>> {
-    let target = match local_anchor {
-        Some(anchor) => state.arena_prefetch_target_preserving_local_anchor_excluding(
-            Some(anchor),
-            excluded_visual_keys,
-        )?,
-        None => state.arena_prefetch_target_excluding(excluded_visual_keys)?,
-    };
-    let RedirectTarget::ArenaPair {
-        ref left,
-        ref right,
-    } = target
-    else {
-        return Ok(None);
-    };
-    let Some(view) = state.arena_pair(left, right)? else {
+    let Some(view) = state.arena_turn_view(turn)? else {
         return Ok(None);
     };
     let Some(pair) = view.pair else {
         return Ok(None);
     };
     Ok(Some(ArenaLookaheadMarkup {
-        href: target.href(),
-        local_anchor: arena_pair_local_anchor(&pair)
-            .map(|asset_id| asset_id.0.clone())
-            .unwrap_or_default(),
-        local_anchor_visual_key: pair
-            .local_anchor_visual_key()
-            .map(|visual_key| visual_key.0.clone())
-            .unwrap_or_default(),
+        href: turn.href(),
+        turn_id: turn.id().0.clone(),
+        action_token: turn.action_token().0.clone(),
+        revision: turn.revision().0,
+        sampler_epoch: turn.sampler_epoch().0,
         visual_keys: pair
             .visual_keys()
             .into_iter()
             .map(|visual_key| visual_key.0)
             .collect(),
-        stage: arena_stage_markup(&pair, view.cluster.as_ref()),
+        stage: arena_stage_markup(turn, &pair, view.cluster.as_ref()),
     }))
 }
 
 fn arena_markup(
+    turn: Option<ArenaTurn>,
     view: ArenaView,
     lookahead: Option<ArenaLookaheadMarkup>,
-    preserved_lookahead: Option<ArenaLookaheadMarkup>,
     _external_status: ExternalArenaStatus,
 ) -> Markup {
     html! {
-        @if let Some(pair) = view.pair {
+        @if let (Some(turn), Some(pair)) = (turn, view.pair) {
             @let pair_href = arena_pair_href(&pair);
-            @let local_anchor = arena_pair_local_anchor(&pair).map_or("", |asset_id| asset_id.0.as_str());
             @let current_visual_keys = pair.visual_keys().into_iter().map(|visual_key| visual_key.0).collect::<Vec<_>>().join(",");
-            @let local_anchor_visual_key = pair.local_anchor_visual_key().map_or("", |visual_key| visual_key.0.as_str());
             @let lookahead_visual_keys = lookahead.as_ref().map(|next| next.visual_keys.join(",")).unwrap_or_default();
-            @let preserved_visual_keys = preserved_lookahead.as_ref().map(|next| next.visual_keys.join(",")).unwrap_or_default();
             div.arena-stage-shell {
-                div.arena-stage-layer.is-current data-href=(pair_href) data-local-anchor=(local_anchor) data-local-anchor-visual-key=(local_anchor_visual_key) data-visual-keys=(current_visual_keys) {
-                    (arena_stage_markup(&pair, view.cluster.as_ref()))
+                div.arena-stage-layer.is-current data-href=(pair_href) data-turn-id=(turn.id().0.as_str()) data-action-token=(turn.action_token().0.as_str()) data-arena-revision=(turn.revision().0) data-arena-sampler-epoch=(turn.sampler_epoch().0) data-visual-keys=(current_visual_keys) {
+                    (arena_stage_markup(&turn, &pair, view.cluster.as_ref()))
                 }
-                div.arena-stage-layer.is-lookahead.is-hidden data-href=(lookahead.as_ref().map_or("", |next| next.href.as_str())) data-local-anchor=(lookahead.as_ref().map_or("", |next| next.local_anchor.as_str())) data-local-anchor-visual-key=(lookahead.as_ref().map_or("", |next| next.local_anchor_visual_key.as_str())) data-visual-keys=(lookahead_visual_keys) aria-hidden="true" {
+                div.arena-stage-layer.is-lookahead.is-hidden data-href=(lookahead.as_ref().map_or("", |next| next.href.as_str())) data-turn-id=(lookahead.as_ref().map_or("", |next| next.turn_id.as_str())) data-action-token=(lookahead.as_ref().map_or("", |next| next.action_token.as_str())) data-arena-revision=(lookahead.as_ref().map_or(0, |next| next.revision)) data-arena-sampler-epoch=(lookahead.as_ref().map_or(0, |next| next.sampler_epoch)) data-visual-keys=(lookahead_visual_keys) aria-hidden="true" {
                     @if let Some(lookahead) = lookahead {
-                        (lookahead.stage)
-                    }
-                }
-                div.arena-stage-layer.is-preserved-lookahead.is-hidden data-href=(preserved_lookahead.as_ref().map_or("", |next| next.href.as_str())) data-local-anchor=(preserved_lookahead.as_ref().map_or("", |next| next.local_anchor.as_str())) data-local-anchor-visual-key=(preserved_lookahead.as_ref().map_or("", |next| next.local_anchor_visual_key.as_str())) data-visual-keys=(preserved_visual_keys) aria-hidden="true" {
-                    @if let Some(lookahead) = preserved_lookahead {
                         (lookahead.stage)
                     }
                 }
@@ -526,6 +636,7 @@ fn arena_markup(
 }
 
 fn arena_stage_markup(
+    turn: &ArenaTurn,
     pair: &crate::model::ArenaPair,
     cluster: Option<&DuplicateCluster>,
 ) -> Markup {
@@ -533,8 +644,8 @@ fn arena_stage_markup(
     let right = pair.right.handle();
     html! {
         section.arena-stage {
-            (arena_panel(&pair.left, &left, &right, None))
-            (arena_panel(&pair.right, &left, &right, cluster))
+            (arena_panel(turn, &pair.left, &left, &right, None))
+            (arena_panel(turn, &pair.right, &left, &right, cluster))
         }
     }
 }
@@ -546,6 +657,7 @@ fn arena_pair_href(pair: &crate::model::ArenaPair) -> String {
 }
 
 fn arena_panel(
+    turn: &ArenaTurn,
     card: &ArenaCard,
     pair_left: &ArenaHandle,
     pair_right: &ArenaHandle,
@@ -566,6 +678,7 @@ fn arena_panel(
     html! {
         article class=(frame_class) {
             form.vote-form data-arena-advance="buffered" action=(format!("{pair_href}/vote")) method="post" {
+                (arena_command_inputs(turn))
                 input type="hidden" name="left_id" value=(pair_left.slug());
                 input type="hidden" name="right_id" value=(pair_right.slug());
                 input type="hidden" name="winner_id" value=(handle.slug());
@@ -589,6 +702,7 @@ fn arena_panel(
                 div.remote-thread-banner-rail title=(thread_title) {
                     @if matches!(card, ArenaCard::Remote(_)) {
                         form.remote-thread-lock-box.arena-lock-thread-form data-arena-advance="refresh-current" action=(format!("{pair_href}/lock-thread")) method="post" {
+                            (arena_command_inputs(turn))
                             input type="hidden" name="asset_id" value=(handle.slug());
                             input type="hidden" name="active" value=(if stream_locked { "false" } else { "true" });
                             (tool_button(ImageToolKind::LockThread, true, stream_locked))
@@ -643,11 +757,8 @@ fn arena_panel(
                     input type="hidden" name="active" value="true";
                     (tool_button(ImageToolKind::Heart, false, hearted))
                 }
-                @let hide_advance = match card {
-                    ArenaCard::Remote(_) => "buffered-preserve",
-                    ArenaCard::Local(_) => "authoritative",
-                };
-                form.arena-hide-form data-arena-advance=(hide_advance) action=(format!("{pair_href}/hide")) method="post" {
+                form.arena-hide-form data-arena-advance="authoritative" action=(format!("{pair_href}/hide")) method="post" {
+                    (arena_command_inputs(turn))
                     input type="hidden" name="asset_id" value=(handle.slug());
                     input type="hidden" name="hide" value=(if arena_card_hidden(card) { "false" } else { "true" });
                     @if let Some(cluster) = cluster {
@@ -666,18 +777,24 @@ fn arena_panel(
                     (asset_domain_controls(&card.asset.id, card.domain, false, false))
                 }
                 @if matches!(card, ArenaCard::Remote(_)) {
-                    @let veto_advance = match card {
-                        ArenaCard::Remote(card) if card.stream_locked => "authoritative",
-                        ArenaCard::Remote(_) => "buffered-preserve",
-                        ArenaCard::Local(_) => "authoritative",
-                    };
-                    form.arena-veto-thread-form data-arena-advance=(veto_advance) action=(format!("{pair_href}/veto-thread")) method="post" {
+                    form.arena-veto-thread-form data-arena-advance="authoritative" action=(format!("{pair_href}/veto-thread")) method="post" {
+                        (arena_command_inputs(turn))
                         input type="hidden" name="asset_id" value=(handle.slug());
                         (tool_button(ImageToolKind::VetoThread, false, false))
                     }
                 }
             }
         }
+    }
+}
+
+fn arena_command_inputs(turn: &ArenaTurn) -> Markup {
+    html! {
+        input type="hidden" name="command_id" value=(ArenaCommandId::forge().0);
+        input type="hidden" name="turn_id" value=(turn.id().0.as_str());
+        input type="hidden" name="action_token" value=(turn.action_token().0.as_str());
+        input type="hidden" name="arena_revision" value=(turn.revision().0);
+        input type="hidden" name="arena_sampler_epoch" value=(turn.sampler_epoch().0);
     }
 }
 

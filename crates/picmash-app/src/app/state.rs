@@ -265,8 +265,8 @@ impl SessionField {
     }
 
     pub(super) fn quality_posterior(&self, asset: &AssetRecord) -> PosteriorSummary {
-        self.quality_summary(asset).map_or(
-            PosteriorSummary {
+        self.quality_summary(asset).map_or_else(
+            || PosteriorSummary {
                 mean: self.utility(asset),
                 sigma: crate::quality::legacy_cache_variance(asset.compare_count).sqrt(),
             },

@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
                 let state = Arc::new(state);
                 spawn_config_reload_loop(state.clone());
                 spawn_external_source_loop(state.clone());
+                spawn_cache_prune_loop(state.clone());
                 match state.startup_summary().context("summarizing startup state") {
                     Ok(StartupSummary {
                         corpus_id,
@@ -143,6 +144,29 @@ fn spawn_background_maintenance_loop(state: Arc<AppState>) {
                 _ = state.wait_for_maintenance_signal() => {}
                 _ = tokio::time::sleep(StdDuration::from_secs(poll)) => {}
             }
+        }
+    });
+}
+
+fn spawn_cache_prune_loop(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let worker = state.clone();
+            match tokio::task::spawn_blocking(move || worker.prune_disk_caches())
+                .instrument(debug_span!("cache.prune.loop.tick"))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!(error = %format!("{error:#}"), "cache prune loop failed");
+                }
+                Err(error) => {
+                    error!(error = %format!("{error:#}"), "cache prune task crashed");
+                }
+            }
+            let interval =
+                u64::try_from(state.cache_prune_interval().whole_seconds().max(10)).unwrap_or(300);
+            tokio::time::sleep(StdDuration::from_secs(interval)).await;
         }
     });
 }

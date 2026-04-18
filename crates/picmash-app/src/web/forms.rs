@@ -1,7 +1,26 @@
-use super::*;
+use std::str::FromStr;
+
+use anyhow::bail;
+use serde::Deserialize;
+
+use crate::{
+    asset_domain::AssetDomainLabel,
+    model::{AssetId, ExploreMapMode},
+};
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ArenaCommandFields {
+    pub(super) command_id: String,
+    pub(super) turn_id: String,
+    pub(super) action_token: String,
+    pub(super) arena_revision: u64,
+    pub(super) arena_sampler_epoch: u64,
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct VoteForm {
+    #[serde(flatten)]
+    pub(super) command: ArenaCommandFields,
     pub(super) left_id: String,
     pub(super) right_id: String,
     pub(super) winner_id: String,
@@ -12,7 +31,7 @@ pub(super) struct RotateForm {
     pub(super) asset_id: String,
     pub(super) direction: i32,
     #[serde(rename = "next_rotation")]
-    pub(super) _next_rotation: Option<i32>,
+    pub(super) next_rotation: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +91,8 @@ pub(super) struct IdentitiesQuery {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct HideForm {
+    #[serde(flatten)]
+    pub(super) command: ArenaCommandFields,
     pub(super) asset_id: String,
     pub(super) hide: bool,
     #[serde(default, deserialize_with = "deserialize_comma_ids")]
@@ -93,11 +114,15 @@ where
 
 #[derive(Debug, Deserialize)]
 pub(super) struct HandleForm {
+    #[serde(flatten)]
+    pub(super) command: ArenaCommandFields,
     pub(super) asset_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ThreadLockForm {
+    #[serde(flatten)]
+    pub(super) command: ArenaCommandFields,
     pub(super) asset_id: String,
     pub(super) active: bool,
 }

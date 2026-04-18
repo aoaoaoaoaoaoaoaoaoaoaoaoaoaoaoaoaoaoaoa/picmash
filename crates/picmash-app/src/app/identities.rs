@@ -353,15 +353,14 @@ impl AppState {
                 })
         });
 
-        let mut focus_name = None;
-        if focus_slug.is_some() || focus_anchor_handle.is_some() {
-            focus_name = rows
-                .first()
+        let focus_name = if focus_slug.is_some() || focus_anchor_handle.is_some() {
+            rows.first()
                 .and_then(|row| row.anchor_name.clone())
-                .or_else(|| rows.first().map(|_| "unnamed subject".to_owned()));
+                .or_else(|| rows.first().map(|_| "unnamed subject".to_owned()))
         } else {
             rows.truncate(IDENTITY_REVIEW_MAX_ROWS);
-        }
+            None
+        };
 
         Ok(IdentityReviewView {
             status: IdentityReviewStatus {
@@ -517,7 +516,7 @@ impl AppState {
     }
 
     fn mint_identity_handle(&self, tag: u8, values: &[i64]) -> String {
-        let mut payload = Vec::with_capacity(1 + (values.len() * std::mem::size_of::<i64>()));
+        let mut payload = Vec::with_capacity(1 + std::mem::size_of_val(values));
         payload.push(tag);
         for value in values {
             payload.extend_from_slice(&value.to_le_bytes());
@@ -613,7 +612,7 @@ fn hex_decode(raw: &str) -> Option<Vec<u8>> {
     }
 
     let raw = raw.as_bytes();
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(raw.len() / 2);

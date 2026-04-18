@@ -162,14 +162,12 @@ impl AppState {
         }
         match result {
             Ok(()) => {
-                let job = job.clone();
                 self.with_write_store("complete_maintenance_job", move |store| {
                     store.complete_maintenance_job(&job)
                 })?;
             }
             Err(error) => {
                 let retry_at = maintenance_now_ts() + maintenance_retry_seconds(job.kind);
-                let job = job.clone();
                 let job_for_write = job.clone();
                 let error_message = format!("{error:#}");
                 span.record("retry_at", field::display(retry_at));

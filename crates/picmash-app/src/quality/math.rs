@@ -57,8 +57,9 @@ pub fn posterior_accept_probability(
     frontier_variance: f32,
     beta: f32,
 ) -> f32 {
-    let performance_variance =
-        (utility_variance + frontier_variance + beta * beta).max(HIERARCHICAL_MIN_VARIANCE);
+    let performance_variance = beta
+        .mul_add(beta, utility_variance + frontier_variance)
+        .max(HIERARCHICAL_MIN_VARIANCE);
     standard_normal_cdf((utility_mean - frontier_mean) / performance_variance.sqrt())
 }
 

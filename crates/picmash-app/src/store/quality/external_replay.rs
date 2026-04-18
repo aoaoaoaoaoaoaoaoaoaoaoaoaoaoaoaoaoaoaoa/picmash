@@ -1149,12 +1149,12 @@ pub(super) fn sync_hierarchical_asset_record(asset: &mut HierarchicalReplayAsset
 }
 
 pub(super) fn ensure_projection_dim(state: &mut LegacyReplayState, dim: Option<usize>) {
-    if state.projection.is_none() {
-        if let Some(dim) = dim {
-            state.projection = Some(ProjectionModel::zero(
-                state.projection_model_name.clone(),
-                dim,
-            ));
-        }
+    if state.projection.is_none()
+        && let Some(dim) = dim
+    {
+        state.projection = Some(ProjectionModel::zero(
+            state.projection_model_name.clone(),
+            dim,
+        ));
     }
 }

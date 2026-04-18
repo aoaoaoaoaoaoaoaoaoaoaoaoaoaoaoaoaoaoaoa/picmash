@@ -166,6 +166,7 @@ impl AppState {
             },
             root_path,
             cache_root: paths.cache_root,
+            source_cache_root: paths.source_cache_root,
             session_field_cache: RwLock::new(None),
             explore_layouts: RwLock::new(HashMap::new()),
             explore_vectors: RwLock::new(None),
@@ -173,6 +174,7 @@ impl AppState {
             duplicate_frontier: RwLock::new(None),
             face_oracle: RwLock::new(None),
             maintenance_notify: Notify::new(),
+            arena_session: Mutex::new(ArenaSessionRuntime::default()),
             recent_facemash_pairs: Mutex::new(VecDeque::with_capacity(
                 FACEMASH_RECENT_PAIR_EXCLUDE,
             )),
@@ -213,7 +215,7 @@ impl AppState {
         if progress.processed > 0 {
             self.invalidate_session_field_cache();
             if phase == crate::store::BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS
-                && progress.requeue_phase.as_deref() != Some(phase)
+                && progress.requeue_phase != Some(phase)
             {
                 let store = self.read_store()?;
                 self.retrain_face_oracle(&store)?;
@@ -599,6 +601,17 @@ mod tests {
         image.save(path).expect("write test png");
     }
 
+    fn app_config_with_source_mix(external_probability: f32) -> AppConfig {
+        AppConfig {
+            arena: ArenaConfig {
+                external_probability,
+                explore: 0.0,
+                dedup_radius: 0.0,
+            },
+            ..AppConfig::default()
+        }
+    }
+
     fn drain_maintenance(state: &AppState) {
         while state
             .devour_one_maintenance_job()
@@ -690,12 +703,7 @@ mod tests {
 
         solid_png(&corpus_root.join("seed.png"), [32, 48, 64]);
 
-        let mut config = AppConfig::default();
-        config.arena = ArenaConfig {
-            external_probability: 1.0,
-            explore: 0.0,
-            dedup_radius: 0.0,
-        };
+        let mut config = app_config_with_source_mix(1.0);
         let source = SourceConfig {
             weight: 1.0,
             import_policy: ImportPolicy::NotX,
@@ -815,7 +823,7 @@ mod tests {
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 0,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: source_root.clone(),
+                root: source_root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 0,
@@ -893,7 +901,7 @@ mod tests {
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 0,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: source_root.clone(),
+                root: source_root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 0,
@@ -953,7 +961,7 @@ mod tests {
         );
         assert!(
             state
-                .arena_pair(&ArenaHandle::Local(local_asset.id.clone()), &remote_handle)
+                .arena_pair(&ArenaHandle::Local(local_asset.id), &remote_handle)
                 .expect("load arena pair with stale imported remote")
                 .is_none(),
             "arena should refuse to render imported remote handles"
@@ -984,7 +992,7 @@ mod tests {
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 0,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: source_root.clone(),
+                root: source_root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 0,
@@ -1024,7 +1032,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("remote item present");
-        let local_handle = ArenaHandle::Local(local_asset.id.clone());
+        let local_handle = ArenaHandle::Local(local_asset.id);
         let remote_handle = ArenaHandle::Remote(remote_item);
 
         state
@@ -1117,18 +1125,13 @@ mod tests {
         solid_png(&source_root.join("a").join("remote-a.png"), [180, 40, 60]);
         solid_png(&source_root.join("b").join("remote-b.png"), [40, 160, 90]);
 
-        let mut config = AppConfig::default();
-        config.arena = ArenaConfig {
-            external_probability: 0.0,
-            explore: 0.0,
-            dedup_radius: 0.0,
-        };
+        let mut config = app_config_with_source_mix(0.0);
         let source = SourceConfig {
             weight: 1.0,
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 0,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: source_root.clone(),
+                root: source_root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 0,
@@ -1249,18 +1252,13 @@ mod tests {
         solid_png(&corpus_root.join("seed-b.png"), [64, 48, 32]);
         solid_png(&source_root.join("a").join("remote-a.png"), [180, 40, 60]);
 
-        let mut config = AppConfig::default();
-        config.arena = ArenaConfig {
-            external_probability: 1.0,
-            explore: 0.0,
-            dedup_radius: 0.0,
-        };
+        let mut config = app_config_with_source_mix(1.0);
         let source = SourceConfig {
             weight: 1.0,
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 0,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: source_root.clone(),
+                root: source_root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 0,
@@ -1345,12 +1343,7 @@ mod tests {
         solid_png(&corpus_root.join("seed-b.png"), [64, 48, 32]);
         solid_png(&corpus_root.join("seed-c.png"), [180, 40, 60]);
 
-        let mut config = AppConfig::default();
-        config.arena = ArenaConfig {
-            external_probability: 0.0,
-            explore: 0.0,
-            dedup_radius: 0.0,
-        };
+        let config = app_config_with_source_mix(0.0);
         let config_path = config_root.join("config.toml");
         let config_digest = config.write(&config_path).expect("write config");
         let app_paths = AppBootPaths {
@@ -1418,12 +1411,7 @@ mod tests {
             solid_png(&corpus_root.join(name), rgb);
         }
 
-        let mut config = AppConfig::default();
-        config.arena = ArenaConfig {
-            external_probability: 0.0,
-            explore: 0.0,
-            dedup_radius: 0.0,
-        };
+        let config = app_config_with_source_mix(0.0);
         let config_path = config_root.join("config.toml");
         let config_digest = config.write(&config_path).expect("write config");
         let app_paths = AppBootPaths {
@@ -1484,6 +1472,146 @@ mod tests {
     }
 
     #[test]
+    fn arena_command_promotes_issued_lookahead_once() {
+        let _guard = test_guard();
+        let root = test_root("arena-command-promotes-lookahead");
+        let corpus_root = root.join("corpus");
+        let config_root = root.join("config");
+        let app_data_root = root.join("xdg-data");
+        let app_cache_root = root.join("xdg-cache");
+        std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&app_data_root).expect("create data root");
+        std::fs::create_dir_all(&app_cache_root).expect("create cache root");
+
+        for (name, rgb) in [
+            ("seed-a.png", [32, 48, 64]),
+            ("seed-b.png", [64, 48, 32]),
+            ("seed-c.png", [180, 40, 60]),
+            ("seed-d.png", [20, 160, 120]),
+        ] {
+            solid_png(&corpus_root.join(name), rgb);
+        }
+
+        let config = app_config_with_source_mix(0.0);
+        let config_path = config_root.join("config.toml");
+        let config_digest = config.write(&config_path).expect("write config");
+        let app_paths = AppBootPaths {
+            db_path: app_data_root.join("picmash.sqlite3"),
+            model_cache_root: app_cache_root.clone(),
+            cache_root: app_cache_root.join("renditions"),
+            source_cache_root: app_cache_root.join("sources"),
+        };
+        let state =
+            AppState::boot_with_paths(&corpus_root, config, config_path, config_digest, app_paths)
+                .expect("boot app state");
+        state.schedule_corpus_ingest();
+        drain_maintenance(&state);
+
+        let page = state.arena_page_state(None).expect("arena page state");
+        let current = page.current.expect("current turn");
+        let lookahead = page.lookahead.expect("lookahead turn");
+        let winner = current.pair().left.clone();
+        let command = ArenaCommand::Vote {
+            command_id: ArenaCommandId::forge(),
+            expected_revision: current.revision(),
+            expected_sampler_epoch: current.sampler_epoch(),
+            turn_id: current.id().clone(),
+            action_token: current.action_token().clone(),
+            winner,
+        };
+
+        let applied = state
+            .apply_arena_command(command.clone())
+            .expect("apply arena command");
+        assert_eq!(applied.status, ArenaCommandStatus::Applied);
+        let promoted = applied.current.expect("promoted current turn");
+        assert_eq!(
+            promoted.id(),
+            lookahead.id(),
+            "a hot vote should promote the server-issued lookahead"
+        );
+        assert_eq!(
+            promoted.revision().0,
+            current.revision().0 + 1,
+            "the promoted turn should be activated at the next revision"
+        );
+
+        let comparisons_after_apply = state
+            .read_store()
+            .expect("open store after apply")
+            .session(state.active.session_id)
+            .expect("load session after apply")
+            .comparisons;
+        assert_eq!(comparisons_after_apply, 1);
+
+        let replayed = state
+            .apply_arena_command(command)
+            .expect("replay arena command");
+        assert_eq!(replayed.status, ArenaCommandStatus::Replayed);
+        let comparisons_after_replay = state
+            .read_store()
+            .expect("open store after replay")
+            .session(state.active.session_id)
+            .expect("load session after replay")
+            .comparisons;
+        assert_eq!(
+            comparisons_after_replay, comparisons_after_apply,
+            "command id replay must not duplicate the vote"
+        );
+
+        let stale_outcome = state
+            .apply_arena_command(ArenaCommand::Vote {
+                command_id: ArenaCommandId::forge(),
+                expected_revision: current.revision(),
+                expected_sampler_epoch: current.sampler_epoch(),
+                turn_id: current.id().clone(),
+                action_token: current.action_token().clone(),
+                winner: current.pair().left.clone(),
+            })
+            .expect("reject stale arena command");
+        assert_eq!(stale_outcome.status, ArenaCommandStatus::Stale);
+
+        let promoted_epoch = promoted.sampler_epoch();
+        state.apply_arena_sampler_invalidation(SamplerInvalidation::Immediate);
+        let old_epoch_outcome = state
+            .apply_arena_command(ArenaCommand::Vote {
+                command_id: ArenaCommandId::forge(),
+                expected_revision: promoted.revision(),
+                expected_sampler_epoch: promoted_epoch,
+                turn_id: promoted.id().clone(),
+                action_token: promoted.action_token().clone(),
+                winner: promoted.pair().left.clone(),
+            })
+            .expect("reject command from invalidated sampler epoch");
+        assert_eq!(old_epoch_outcome.status, ArenaCommandStatus::Stale);
+
+        let refreshed = state
+            .arena_page_state(None)
+            .expect("refresh arena after sampler invalidation")
+            .current
+            .expect("current turn after sampler invalidation");
+        assert_eq!(
+            refreshed.sampler_epoch().0,
+            promoted_epoch.0 + 1,
+            "immediate sampler invalidation should hard-fence old issued turns"
+        );
+
+        state.apply_arena_sampler_invalidation(SamplerInvalidation::Eventual);
+        let preserved = state
+            .arena_page_state(None)
+            .expect("refresh arena after eventual sampler change")
+            .current
+            .expect("current turn after eventual sampler change");
+        assert_eq!(
+            preserved.id(),
+            refreshed.id(),
+            "eventual sampler changes should not discard issued turns"
+        );
+        assert_eq!(preserved.sampler_epoch(), refreshed.sampler_epoch());
+    }
+
+    #[test]
     fn vetoing_a_locked_thread_lifts_the_lock_before_rerolling() {
         let _guard = test_guard();
         let root = test_root("subsource-lock-veto-clears");
@@ -1504,18 +1632,13 @@ mod tests {
         solid_png(&source_root.join("a").join("remote-a.png"), [180, 40, 60]);
         solid_png(&source_root.join("b").join("remote-b.png"), [40, 160, 90]);
 
-        let mut config = AppConfig::default();
-        config.arena = ArenaConfig {
-            external_probability: 0.0,
-            explore: 0.0,
-            dedup_radius: 0.0,
-        };
+        let mut config = app_config_with_source_mix(0.0);
         let source = SourceConfig {
             weight: 1.0,
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 0,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: source_root.clone(),
+                root: source_root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 0,
@@ -1627,18 +1750,13 @@ mod tests {
         solid_png(&corpus_root.join("seed-b.png"), [64, 48, 32]);
         solid_png(&source_root.join("a").join("remote-a.png"), [180, 40, 60]);
 
-        let mut config = AppConfig::default();
-        config.arena = ArenaConfig {
-            external_probability: 0.0,
-            explore: 0.0,
-            dedup_radius: 0.0,
-        };
+        let mut config = app_config_with_source_mix(0.0);
         let source = SourceConfig {
             weight: 1.0,
             import_policy: ImportPolicy::NotX,
             scan_interval_seconds: 0,
             upstream: UpstreamSource::LocalDirectory(LocalDirectorySource {
-                root: source_root.clone(),
+                root: source_root,
                 recurse: true,
                 filters: RemoteImageFilterConfig {
                     min_shortest_edge: 0,

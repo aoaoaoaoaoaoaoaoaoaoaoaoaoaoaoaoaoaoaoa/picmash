@@ -24,11 +24,11 @@ use crate::{
     quality::{
         HIERARCHICAL_DUEL_BETA, HIERARCHICAL_TECH_WEIGHT, HierarchicalAssetPosterior,
         HierarchicalAssetQualityCacheV1, HierarchicalSessionPosterior,
-        HierarchicalSessionQualityCacheV1, LEGACY_EXACT_OFFSET_EPSILON, LEGACY_L2_FRONTIER,
-        LEGACY_L2_OFFSET, LEGACY_L2_SESSION_HEAD, LEGACY_LR_DUEL_ALPHA, LEGACY_LR_DUEL_COORD,
-        LEGACY_LR_DUEL_HEAD, LEGACY_LR_DUEL_MOOD, LEGACY_LR_PROJECTION,
-        LEGACY_PROJECTION_WEIGHT_DECAY, LegacyUnaryFeedback, PerturbativeAssetPosterior,
-        PerturbativeSessionPosterior, QualityFormalVersion, QualityModelRecord,
+        HierarchicalSessionQualityCacheV1, LEGACY_L2_FRONTIER, LEGACY_L2_OFFSET,
+        LEGACY_L2_SESSION_HEAD, LEGACY_LR_DUEL_ALPHA, LEGACY_LR_DUEL_COORD, LEGACY_LR_DUEL_HEAD,
+        LEGACY_LR_DUEL_MOOD, LEGACY_LR_PROJECTION, LEGACY_PROJECTION_WEIGHT_DECAY,
+        LegacyUnaryFeedback, PerturbativeAssetPosterior, PerturbativeSessionPosterior,
+        QualityFormalVersion, QualityModelRecord, QualityPriorFamily, QualityPriorRevision,
         diagonal_adf_update, gaussian_duel_moment_match, legacy_batter_asset, legacy_heart_bias,
         legacy_projection_prior, legacy_shove_mood,
     },
@@ -260,8 +260,8 @@ fn legacy_quality_replay_rebuilds_derived_state_from_event_truth() {
     store
         .set_active_quality_model(&QualityModelRecord {
             formal_version: QualityFormalVersion::LegacyIndependentV1,
-            prior_family: Default::default(),
-            prior_revision: Default::default(),
+            prior_family: QualityPriorFamily::default(),
+            prior_revision: QualityPriorRevision::default(),
             updated_at: OffsetDateTime::now_utc(),
         })
         .expect("pin legacy quality model");
@@ -307,7 +307,6 @@ fn legacy_quality_replay_rebuilds_derived_state_from_event_truth() {
         .expect("save right embedding");
 
     let mut session = store.create_session(corpus_id).expect("create session");
-    let mut exact_offsets = HashMap::<AssetId, f32>::new();
     let mut hearted = HashSet::<AssetId>::new();
     let mut embedding_head: Option<SessionEmbeddingHead>;
     let mut projection: Option<ProjectionModel>;
@@ -436,9 +435,6 @@ fn legacy_quality_replay_rebuilds_derived_state_from_event_truth() {
         );
     }
     session.nudges += 1;
-    if next_offset.abs() >= LEGACY_EXACT_OFFSET_EPSILON {
-        exact_offsets.insert(right.id.clone(), next_offset);
-    }
     store
         .persist_nudge_step(
             &session,
@@ -1070,9 +1066,9 @@ fn hierarchical_quality_replay_rebuilds_derived_state_from_event_truth() {
     assert_eq!(restored_session.hearts, expected_session.hearts);
     assert_eq!(
         restored_offsets,
-        HashMap::from([(expected_left.id.clone(), expected_offset)])
+        HashMap::from([(expected_left.id, expected_offset)])
     );
-    assert_eq!(restored_hearts, HashSet::from([expected_right.id.clone()]));
+    assert_eq!(restored_hearts, HashSet::from([expected_right.id]));
     assert_slice_close(&restored_head.weights, &expected_head.weights);
 
     assert_close(
@@ -1318,7 +1314,7 @@ fn recent_arena_asset_ids_merge_local_duels_with_remote_selections() {
                 .visual_key
                 .clone()
                 .expect("seed asset c visual key"),
-            remote_identity.visual_key.clone(),
+            remote_identity.visual_key,
             assets[0]
                 .visual_key
                 .clone()
@@ -1458,8 +1454,8 @@ fn hierarchical_quality_replay_wakes_semantic_branch_from_embedding_prior() {
     store
         .set_active_quality_model(&QualityModelRecord {
             formal_version: QualityFormalVersion::HierarchicalGaussianV1,
-            prior_family: Default::default(),
-            prior_revision: Default::default(),
+            prior_family: QualityPriorFamily::default(),
+            prior_revision: QualityPriorRevision::default(),
             updated_at: OffsetDateTime::now_utc(),
         })
         .expect("pin hierarchical quality model");
@@ -2154,7 +2150,7 @@ fn store_open_waits_for_busy_writer_instead_of_immediate_lock_failure() {
     )
     .expect("acquire write lock");
 
-    let db_path_thread = db_path.clone();
+    let db_path_thread = db_path;
     let worker = std::thread::spawn(move || -> anyhow::Result<()> {
         let store = Store::open(&db_path_thread)?;
         store.create_session(corpus_id)?;

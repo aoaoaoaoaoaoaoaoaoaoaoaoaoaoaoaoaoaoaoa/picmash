@@ -2,7 +2,7 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ExternalItemWarmState {
+pub struct ExternalItemWarmState {
     pub(crate) needs_materialization: bool,
     pub(crate) needs_identity: bool,
     pub(crate) needs_quality_features: bool,
@@ -1227,7 +1227,7 @@ impl Store {
                 resolved_asset_id
                     .as_ref()
                     .map(|asset_id| asset_id.0.as_str()),
-                if tombstoned { 1_i64 } else { 0_i64 },
+                i64::from(tombstoned),
                 now_ts(),
             ],
         )?;
@@ -1438,24 +1438,27 @@ impl Store {
             .query_row(
                 r"
                 SELECT
-                    id,
-                    source_key,
-                    stream_id,
-                    stream_title,
-                    thread_no,
-                    post_no,
-                    title,
-                    cached_path,
-                    image_url,
-                    thumb_url,
-                    visual_key,
-                    rotation_quarters
-                FROM external_items
-                WHERE id = ?1
-                  AND hidden = 0
-                  AND import_pending = 0
-                  AND resolved_asset_id IS NULL
-                  AND imported_asset_id IS NULL
+                    i.id,
+                    i.source_key,
+                    i.stream_id,
+                    i.stream_title,
+                    i.thread_no,
+                    i.post_no,
+                    i.title,
+                    i.cached_path,
+                    i.image_url,
+                    i.thumb_url,
+                    i.visual_key,
+                    i.rotation_quarters
+                FROM external_items i
+                JOIN external_streams s ON s.id = i.stream_id
+                WHERE i.id = ?1
+                  AND i.hidden = 0
+                  AND i.import_pending = 0
+                  AND i.resolved_asset_id IS NULL
+                  AND i.imported_asset_id IS NULL
+                  AND s.active = 1
+                  AND s.blocked = 0
                 ",
                 params![item_id.0],
                 |row| {

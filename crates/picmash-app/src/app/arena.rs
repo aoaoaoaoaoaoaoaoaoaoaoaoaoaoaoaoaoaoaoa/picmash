@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 impl AppState {
     pub fn arena_target(&self) -> anyhow::Result<RedirectTarget> {
-        self.redirect_target_for_next_pair(&HashSet::new())
+        self.arena_current_target()
     }
 
     pub fn arena_prefetch_target(&self) -> anyhow::Result<RedirectTarget> {
@@ -109,6 +109,14 @@ impl AppState {
     }
 
     pub fn hide_asset(&self, asset_id: &AssetId, hidden: bool) -> anyhow::Result<RedirectTarget> {
+        let present = self.apply_hide_asset_effect(asset_id, hidden)?;
+        if !present {
+            return redirect_target_for_pair(None);
+        }
+        self.redirect_target_for_next_pair(&HashSet::new())
+    }
+
+    fn apply_hide_asset_effect(&self, asset_id: &AssetId, hidden: bool) -> anyhow::Result<bool> {
         let asset_id = asset_id.clone();
         let corpus_id = self.active.corpus_id;
         let session_id = self.active.session_id;
@@ -121,13 +129,12 @@ impl AppState {
             store.touch_session(session_id)?;
             Ok(true)
         })?;
-        if !present {
-            return redirect_target_for_pair(None);
+        if present {
+            self.purge_explore_vectors();
+            self.purge_all_explore_layouts();
+            self.invalidate_session_field_cache();
         }
-        self.purge_explore_vectors();
-        self.purge_all_explore_layouts();
-        self.invalidate_session_field_cache();
-        self.redirect_target_for_next_pair(&HashSet::new())
+        Ok(present)
     }
 
     pub fn hide_arena_handle(
@@ -138,13 +145,34 @@ impl AppState {
         pair_left: &ArenaHandle,
         pair_right: &ArenaHandle,
     ) -> anyhow::Result<RedirectTarget> {
+        self.apply_hide_arena_handle_effect(handle, hidden, cluster_ids, pair_left, pair_right)?;
+        let local_anchor = surviving_local_anchor(handle, pair_left, pair_right).cloned();
         match handle {
-            ArenaHandle::Local(asset_id) => self.hide_asset(asset_id, hidden),
+            ArenaHandle::Local(_) => self.redirect_target_for_next_pair(&HashSet::new()),
+            ArenaHandle::Remote(_) => {
+                self.redirect_target_preserving_local_anchor(local_anchor.as_ref())
+            }
+        }
+    }
+
+    pub(super) fn apply_hide_arena_handle_effect(
+        &self,
+        handle: &ArenaHandle,
+        hidden: bool,
+        cluster_ids: &[RemoteItemId],
+        pair_left: &ArenaHandle,
+        pair_right: &ArenaHandle,
+    ) -> anyhow::Result<()> {
+        match handle {
+            ArenaHandle::Local(asset_id) => {
+                self.apply_hide_asset_effect(asset_id, hidden)?;
+                Ok(())
+            }
             ArenaHandle::Remote(_item_id) => {
                 let local_anchor = surviving_local_anchor(handle, pair_left, pair_right).cloned();
                 let lock_handle = handle.clone();
                 let cluster_ids = cluster_ids.to_vec();
-                let anchor_for_write = local_anchor.clone();
+                let anchor_for_write = local_anchor;
                 let session_id = self.active.session_id;
                 let corpus_id = self.active.corpus_id;
                 self.with_write_store("hide_remote_handle", move |store| {
@@ -176,7 +204,7 @@ impl AppState {
                     self.purge_duplicate_frontier();
                 }
                 self.invalidate_session_field_cache();
-                self.redirect_target_preserving_local_anchor(local_anchor.as_ref())
+                Ok(())
             }
         }
     }
@@ -187,8 +215,22 @@ impl AppState {
         pair_left: &ArenaHandle,
         pair_right: &ArenaHandle,
     ) -> anyhow::Result<RedirectTarget> {
-        let ArenaHandle::Remote(item_id) = handle else {
+        if !matches!(handle, ArenaHandle::Remote(_)) {
             return self.arena_target();
+        }
+        let (local_anchor, _) =
+            self.apply_veto_external_thread_effect(handle, pair_left, pair_right)?;
+        self.redirect_target_preserving_local_anchor(local_anchor.as_ref())
+    }
+
+    pub(super) fn apply_veto_external_thread_effect(
+        &self,
+        handle: &ArenaHandle,
+        pair_left: &ArenaHandle,
+        pair_right: &ArenaHandle,
+    ) -> anyhow::Result<(Option<AssetId>, PipelineDisposition)> {
+        let ArenaHandle::Remote(item_id) = handle else {
+            return Ok((None, PipelineDisposition::Preserve));
         };
         let item = {
             let store = Store::open_hot(&self.db_path)?;
@@ -201,24 +243,19 @@ impl AppState {
         let anchor_for_write = local_anchor.clone();
         let session_id = self.active.session_id;
         let corpus_id = self.active.corpus_id;
-        let locked_source_key = item.source_key.clone();
-        let locked_source_key_for_check = locked_source_key.clone();
-        let locked_stream_id = item.stream_id;
-        let cleared_lock = self.with_write_store("veto_external_thread", move |store| {
-            let cleared_lock = store
-                .session_subsource_lock(session_id)?
-                .is_some_and(|lock| {
-                    lock.source_key == locked_source_key_for_check
-                        && lock.stream_id == locked_stream_id
-                });
+        let vetoed_source_key = item.source_key.clone();
+        let vetoed_stream_id = item.stream_id;
+        let transition = self.with_write_store("veto_external_thread", move |store| {
+            let transition = ArenaScope::from(store.session_subsource_lock(session_id)?)
+                .reduce(ArenaScopeAction::Veto(ThreadKey::from(&item)));
             store.block_external_stream(
                 session_id,
                 corpus_id,
                 item_id,
                 anchor_for_write.as_ref(),
             )?;
-            if cleared_lock {
-                store.clear_session_subsource_lock(session_id)?;
+            transition.apply(store, session_id)?;
+            if transition.clears_lock() {
                 info!(
                     source = %item.source_key,
                     stream_id = item.stream_id,
@@ -232,18 +269,18 @@ impl AppState {
                 "blocked external stream"
             );
             store.touch_session(session_id)?;
-            Ok(cleared_lock)
+            Ok(transition)
         })?;
         self.purge_duplicate_frontier();
         self.invalidate_session_field_cache();
-        if cleared_lock {
+        if transition.clears_lock() {
             info!(
-                source = %locked_source_key,
-                stream_id = locked_stream_id,
+                source = %vetoed_source_key,
+                stream_id = vetoed_stream_id,
                 "veto lifted the active subsource lock"
             );
         }
-        self.redirect_target_preserving_local_anchor(local_anchor.as_ref())
+        Ok((local_anchor, transition.pipeline()))
     }
 
     pub fn set_external_subsource_lock_for_handle(
@@ -255,7 +292,7 @@ impl AppState {
     ) -> anyhow::Result<RedirectTarget> {
         match handle {
             ArenaHandle::Remote(item_id) => {
-                self.set_external_subsource_lock(*item_id, active)?;
+                let _ = self.set_external_subsource_lock(*item_id, active)?;
                 Ok(RedirectTarget::ArenaPair {
                     left: pair_left.clone(),
                     right: pair_right.clone(),
@@ -612,6 +649,17 @@ impl AppState {
         right: &ArenaHandle,
         winner: &ArenaHandle,
     ) -> anyhow::Result<RedirectTarget> {
+        self.apply_arena_vote_effect(left, right, winner)?;
+        self.shatter_arena_session();
+        self.redirect_target_for_next_pair(&HashSet::new())
+    }
+
+    pub(super) fn apply_arena_vote_effect(
+        &self,
+        left: &ArenaHandle,
+        right: &ArenaHandle,
+        winner: &ArenaHandle,
+    ) -> anyhow::Result<()> {
         match (left, right) {
             (ArenaHandle::Local(left_id), ArenaHandle::Local(right_id)) => {
                 if let ArenaHandle::Local(winner_id) = winner {
@@ -634,26 +682,36 @@ impl AppState {
         left_id: &AssetId,
         right_id: &AssetId,
         winner_id: &AssetId,
-    ) -> anyhow::Result<RedirectTarget> {
-        let updated = self.with_locked_store_write(|store| {
-            let corpus_id = self.active.corpus_id;
-            let mut field = self.session_field(store)?;
+    ) -> anyhow::Result<()> {
+        let active = self.active;
+        let left_id = left_id.clone();
+        let right_id = right_id.clone();
+        let winner_id = winner_id.clone();
+        let embedding_model_name = self.embedder.model_name().to_owned();
+        let cached_field = self.session_field_cache.read().clone();
+        let updated = self.with_write_store("vote_local", move |store| {
+            let corpus_id = active.corpus_id;
+            let mut field = if let Some(field) = cached_field {
+                field
+            } else {
+                Self::rebuild_session_field_for(store, active, &embedding_model_name)?
+            };
             let assets = store.corpus_assets(corpus_id)?;
             let mut left = assets
                 .iter()
-                .find(|asset| asset.id == *left_id)
+                .find(|asset| asset.id == left_id)
                 .cloned()
                 .with_context(|| format!("missing left asset {}", left_id.0))?;
             let mut right = assets
                 .iter()
-                .find(|asset| asset.id == *right_id)
+                .find(|asset| asset.id == right_id)
                 .cloned()
                 .with_context(|| format!("missing right asset {}", right_id.0))?;
 
             if left.id == right.id {
                 bail!("cannot compare an asset against itself");
             }
-            if winner_id != &left.id && winner_id != &right.id {
+            if winner_id != left.id && winner_id != right.id {
                 bail!("winner is not one of the compared assets");
             }
 
@@ -666,7 +724,7 @@ impl AppState {
                 let right_before = right.clone();
                 let left_utility = field.utility(&left);
                 let right_utility = field.utility(&right);
-                let left_won = winner_id == &left.id;
+                let left_won = winner_id == left.id;
                 left.compare_count += 1;
                 right.compare_count += 1;
                 if left_won {
@@ -681,7 +739,7 @@ impl AppState {
                     &right_before,
                     &left,
                     &right,
-                    winner_id,
+                    &winner_id,
                     left_utility,
                     right_utility,
                     None,
@@ -718,7 +776,7 @@ impl AppState {
                 let right_before = right.clone();
                 let left_utility = field.utility(&left);
                 let right_utility = field.utility(&right);
-                let left_won = winner_id == &left.id;
+                let left_won = winner_id == left.id;
                 let outcome = if left_won { 1.0 } else { -1.0 };
                 let delta_mean = left_utility - right_utility;
                 let delta_variance = hierarchical_session_utility_variance(
@@ -955,10 +1013,7 @@ impl AppState {
                         .as_ref()
                         .or(right_embedding.as_ref())
                         .map(|vector| {
-                            SessionEmbeddingHead::zero(
-                                self.embedder.model_name().to_owned(),
-                                vector.len(),
-                            )
+                            SessionEmbeddingHead::zero(embedding_model_name.clone(), vector.len())
                         })
                 });
                 let logistic_err = if left_won { 1.0 } else { 0.0 } - sigmoid(delta_mean);
@@ -982,7 +1037,7 @@ impl AppState {
                     &right_before,
                     &left,
                     &right,
-                    winner_id,
+                    &winner_id,
                     left_utility,
                     right_utility,
                     embedding_head.as_ref(),
@@ -1002,7 +1057,7 @@ impl AppState {
             let right_before = right.clone();
             let left_utility = field.utility(&left);
             let right_utility = field.utility(&right);
-            let left_won = winner_id == &left.id;
+            let left_won = winner_id == left.id;
             let y = if left_won { 1.0 } else { 0.0 };
             let err = y - sigmoid(left_utility - right_utility);
             let coord_gap = subtract(&left.coords, &right.coords);
@@ -1011,7 +1066,7 @@ impl AppState {
             let right_embedding = field.embedding(&right.id).map(ToOwned::to_owned);
             let mut projection = projection_state(
                 store,
-                self.embedder.model_name(),
+                &embedding_model_name,
                 left_embedding.as_deref().or(right_embedding.as_deref()),
             )?;
             let left_prior =
@@ -1055,10 +1110,7 @@ impl AppState {
                     .as_ref()
                     .or(right_embedding.as_ref())
                     .map(|vector| {
-                        SessionEmbeddingHead::zero(
-                            self.embedder.model_name().to_owned(),
-                            vector.len(),
-                        )
+                        SessionEmbeddingHead::zero(embedding_model_name.clone(), vector.len())
                     })
             });
             if let (Some(head), Some(lhs), Some(rhs)) = (
@@ -1093,7 +1145,7 @@ impl AppState {
                 &right_before,
                 &left,
                 &right,
-                winner_id,
+                &winner_id,
                 left_utility,
                 right_utility,
                 projection.as_ref(),
@@ -1105,40 +1157,44 @@ impl AppState {
         if let Some(field) = updated {
             self.replace_session_field_cache(field);
         }
-        self.redirect_target_for_next_pair(&HashSet::new())
-    }
-
-    fn session_with_store(&self, store: &Store) -> anyhow::Result<SessionRecord> {
-        store.session(self.active.session_id)
+        Ok(())
     }
 
     fn rebuild_session_field(&self, store: &Store) -> anyhow::Result<SessionField> {
+        Self::rebuild_session_field_for(store, self.active, self.embedder.model_name())
+    }
+
+    fn rebuild_session_field_for(
+        store: &Store,
+        active: ActiveArena,
+        embedding_model_name: &str,
+    ) -> anyhow::Result<SessionField> {
         let quality_model = store.active_quality_model()?.formal_version;
         let hierarchical_assets = match quality_model {
-            QualityFormalVersion::LegacyIndependentV1 => HashMap::new(),
             QualityFormalVersion::HierarchicalGaussianV1 => store
-                .corpus_asset_quality_caches(self.active.corpus_id, quality_model)?
+                .corpus_asset_quality_caches(active.corpus_id, quality_model)?
                 .into_iter()
                 .filter_map(|(asset_id, cache)| {
                     HierarchicalAssetPosterior::decode(&cache.payload)
                         .map(|payload| (asset_id, payload))
                 })
                 .collect(),
-            QualityFormalVersion::HierarchicalPerturbativeV2
+            QualityFormalVersion::LegacyIndependentV1
+            | QualityFormalVersion::HierarchicalPerturbativeV2
             | QualityFormalVersion::HierarchicalPerturbativeV3 => HashMap::new(),
         };
         let hierarchical_session = match quality_model {
-            QualityFormalVersion::LegacyIndependentV1 => None,
             QualityFormalVersion::HierarchicalGaussianV1 => store
-                .session_quality_cache(self.active.session_id, quality_model)?
+                .session_quality_cache(active.session_id, quality_model)?
                 .and_then(|cache| HierarchicalSessionPosterior::decode(&cache.payload)),
-            QualityFormalVersion::HierarchicalPerturbativeV2
+            QualityFormalVersion::LegacyIndependentV1
+            | QualityFormalVersion::HierarchicalPerturbativeV2
             | QualityFormalVersion::HierarchicalPerturbativeV3 => None,
         };
         let perturbative_assets = match quality_model {
             QualityFormalVersion::HierarchicalPerturbativeV2
             | QualityFormalVersion::HierarchicalPerturbativeV3 => store
-                .corpus_asset_quality_caches(self.active.corpus_id, quality_model)?
+                .corpus_asset_quality_caches(active.corpus_id, quality_model)?
                 .into_iter()
                 .filter_map(|(asset_id, cache)| {
                     PerturbativeAssetPosterior::decode(&cache.payload)
@@ -1150,7 +1206,7 @@ impl AppState {
         let perturbative_session = match quality_model {
             QualityFormalVersion::HierarchicalPerturbativeV2
             | QualityFormalVersion::HierarchicalPerturbativeV3 => store
-                .session_quality_cache(self.active.session_id, quality_model)?
+                .session_quality_cache(active.session_id, quality_model)?
                 .and_then(|cache| PerturbativeSessionPosterior::decode(&cache.payload)),
             _ => None,
         };
@@ -1158,18 +1214,16 @@ impl AppState {
             .load_perturbative_hyper_params(&store.active_quality_model()?)?
             .unwrap_or_default();
         Ok(SessionField {
-            session: self.session_with_store(store)?,
+            session: store.session(active.session_id)?,
             quality_model,
-            exact_offsets: store.session_asset_offsets(self.active.session_id)?,
+            exact_offsets: store.session_asset_offsets(active.session_id)?,
             hearted_assets: store.hearted_assets()?,
-            subsource_lock: store.session_subsource_lock(self.active.session_id)?,
-            embeddings: Arc::new(
-                store.corpus_embeddings(self.active.corpus_id, self.embedder.model_name())?,
-            ),
+            subsource_lock: store.session_subsource_lock(active.session_id)?,
+            embeddings: Arc::new(store.corpus_embeddings(active.corpus_id, embedding_model_name)?),
             embedding_head: store
-                .session_embedding_head(self.active.session_id, self.embedder.model_name())?,
+                .session_embedding_head(active.session_id, embedding_model_name)?,
             hierarchical_assets: Arc::new(hierarchical_assets),
-            dominant_faces: Arc::new(store.dominant_local_face_identities(self.active.corpus_id)?),
+            dominant_faces: Arc::new(store.dominant_local_face_identities(active.corpus_id)?),
             hierarchical_session,
             perturbative_assets: Arc::new(perturbative_assets),
             perturbative_session,
@@ -1177,7 +1231,7 @@ impl AppState {
         })
     }
 
-    fn choose_next_pair(
+    pub(super) fn choose_next_pair(
         &self,
         lock_exhaustion: LockExhaustionPolicy,
         excluded_visual_keys: &HashSet<VisualKey>,
@@ -1294,7 +1348,8 @@ impl AppState {
     }
 
     pub(super) fn session_field(&self, store: &Store) -> anyhow::Result<SessionField> {
-        if let Some(field) = self.session_field_cache.read().clone() {
+        let cached = self.session_field_cache.read().clone();
+        if let Some(field) = cached {
             return Ok(field);
         }
         let field = self.rebuild_session_field(store)?;

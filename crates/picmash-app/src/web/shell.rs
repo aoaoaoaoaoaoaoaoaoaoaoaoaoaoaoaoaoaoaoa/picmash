@@ -1,4 +1,8 @@
-use super::*;
+use std::path::{Path as FsPath, PathBuf};
+
+use anyhow::bail;
+use axum::http::{HeaderMap, header::REFERER};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ImageToolKind {
@@ -49,8 +53,6 @@ impl ImageToolKind {
             (Self::Heart, false) => "tool heart",
             (Self::Hide | Self::VetoThread, true) => "tool mini danger",
             (Self::Hide | Self::VetoThread, false) => "tool danger",
-            (Self::LockThread, true) => "tool mini",
-            (Self::LockThread, false) => "tool",
             (_, true) => "tool mini",
             (_, false) => "tool",
         }
@@ -399,15 +401,10 @@ pub(super) fn script_block() -> Markup {
                   const normalizeTurns = (value) => ((Number(value) || 0) % 4 + 4) % 4;
                   let currentLayer = arenaShell.querySelector(".arena-stage-layer.is-current");
                   let lookaheadLayer = arenaShell.querySelector(".arena-stage-layer.is-lookahead");
-                  let preservedLookaheadLayer = arenaShell.querySelector(".arena-stage-layer.is-preserved-lookahead");
                   let lookaheadReady = false;
-                  let preservedLookaheadReady = false;
                   let preparedEpoch = 0;
                   let queuedLookaheadPayloads = [];
-                  let queuedPreservedPayloads = [];
-                  let queuedPreservedAnchor = "";
                   let queuedLookaheadRequest = null;
-                  let queuedPreservedRequest = null;
                   let isTransitioning = false;
                   let isActionPending = false;
                   const telemetry = window.__picmashTelemetry || null;
@@ -419,7 +416,6 @@ pub(super) fn script_block() -> Markup {
                     if (!layer) return "";
                     if (layer === currentLayer) return "current";
                     if (layer === lookaheadLayer) return "lookahead";
-                    if (layer === preservedLookaheadLayer) return "preserved_lookahead";
                     return "unknown";
                   };
                   const eventElement = (event) =>
@@ -446,7 +442,6 @@ pub(super) fn script_block() -> Markup {
                       pair_href: currentPairHref(),
                       current_href: currentLayer?.dataset.href || "",
                       lookahead_href: lookaheadLayer?.dataset.href || "",
-                      preserved_href: preservedLookaheadLayer?.dataset.href || "",
                       arena_epoch: preparedEpoch,
                       ...payload,
                     });
@@ -461,35 +456,37 @@ pub(super) fn script_block() -> Markup {
                     Array.isArray(payload?.visualKeys)
                       ? payload.visualKeys.filter((entry) => typeof entry === "string" && entry.length > 0)
                       : [];
-                  const currentLocalAnchor = () => currentLayer?.dataset.localAnchor || "";
-                  const preservedLayerAnchorMatchesCurrent = () =>
-                    !!currentLocalAnchor() &&
-                    preservedLookaheadLayer?.dataset.localAnchor === currentLocalAnchor();
-                  const collectExcludedVisualKeys = (preserveLocalAnchor) => {
+                  const payloadTurnId = (payload) =>
+                    typeof payload?.turnId === "string" ? payload.turnId : "";
+                  const layerTurnId = (layer) => layer?.dataset.turnId || "";
+                  const collectKnownTurnIds = () => {
+                    const known = new Set();
+                    const lookaheadTurnId = layerTurnId(lookaheadLayer);
+                    if (lookaheadTurnId) known.add(lookaheadTurnId);
+                    for (const payload of queuedLookaheadPayloads) {
+                      const turnId = payloadTurnId(payload);
+                      if (turnId) known.add(turnId);
+                    }
+                    return Array.from(known);
+                  };
+                  const collectExcludedVisualKeys = () => {
                     const excluded = new Set();
                     for (const key of layerVisualKeys(currentLayer)) excluded.add(key);
                     for (const key of layerVisualKeys(lookaheadLayer)) excluded.add(key);
-                    if (preservedLayerAnchorMatchesCurrent()) {
-                      for (const key of layerVisualKeys(preservedLookaheadLayer)) excluded.add(key);
-                    }
                     for (const payload of queuedLookaheadPayloads) {
                       for (const key of payloadVisualKeys(payload)) excluded.add(key);
                     }
-                    if (queuedPreservedAnchor === currentLocalAnchor()) {
-                      for (const payload of queuedPreservedPayloads) {
-                        for (const key of payloadVisualKeys(payload)) excluded.add(key);
-                      }
-                    }
-                    if (preserveLocalAnchor) {
-                      const anchorKey = currentLayer?.dataset.localAnchorVisualKey || "";
-                      if (anchorKey) excluded.delete(anchorKey);
-                    }
                     return Array.from(excluded);
                   };
-                  const arenaPrefetchUrl = (base, excludeVisualKeys) => {
-                    if (!excludeVisualKeys.length) return base;
+                  const arenaPrefetchUrl = (base, excludeVisualKeys, knownTurnIds) => {
+                    if (!excludeVisualKeys.length && !knownTurnIds.length) return base;
                     const url = new URL(base, window.location.origin);
-                    url.searchParams.set("exclude_visual_keys", excludeVisualKeys.join(","));
+                    if (excludeVisualKeys.length) {
+                      url.searchParams.set("exclude_visual_keys", excludeVisualKeys.join(","));
+                    }
+                    if (knownTurnIds.length) {
+                      url.searchParams.set("known_turn_ids", knownTurnIds.join(","));
+                    }
                     return `${url.pathname}${url.search}`;
                   };
 
@@ -663,6 +660,44 @@ pub(super) fn script_block() -> Markup {
                     );
                   };
 
+                  const setLayerMetadata = (layer, payload) => {
+                    if (!layer || !payload) return;
+                    layer.dataset.href = payload.href || "";
+                    layer.dataset.turnId = payload.turnId || "";
+                    layer.dataset.actionToken = payload.actionToken || "";
+                    layer.dataset.arenaRevision = `${payload.revision ?? ""}`;
+                    layer.dataset.arenaSamplerEpoch = `${payload.samplerEpoch ?? ""}`;
+                    layer.dataset.visualKeys = payloadVisualKeys(payload).join(",");
+                  };
+
+                  const stampLayerForms = (layer) => {
+                    if (!layer) return;
+                    const fields = {
+                      turn_id: layer.dataset.turnId || "",
+                      action_token: layer.dataset.actionToken || "",
+                      arena_revision: layer.dataset.arenaRevision || "",
+                      arena_sampler_epoch: layer.dataset.arenaSamplerEpoch || "",
+                    };
+                    for (const form of layer.querySelectorAll("form")) {
+                      for (const [name, value] of Object.entries(fields)) {
+                        const input = form.querySelector(`input[name="${name}"]`);
+                        if (input) input.value = value;
+                      }
+                    }
+                  };
+
+                  const syncCurrentLayer = (payload) => {
+                    if (!payload || payload.empty || !currentLayer) return false;
+                    const currentTurnId = currentLayer.dataset.turnId || "";
+                    if (currentTurnId && payload.turnId && currentTurnId !== payload.turnId) {
+                      return false;
+                    }
+                    setLayerMetadata(currentLayer, payload);
+                    stampLayerForms(currentLayer);
+                    history.replaceState(null, "", currentLayer.dataset.href || window.location.pathname);
+                    return true;
+                  };
+
                   const transplantSettledArenaImages = (sourceLayer, stage) => {
                     const sourceImages = layerImages(sourceLayer);
                     const stageImages = Array.from(
@@ -692,10 +727,8 @@ pub(super) fn script_block() -> Markup {
                     }
                     transplantSettledArenaImages(options.preserveImagesFromLayer, stage);
                     layer.replaceChildren(stage);
-                    layer.dataset.href = payload.href || "";
-                    layer.dataset.localAnchor = payload.localAnchor || "";
-                    layer.dataset.localAnchorVisualKey = payload.localAnchorVisualKey || "";
-                    layer.dataset.visualKeys = payloadVisualKeys(payload).join(",");
+                    setLayerMetadata(layer, payload);
+                    stampLayerForms(layer);
                     return primeLayer(layer, {
                       progressive: options.progressive === true,
                     });
@@ -714,25 +747,22 @@ pub(super) fn script_block() -> Markup {
                       });
                       return false;
                     }
-                    if (!preservedLayerAnchorMatchesCurrent()) {
-                      clearPreparedLayer(preservedLookaheadLayer);
-                      preservedLookaheadReady = false;
-                    }
                     history.replaceState(
                       null,
                       "",
                       currentLayer.dataset.href || window.location.pathname,
                     );
                     void refillLookaheadFromReserve();
-                    void refillPreservedLookaheadFromReserve();
                     return true;
                   };
 
                   const clearPreparedLayer = (layer) => {
                     if (!layer) return;
                     layer.dataset.href = "";
-                    layer.dataset.localAnchor = "";
-                    layer.dataset.localAnchorVisualKey = "";
+                    layer.dataset.turnId = "";
+                    layer.dataset.actionToken = "";
+                    layer.dataset.arenaRevision = "";
+                    layer.dataset.arenaSamplerEpoch = "";
                     layer.dataset.visualKeys = "";
                     layer.replaceChildren();
                   };
@@ -740,22 +770,15 @@ pub(super) fn script_block() -> Markup {
                   const invalidatePreparedArena = () => {
                     preparedEpoch += 1;
                     lookaheadReady = false;
-                    preservedLookaheadReady = false;
                     queuedLookaheadPayloads = [];
-                    queuedPreservedPayloads = [];
-                    queuedPreservedAnchor = "";
                     queuedLookaheadRequest = null;
-                    queuedPreservedRequest = null;
                     clearPreparedLayer(lookaheadLayer);
-                    clearPreparedLayer(preservedLookaheadLayer);
                     return preparedEpoch;
                   };
 
                   const rewarmPreparedArena = async () => {
-                    const epoch = invalidatePreparedArena();
+                    invalidatePreparedArena();
                     await refillLookaheadFromReserve();
-                    if (epoch !== preparedEpoch) return;
-                    await refillPreservedLookaheadFromReserve();
                   };
 
                   const fetchArenaPayload = async (url, interactionId) => {
@@ -767,7 +790,14 @@ pub(super) fn script_block() -> Markup {
                     if (!response.ok) throw new Error(`arena prefetch failed: ${response.status}`);
                     const payload = await response.json();
                     if (payload.empty) return null;
-                    if (!payload?.href || !payload?.html) {
+                    if (
+                      !payload?.href ||
+                      !payload?.html ||
+                      !payload?.turnId ||
+                      !payload?.actionToken ||
+                      payload?.revision === undefined ||
+                      payload?.samplerEpoch === undefined
+                    ) {
                       reportArenaAnomaly("arena_prefetch_payload_rejected", {
                         interaction_id: interactionId || "",
                         pair_href: payload?.href || url,
@@ -783,7 +813,11 @@ pub(super) fn script_block() -> Markup {
                       lookaheadReady = false;
                       const interactionId = telemetryInteractionId("arena-prefetch");
                       const payload = await fetchArenaPayload(
-                        arenaPrefetchUrl("/api/arena/next", collectExcludedVisualKeys(false)),
+                        arenaPrefetchUrl(
+                          "/api/arena/next",
+                          collectExcludedVisualKeys(),
+                          collectKnownTurnIds(),
+                        ),
                         interactionId,
                       );
                       if (epoch !== preparedEpoch) return;
@@ -803,44 +837,6 @@ pub(super) fn script_block() -> Markup {
                     }
                   };
 
-                  const prefetchPreservedLookahead = async () => {
-                    const epoch = preparedEpoch;
-                    const anchor = currentLayer?.dataset.localAnchor || "";
-                    preservedLookaheadReady = false;
-                    queuedPreservedPayloads = [];
-                    queuedPreservedAnchor = anchor;
-                    if (!anchor) {
-                      clearPreparedLayer(preservedLookaheadLayer);
-                      return;
-                    }
-                    try {
-                      const interactionId = telemetryInteractionId("arena-prefetch");
-                      const payload = await fetchArenaPayload(
-                        arenaPrefetchUrl(
-                          `/api/arena/next?anchor=${encodeURIComponent(anchor)}`,
-                          collectExcludedVisualKeys(true),
-                        ),
-                        interactionId,
-                      );
-                      if (epoch !== preparedEpoch) return;
-                      if (!payload) {
-                        clearPreparedLayer(preservedLookaheadLayer);
-                        return;
-                      }
-                      const seeded = await seedPreparedLayer(
-                        preservedLookaheadLayer,
-                        payload,
-                        { interactionId },
-                      );
-                      if (epoch !== preparedEpoch) return;
-                      preservedLookaheadReady = seeded;
-                    } catch (error) {
-                      if (epoch !== preparedEpoch) return;
-                      console.error(error);
-                      clearPreparedLayer(preservedLookaheadLayer);
-                    }
-                  };
-
                   const queueLookaheadReserve = async () => {
                     const epoch = preparedEpoch;
                     if (queuedLookaheadRequest?.epoch === epoch) {
@@ -854,7 +850,11 @@ pub(super) fn script_block() -> Markup {
                       ) {
                         const interactionId = telemetryInteractionId("arena-prefetch");
                         const payload = await fetchArenaPayload(
-                          arenaPrefetchUrl("/api/arena/next", collectExcludedVisualKeys(false)),
+                          arenaPrefetchUrl(
+                            "/api/arena/next",
+                            collectExcludedVisualKeys(),
+                            collectKnownTurnIds(),
+                          ),
                           interactionId,
                         );
                         if (epoch !== preparedEpoch) return;
@@ -873,62 +873,6 @@ pub(super) fn script_block() -> Markup {
                         }
                       });
                     queuedLookaheadRequest = { epoch, promise };
-                    await promise;
-                  };
-
-                  const queuePreservedReserve = async () => {
-                    const epoch = preparedEpoch;
-                    const anchor = currentLayer?.dataset.localAnchor || "";
-                    if (!anchor) {
-                      queuedPreservedPayloads = [];
-                      queuedPreservedAnchor = "";
-                      clearPreparedLayer(preservedLookaheadLayer);
-                      preservedLookaheadReady = false;
-                      return;
-                    }
-                    if (queuedPreservedAnchor !== anchor) {
-                      queuedPreservedPayloads = [];
-                      queuedPreservedAnchor = anchor;
-                      clearPreparedLayer(preservedLookaheadLayer);
-                      preservedLookaheadReady = false;
-                    }
-                    if (queuedPreservedRequest?.epoch === epoch && queuedPreservedRequest?.anchor === anchor) {
-                      await queuedPreservedRequest.promise;
-                      return;
-                    }
-                    const promise = (async () => {
-                      while (
-                        epoch === preparedEpoch &&
-                        queuedPreservedAnchor === anchor &&
-                        queuedPreservedPayloads.length < PREFETCH_RESERVE_DEPTH
-                      ) {
-                        const interactionId = telemetryInteractionId("arena-prefetch");
-                        const payload = await fetchArenaPayload(
-                          arenaPrefetchUrl(
-                            `/api/arena/next?anchor=${encodeURIComponent(anchor)}`,
-                            collectExcludedVisualKeys(true),
-                          ),
-                          interactionId,
-                        );
-                        if (epoch !== preparedEpoch || queuedPreservedAnchor !== anchor) return;
-                        if (!payload) return;
-                        queuedPreservedPayloads.push(payload);
-                      }
-                    })()
-                      .catch((error) => {
-                        if (epoch !== preparedEpoch || queuedPreservedAnchor !== anchor) return;
-                        console.error(error);
-                        queuedPreservedPayloads = [];
-                      })
-                      .finally(() => {
-                        if (
-                          queuedPreservedRequest?.epoch === epoch &&
-                          queuedPreservedRequest?.anchor === anchor
-                        ) {
-                          queuedPreservedRequest = null;
-                        }
-                      });
-                    queuedPreservedRequest = { epoch, anchor, promise };
                     await promise;
                   };
 
@@ -951,58 +895,7 @@ pub(super) fn script_block() -> Markup {
                     void queueLookaheadReserve();
                   };
 
-                  const refillPreservedLookaheadFromReserve = async () => {
-                    const epoch = preparedEpoch;
-                    const anchor = currentLayer?.dataset.localAnchor || "";
-                    if (!anchor) {
-                      clearPreparedLayer(preservedLookaheadLayer);
-                      preservedLookaheadReady = false;
-                      queuedPreservedPayloads = [];
-                      queuedPreservedAnchor = "";
-                      return;
-                    }
-                    if (queuedPreservedAnchor !== anchor) {
-                      queuedPreservedPayloads = [];
-                      queuedPreservedAnchor = anchor;
-                      clearPreparedLayer(preservedLookaheadLayer);
-                      preservedLookaheadReady = false;
-                    }
-                    while (queuedPreservedPayloads.length) {
-                      const payload = queuedPreservedPayloads.shift();
-                      if (!payload) break;
-                      const seeded = await seedPreparedLayer(
-                        preservedLookaheadLayer,
-                        payload,
-                      );
-                      if (epoch !== preparedEpoch) return;
-                      if (seeded) {
-                        preservedLookaheadReady = true;
-                        void queuePreservedReserve();
-                        return;
-                      }
-                      clearPreparedLayer(preservedLookaheadLayer);
-                    }
-                    await prefetchPreservedLookahead();
-                    if (epoch !== preparedEpoch) return;
-                    void queuePreservedReserve();
-                  };
-
-                  const ensurePreparedLookahead = async (usePreservedLookahead) => {
-                    if (usePreservedLookahead) {
-                      if (
-                        preservedLookaheadReady &&
-                        preservedLookaheadLayer?.dataset.href &&
-                        preservedLayerAnchorMatchesCurrent()
-                      ) {
-                        return true;
-                      }
-                      await refillPreservedLookaheadFromReserve();
-                      return !!(
-                        preservedLookaheadReady &&
-                        preservedLookaheadLayer?.dataset.href &&
-                        preservedLayerAnchorMatchesCurrent()
-                      );
-                    }
+                  const ensurePreparedLookahead = async () => {
                     if (lookaheadReady && lookaheadLayer?.dataset.href) return true;
                     await refillLookaheadFromReserve();
                     return !!(lookaheadReady && lookaheadLayer?.dataset.href);
@@ -1025,13 +918,6 @@ pub(super) fn script_block() -> Markup {
                       lookaheadReady = true;
                     }, prefetchLookahead);
                     void queueLookaheadReserve();
-                  };
-
-                  const bootPreservedLookahead = async () => {
-                    await bootPreparedLayer(preservedLookaheadLayer, () => {
-                      preservedLookaheadReady = true;
-                    }, prefetchPreservedLookahead);
-                    void queuePreservedReserve();
                   };
 
                   const rotateArenaImage = async (form) => {
@@ -1063,17 +949,19 @@ pub(super) fn script_block() -> Markup {
                     }
                   };
 
-                  const promotePreparedLayer = async (incoming, bufferClass) => {
+                  const promoteLookahead = async () => {
                     const outgoing = currentLayer;
-                    if (!outgoing || !incoming || !incoming.dataset.href) {
+                    if (!lookaheadReady || !lookaheadLayer?.dataset.href) return false;
+                    if (!outgoing) {
                       reportArenaAnomaly("arena_promotion_failed", {
-                        layer_role: bufferClass === "is-lookahead" ? "lookahead" : "preserved_lookahead",
+                        layer_role: "lookahead",
                       });
                       return false;
                     }
                     isTransitioning = true;
                     arenaShell.classList.add("is-transitioning");
-                    incoming.classList.remove("is-hidden", "is-lookahead", "is-preserved-lookahead");
+                    const incoming = lookaheadLayer;
+                    incoming.classList.remove("is-hidden", "is-lookahead");
                     incoming.setAttribute("aria-hidden", "false");
                     requestAnimationFrame(() => {
                       outgoing.classList.add("is-exiting");
@@ -1084,117 +972,94 @@ pub(super) fn script_block() -> Markup {
                       "is-current",
                       "is-exiting",
                       "is-lookahead",
-                      "is-preserved-lookahead",
                     );
-                    outgoing.classList.add(bufferClass, "is-hidden");
+                    outgoing.classList.add("is-lookahead", "is-hidden");
                     outgoing.setAttribute("aria-hidden", "true");
                     clearPreparedLayer(outgoing);
                     incoming.classList.remove("is-entering");
                     incoming.classList.add("is-current");
                     currentLayer = incoming;
-                    if (bufferClass === "is-lookahead") {
-                      lookaheadLayer = outgoing;
-                      lookaheadReady = false;
-                      void refillLookaheadFromReserve();
-                    } else {
-                      preservedLookaheadLayer = outgoing;
-                      preservedLookaheadReady = false;
-                      void refillPreservedLookaheadFromReserve();
-                    }
-                    if (!preservedLayerAnchorMatchesCurrent()) {
-                      clearPreparedLayer(preservedLookaheadLayer);
-                      preservedLookaheadReady = false;
-                    }
+                    lookaheadLayer = outgoing;
+                    lookaheadReady = false;
+                    if (!isActionPending) void refillLookaheadFromReserve();
                     history.replaceState(null, "", currentLayer.dataset.href || window.location.pathname);
                     arenaShell.classList.remove("is-transitioning");
                     isTransitioning = false;
-                    void queueLookaheadReserve();
-                    void queuePreservedReserve();
+                    if (!isActionPending) void queueLookaheadReserve();
                     return true;
                   };
 
-                  const promoteLookahead = async () => {
-                    if (!lookaheadReady || !lookaheadLayer?.dataset.href) return false;
-                    return promotePreparedLayer(lookaheadLayer, "is-lookahead");
-                  };
-
-                  const promotePreservedLookahead = async () => {
-                    if (!preservedLookaheadReady || !preservedLookaheadLayer?.dataset.href) return false;
-                    return promotePreparedLayer(preservedLookaheadLayer, "is-preserved-lookahead");
-                  };
-
-                  const seedAuthoritativeLayer = async (usePreservedLookahead, payload) => {
-                    const layer = usePreservedLookahead ? preservedLookaheadLayer : lookaheadLayer;
-                    if (!layer) return false;
-                    const seeded = await seedPreparedLayer(layer, payload);
-                    if (usePreservedLookahead) {
-                      preservedLookaheadReady = seeded;
-                    } else {
-                      lookaheadReady = seeded;
-                    }
+                  const seedAuthoritativeLayer = async (payload) => {
+                    if (!lookaheadLayer) return false;
+                    const seeded = await seedPreparedLayer(lookaheadLayer, payload);
+                    lookaheadReady = seeded;
                     return seeded;
                   };
 
-                  const promoteBufferedPolicy = async (usePreservedLookahead) =>
-                    usePreservedLookahead ? promotePreservedLookahead() : promoteLookahead();
-
                   const salvagePreparedCurrent = () => {
                     if (layerImages(currentLayer).length) return false;
-                    const trySalvage = (incoming, bufferClass) => {
-                      if (!incoming?.dataset.href || !layerImages(incoming).length) return false;
-                      const outgoing = currentLayer;
-                      outgoing.classList.remove(
-                        "is-current",
-                        "is-entering",
-                        "is-exiting",
-                        "is-lookahead",
-                        "is-preserved-lookahead",
-                      );
-                      outgoing.classList.add(bufferClass, "is-hidden");
-                      outgoing.setAttribute("aria-hidden", "true");
-                      incoming.classList.remove(
-                        "is-hidden",
-                        "is-lookahead",
-                        "is-preserved-lookahead",
-                        "is-entering",
-                        "is-exiting",
-                      );
-                      incoming.classList.add("is-current");
-                      incoming.setAttribute("aria-hidden", "false");
-                      currentLayer = incoming;
-                      if (bufferClass === "is-lookahead") {
-                        lookaheadLayer = outgoing;
-                        lookaheadReady = false;
-                      } else {
-                        preservedLookaheadLayer = outgoing;
-                        preservedLookaheadReady = false;
-                      }
-                      history.replaceState(
-                        null,
-                        "",
-                        currentLayer.dataset.href || window.location.pathname,
-                      );
-                      reportArenaAnomaly("arena_salvage_current_from_hidden", {
-                        layer_role: bufferClass === "is-lookahead" ? "lookahead" : "preserved_lookahead",
-                      });
-                      return true;
-                    };
-                    return (
-                      trySalvage(lookaheadLayer, "is-lookahead") ||
-                      trySalvage(preservedLookaheadLayer, "is-preserved-lookahead")
+                    if (!lookaheadLayer?.dataset.href || !layerImages(lookaheadLayer).length) {
+                      return false;
+                    }
+                    const outgoing = currentLayer;
+                    outgoing.classList.remove(
+                      "is-current",
+                      "is-entering",
+                      "is-exiting",
+                      "is-lookahead",
                     );
+                    outgoing.classList.add("is-lookahead", "is-hidden");
+                    outgoing.setAttribute("aria-hidden", "true");
+                    lookaheadLayer.classList.remove(
+                      "is-hidden",
+                      "is-lookahead",
+                      "is-entering",
+                      "is-exiting",
+                    );
+                    lookaheadLayer.classList.add("is-current");
+                    lookaheadLayer.setAttribute("aria-hidden", "false");
+                    currentLayer = lookaheadLayer;
+                    lookaheadLayer = outgoing;
+                    lookaheadReady = false;
+                    history.replaceState(
+                      null,
+                      "",
+                      currentLayer.dataset.href || window.location.pathname,
+                    );
+                    reportArenaAnomaly("arena_salvage_current_from_hidden", {
+                      layer_role: "lookahead",
+                    });
+                    return true;
                   };
 
                   const resolveArenaActionPayload = async (response, fallbackHref) => {
+                    const contentType = response.headers.get("content-type") || "";
+                    const payload = contentType.includes("application/json")
+                      ? await response.json().catch(() => null)
+                      : null;
+                    if (response.status === 409) {
+                      window.location.assign(payload?.href || fallbackHref || arenaRootHref());
+                      return null;
+                    }
                     if (!response.ok) {
                       throw new Error(`arena action failed: ${response.status}`);
                     }
-                    const payload = await response.json();
                     if (payload?.empty || !payload?.href || !payload?.html) {
                       window.location.assign(payload?.href || fallbackHref);
                       return null;
                     }
                     return payload;
+                  };
+
+                  const stampArenaCommandBody = (form, body) => {
+                    const layer = form.closest(".arena-stage-layer") || currentLayer;
+                    if (!body.get("command_id")) {
+                      body.set("command_id", telemetryInteractionId("arena-command"));
+                    }
+                    body.set("turn_id", layer?.dataset.turnId || body.get("turn_id") || "");
+                    body.set("action_token", layer?.dataset.actionToken || body.get("action_token") || "");
+                    body.set("arena_revision", layer?.dataset.arenaRevision || body.get("arena_revision") || "");
+                    body.set("arena_sampler_epoch", layer?.dataset.arenaSamplerEpoch || body.get("arena_sampler_epoch") || "");
                   };
 
                   arenaShell.addEventListener("pointerdown", (event) => {
@@ -1228,12 +1093,10 @@ pub(super) fn script_block() -> Markup {
                         return;
                       }
                       const body = new URLSearchParams(formData);
-                      if (
-                        advancePolicy === "buffered" ||
-                        advancePolicy === "buffered-preserve"
-                      ) {
-                        const usePreservedLookahead = advancePolicy === "buffered-preserve";
+                      stampArenaCommandBody(form, body);
+                      if (advancePolicy === "buffered") {
                         const interactionId = telemetryInteractionId("arena-action");
+                        isActionPending = true;
                         const sendAction = fetch(form.action, {
                           method: "POST",
                           body,
@@ -1241,29 +1104,32 @@ pub(super) fn script_block() -> Markup {
                           cache: "no-store",
                           headers: telemetryHeaders(interactionId, { Accept: "application/json" }),
                         });
-                        const ready = await ensurePreparedLookahead(usePreservedLookahead);
-                        if (ready) {
-                          const promoted = await promoteBufferedPolicy(usePreservedLookahead);
-                          if (!promoted) {
-                            window.location.reload();
+                        sendAction.catch(() => {});
+                        try {
+                          const ready = await ensurePreparedLookahead();
+                          if (ready) {
+                            const promoted = await promoteLookahead();
+                            if (!promoted) {
+                              window.location.reload();
+                              return;
+                            }
+                            const payload = await resolveArenaActionPayload(
+                              await sendAction,
+                              form.action,
+                            );
+                            if (!payload) {
+                              return;
+                            }
+                            if (!syncCurrentLayer(payload)) {
+                              const refreshed = await refreshCurrentLayer(payload);
+                              if (!refreshed) {
+                                window.location.assign(payload.href);
+                                return;
+                              }
+                            }
+                            await rewarmPreparedArena();
                             return;
                           }
-                          sendAction
-                            .then(async (response) => {
-                              if (!response.ok) throw new Error(`arena action failed: ${response.status}`);
-                              if (response.headers.get("content-type")?.includes("application/json")) {
-                                await response.json().catch(() => null);
-                              }
-                              await rewarmPreparedArena();
-                            })
-                            .catch((error) => {
-                              console.error(error);
-                              window.location.reload();
-                            });
-                          return;
-                        }
-                        isActionPending = true;
-                        try {
                           const payload = await resolveArenaActionPayload(
                             await sendAction,
                             form.action,
@@ -1271,28 +1137,27 @@ pub(super) fn script_block() -> Markup {
                           if (!payload) {
                             return;
                           }
-                          const seeded = await seedAuthoritativeLayer(
-                            usePreservedLookahead,
-                            payload,
-                          );
+                          const seeded = await seedAuthoritativeLayer(payload);
                           if (!seeded) {
                             reportArenaAnomaly("arena_promotion_failed", {
                               interaction_id: interactionId,
                               pair_href: payload.href,
-                              layer_role: usePreservedLookahead ? "preserved_lookahead" : "lookahead",
+                              layer_role: "lookahead",
                             });
                             window.location.assign(payload.href);
                             return;
                           }
-                          const promoted = await promoteBufferedPolicy(usePreservedLookahead);
+                          const promoted = await promoteLookahead();
                           if (!promoted) {
                             reportArenaAnomaly("arena_promotion_failed", {
                               interaction_id: interactionId,
                               pair_href: payload.href,
-                              layer_role: usePreservedLookahead ? "preserved_lookahead" : "lookahead",
+                              layer_role: "lookahead",
                             });
                             window.location.assign(payload.href);
+                            return;
                           }
+                          await rewarmPreparedArena();
                         } catch (error) {
                           console.error(error);
                           window.location.reload();
@@ -1312,13 +1177,9 @@ pub(super) fn script_block() -> Markup {
                           cache: "no-store",
                           headers: telemetryHeaders(interactionId, { Accept: "application/json" }),
                         });
-                        if (!response.ok) {
-                          throw new Error(`arena action failed: ${response.status}`);
-                        }
-                        const payload = await response.json();
+                        const payload = await resolveArenaActionPayload(response, form.action);
                         if (epoch !== preparedEpoch) return;
-                        if (payload?.empty || !payload?.href || !payload?.html) {
-                          window.location.assign(payload?.href || form.action);
+                        if (!payload) {
                           return;
                         }
                         if (advancePolicy === "refresh-current") {
@@ -1352,7 +1213,9 @@ pub(super) fn script_block() -> Markup {
                             layer_role: "lookahead",
                           });
                           window.location.assign(payload.href);
+                          return;
                         }
+                        await rewarmPreparedArena();
                       } catch (error) {
                         console.error(error);
                         window.location.reload();
@@ -1402,7 +1265,7 @@ pub(super) fn script_block() -> Markup {
                   });
 
                   window.addEventListener("resize", () => {
-                    for (const layer of [currentLayer, lookaheadLayer, preservedLookaheadLayer]) {
+                    for (const layer of [currentLayer, lookaheadLayer]) {
                       applyArenaSplit(layer);
                       for (const image of layerImages(layer)) fitArenaImage(image);
                     }
@@ -1410,7 +1273,6 @@ pub(super) fn script_block() -> Markup {
 
                   if (salvagePreparedCurrent()) {
                     void refillLookaheadFromReserve();
-                    void refillPreservedLookaheadFromReserve();
                   }
 
                   if (!layerImages(currentLayer).length) {
@@ -1428,7 +1290,6 @@ pub(super) fn script_block() -> Markup {
                       return;
                     }
                     void bootLookahead();
-                    void bootPreservedLookahead();
                   });
                 })();
                 "#,

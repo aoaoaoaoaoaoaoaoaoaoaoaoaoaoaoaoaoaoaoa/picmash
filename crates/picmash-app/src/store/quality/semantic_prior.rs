@@ -41,7 +41,7 @@ impl SemanticPriorBasis {
         let centered = DMatrix::from_fn(samples.len(), dim, |row, column| {
             data[(row, column)] - mean[column]
         });
-        let decomposition = centered.clone().svd(false, true);
+        let decomposition = centered.svd(false, true);
         let basis = decomposition.v_t?;
         let axis_count = LATENT_DIM
             .min(dim)
@@ -76,13 +76,13 @@ impl SemanticPriorBasis {
             .zip(self.mean.iter())
             .map(|(value, mean)| value - mean)
             .collect::<Vec<_>>();
-        for axis in 0..self.axes.len() {
+        for (axis, slot) in projected.iter_mut().enumerate().take(self.axes.len()) {
             let numerator = self.axes[axis]
                 .iter()
                 .zip(centered.iter())
                 .map(|(weight, value)| weight * value)
                 .sum::<f32>();
-            projected[axis] = (numerator / self.scales[axis]) * SEMANTIC_PRIOR_SCALE;
+            *slot = (numerator / self.scales[axis]) * SEMANTIC_PRIOR_SCALE;
         }
         projected
     }
