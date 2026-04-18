@@ -101,6 +101,13 @@ pub fn router(state: SharedRuntimeState) -> Router {
         .route("/__status", get(runtime_status))
         .route("/api/client-event", post(client_event))
         .route("/__frontend/picmash-client.js", get(frontend_javascript))
+        .route("/__frontend/api.js", get(frontend_api_javascript))
+        .route("/__frontend/explore.js", get(frontend_explore_javascript))
+        .route(
+            "/__frontend/media-frame.js",
+            get(frontend_media_frame_javascript),
+        )
+        .route("/__frontend/triad.js", get(frontend_triad_javascript))
         .route("/__frontend/picmash-client.css", get(frontend_stylesheet))
         .route("/arena", get(arena_root))
         .route("/arena/reroll", get(arena_reroll))
@@ -178,7 +185,11 @@ pub fn router(state: SharedRuntimeState) -> Router {
 
 static SITE_LOAD_LOGGED: AtomicBool = AtomicBool::new(false);
 const FAVICON_SVG: &str = include_str!("../assets/favicon.svg");
-const FRONTEND_JS: &str = include_str!("../assets/web/picmash-client.js");
+const FRONTEND_JS: &str = include_str!("../assets/web/main.js");
+const FRONTEND_API_JS: &str = include_str!("../assets/web/api.js");
+const FRONTEND_EXPLORE_JS: &str = include_str!("../assets/web/explore.js");
+const FRONTEND_MEDIA_FRAME_JS: &str = include_str!("../assets/web/media-frame.js");
+const FRONTEND_TRIAD_JS: &str = include_str!("../assets/web/triad.js");
 const FRONTEND_CSS: &str = concat!(
     include_str!("../assets/picmash.css"),
     "\n",

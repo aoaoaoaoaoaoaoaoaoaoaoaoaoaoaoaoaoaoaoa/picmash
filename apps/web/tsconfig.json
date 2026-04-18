@@ -2,15 +2,19 @@
   "compilerOptions": {
     "target": "ES2022",
     "useDefineForClassFields": true,
-    "module": "ESNext",
+    "module": "ES2022",
     "moduleResolution": "Bundler",
     "strict": true,
     "allowJs": false,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": true,
+    "rootDir": "src",
+    "outDir": "../../crates/picmash-app/assets/web",
+    "declaration": false,
+    "sourceMap": false,
+    "noEmit": false,
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
-    "types": ["vite/client"]
+    "types": []
   },
-  "include": ["src"]
+  "include": ["src/**/*.ts"]
 }

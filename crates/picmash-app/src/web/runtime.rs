@@ -31,8 +31,28 @@ pub(super) async fn client_event(
 }
 
 pub(super) async fn frontend_javascript() -> Response {
+    frontend_module_response(FRONTEND_JS)
+}
+
+pub(super) async fn frontend_api_javascript() -> Response {
+    frontend_module_response(FRONTEND_API_JS)
+}
+
+pub(super) async fn frontend_explore_javascript() -> Response {
+    frontend_module_response(FRONTEND_EXPLORE_JS)
+}
+
+pub(super) async fn frontend_media_frame_javascript() -> Response {
+    frontend_module_response(FRONTEND_MEDIA_FRAME_JS)
+}
+
+pub(super) async fn frontend_triad_javascript() -> Response {
+    frontend_module_response(FRONTEND_TRIAD_JS)
+}
+
+fn frontend_module_response(source: &'static str) -> Response {
     cached_text_response(
-        FRONTEND_JS,
+        source,
         HeaderValue::from_static("text/javascript; charset=utf-8"),
     )
 }
