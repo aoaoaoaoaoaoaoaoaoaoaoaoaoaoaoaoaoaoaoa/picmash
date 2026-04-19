@@ -397,7 +397,7 @@ pub(super) fn script_block() -> Markup {
 
                   const PREFETCH_DEPTH = 5;
                   const PREFETCH_RESERVE_DEPTH = Math.max(0, PREFETCH_DEPTH - 1);
-                  const TRANSITION_MS = 140;
+                  const TRANSITION_MS = 160;
                   const normalizeTurns = (value) => ((Number(value) || 0) % 4 + 4) % 4;
                   let currentLayer = arenaShell.querySelector(".arena-stage-layer.is-current");
                   let lookaheadLayer = arenaShell.querySelector(".arena-stage-layer.is-lookahead");
@@ -724,7 +724,7 @@ pub(super) fn script_block() -> Markup {
                     }
                   };
 
-                  const transplantSettledArenaImages = (sourceLayer, stage) => {
+                  const transplantSettledArenaImages = (targetLayer, sourceLayer, stage) => {
                     const sourceImages = layerImages(sourceLayer);
                     const stageImages = Array.from(
                       stage?.querySelectorAll(".vote-surface .arena-image") ?? [],
@@ -735,9 +735,12 @@ pub(super) fn script_block() -> Markup {
                       const stageImage = stageImages[index];
                       if (!sameArenaImageIdentity(sourceImage, stageImage)) continue;
                       if (!sourceImage.complete || sourceImage.naturalWidth <= 0) continue;
-                      sourceImage.dataset.settled = "1";
-                      sourceImage.classList.add("is-ready");
-                      stageImage.replaceWith(sourceImage);
+                      const preservedImage =
+                        sourceLayer === targetLayer ? sourceImage : sourceImage.cloneNode(true);
+                      preservedImage.dataset.settled = "1";
+                      preservedImage.dataset.failed = "";
+                      preservedImage.classList.add("is-ready");
+                      stageImage.replaceWith(preservedImage);
                     }
                   };
 
@@ -751,7 +754,7 @@ pub(super) fn script_block() -> Markup {
                       });
                       return false;
                     }
-                    transplantSettledArenaImages(options.preserveImagesFromLayer, stage);
+                    transplantSettledArenaImages(layer, options.preserveImagesFromLayer, stage);
                     layer.replaceChildren(stage);
                     setLayerMetadata(layer, payload);
                     stampLayerForms(layer);
@@ -1016,6 +1019,23 @@ pub(super) fn script_block() -> Markup {
                     }
                   };
 
+                  const waitForOpacityTransition = (layer) =>
+                    new Promise((resolve) => {
+                      let done = false;
+                      const finish = () => {
+                        if (done) return;
+                        done = true;
+                        layer?.removeEventListener("transitionend", onTransitionEnd);
+                        window.clearTimeout(fallback);
+                        resolve();
+                      };
+                      const onTransitionEnd = (event) => {
+                        if (event.target === layer && event.propertyName === "opacity") finish();
+                      };
+                      const fallback = window.setTimeout(finish, TRANSITION_MS + 80);
+                      layer?.addEventListener("transitionend", onTransitionEnd);
+                    });
+
                   const promoteLookahead = async () => {
                     const outgoing = currentLayer;
                     if (!lookaheadReady || !lookaheadLayer?.dataset.href) return false;
@@ -1028,13 +1048,15 @@ pub(super) fn script_block() -> Markup {
                     isTransitioning = true;
                     arenaShell.classList.add("is-transitioning");
                     const incoming = lookaheadLayer;
-                    incoming.classList.remove("is-hidden", "is-lookahead");
+                    incoming.classList.remove("is-hidden", "is-lookahead", "is-exiting");
+                    incoming.classList.add("is-entering");
                     incoming.setAttribute("aria-hidden", "false");
+                    incoming.offsetWidth;
                     requestAnimationFrame(() => {
                       outgoing.classList.add("is-exiting");
-                      incoming.classList.add("is-entering");
+                      incoming.classList.remove("is-entering");
                     });
-                    await new Promise((resolve) => window.setTimeout(resolve, TRANSITION_MS));
+                    await waitForOpacityTransition(outgoing);
                     outgoing.classList.remove(
                       "is-current",
                       "is-exiting",
