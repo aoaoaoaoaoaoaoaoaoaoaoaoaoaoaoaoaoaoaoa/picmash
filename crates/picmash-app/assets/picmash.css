@@ -390,16 +390,14 @@ details.rail-menu > .menu-panel {
 }
 .arena-stage-layer.is-exiting {
   opacity: 0;
-  transition: opacity 200ms linear;
+  transition: opacity 120ms linear;
   pointer-events: none;
 }
 .arena-stage-layer.is-entering {
   opacity: 1;
   visibility: visible;
   pointer-events: none;
-  transition:
-    opacity 200ms linear 100ms,
-    visibility 0ms linear 0ms;
+  transition: opacity 120ms linear;
 }
 .arena-stage-layer.is-current {
   opacity: 1;

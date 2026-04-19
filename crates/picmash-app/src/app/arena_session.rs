@@ -155,8 +155,9 @@ impl ArenaTurn {
         }
     }
 
-    fn activate_at(&mut self, revision: ArenaRevision) {
+    fn activate_at(&mut self, revision: ArenaRevision, sampler_epoch: ArenaSamplerEpoch) {
         self.revision = revision;
+        self.sampler_epoch = sampler_epoch;
     }
 
     #[must_use]
@@ -340,20 +341,16 @@ pub enum SamplerInvalidation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ArenaCommandAdvance {
     Preserve,
+    Flush,
     Reset,
-}
-
-impl ArenaCommandAdvance {
-    fn reset() -> Self {
-        Self::Reset
-    }
 }
 
 impl From<PipelineDisposition> for ArenaCommandAdvance {
     fn from(disposition: PipelineDisposition) -> Self {
         match disposition {
             PipelineDisposition::Preserve => Self::Preserve,
-            PipelineDisposition::Reset => Self::reset(),
+            PipelineDisposition::Flush => Self::Flush,
+            PipelineDisposition::Reset => Self::Reset,
         }
     }
 }
@@ -401,30 +398,44 @@ impl ArenaSessionRuntime {
     fn advance_revision(&mut self) {
         self.revision = self.revision.next();
         if let Some(current) = &mut self.current {
-            current.activate_at(self.revision);
+            current.activate_at(self.revision, self.sampler_epoch);
         }
         for turn in &mut self.pipeline {
-            turn.activate_at(self.revision);
+            turn.activate_at(self.revision, self.sampler_epoch);
         }
     }
 
     fn install_current(&mut self, mut turn: ArenaTurn) {
-        turn.activate_at(self.revision);
+        turn.activate_at(self.revision, self.sampler_epoch);
         self.current = Some(turn);
+    }
+
+    fn flush_sampler(&mut self) {
+        self.sampler_epoch = self.sampler_epoch.next();
+        self.revision = self.revision.next();
+        if let Some(current) = &mut self.current {
+            current.activate_at(self.revision, self.sampler_epoch);
+        }
+        self.pipeline.clear();
     }
 
     fn reset_to(&mut self, turn: Option<ArenaTurn>) {
         self.advance_revision();
         self.pipeline.clear();
         self.current = turn.map(|mut turn| {
-            turn.activate_at(self.revision);
+            turn.activate_at(self.revision, self.sampler_epoch);
             turn
         });
     }
 
+    fn reset_sampler_to(&mut self, turn: Option<ArenaTurn>) {
+        self.sampler_epoch = self.sampler_epoch.next();
+        self.reset_to(turn);
+    }
+
     fn promote_pipeline(&mut self) -> Option<ArenaTurn> {
         let mut turn = self.pipeline.pop_front()?;
-        turn.activate_at(self.revision);
+        turn.activate_at(self.revision, self.sampler_epoch);
         self.current = Some(turn.clone());
         Some(turn)
     }
@@ -600,14 +611,17 @@ impl AppState {
                     runtime.current = turn;
                 }
             }
+            ArenaCommandAdvance::Flush => {
+                runtime.flush_sampler();
+            }
             ArenaCommandAdvance::Reset => {
                 let turn = self.sample_arena_turn(
                     runtime.revision().next(),
-                    runtime.sampler_epoch(),
+                    runtime.sampler_epoch().next(),
                     &HashSet::new(),
                     LockExhaustionPolicy::ClearAndRetry,
                 )?;
-                runtime.reset_to(turn);
+                runtime.reset_sampler_to(turn);
             }
         }
 

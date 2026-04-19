@@ -397,7 +397,7 @@ pub(super) fn script_block() -> Markup {
 
                   const PREFETCH_DEPTH = 5;
                   const PREFETCH_RESERVE_DEPTH = Math.max(0, PREFETCH_DEPTH - 1);
-                  const TRANSITION_MS = 300;
+                  const TRANSITION_MS = 140;
                   const normalizeTurns = (value) => ((Number(value) || 0) % 4 + 4) % 4;
                   let currentLayer = arenaShell.querySelector(".arena-stage-layer.is-current");
                   let lookaheadLayer = arenaShell.querySelector(".arena-stage-layer.is-lookahead");

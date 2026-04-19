@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn locking_subsource_preserves_the_current_pair() {
+    fn locking_subsource_command_flushes_pipeline_without_rerolling_current_pair() {
         let _guard = test_guard();
         let root = test_root("subsource-lock-current-pair");
         let corpus_root = root.join("corpus");
@@ -1285,11 +1285,10 @@ mod tests {
             .refresh_external_sources_if_due(true)
             .expect("harvest local-directory source");
 
-        let current_target = state.arena_target().expect("arena target before lock");
-        let RedirectTarget::ArenaPair { left, right } = current_target else {
-            panic!("expected arena pair before lock");
-        };
-        let remote_handle = match (&left, &right) {
+        let page = state.arena_page_state(None).expect("arena page state");
+        let current = page.current.expect("current turn before lock");
+        let old_epoch = current.sampler_epoch();
+        let remote_handle = match (&current.pair().left, &current.pair().right) {
             (ArenaHandle::Local(_), ArenaHandle::Remote(item_id))
             | (ArenaHandle::Remote(item_id), ArenaHandle::Local(_)) => {
                 ArenaHandle::Remote(*item_id)
@@ -1297,23 +1296,38 @@ mod tests {
             _ => panic!("expected local-vs-remote pair before lock"),
         };
 
-        let locked_target = state
-            .set_external_subsource_lock_for_handle(&remote_handle, true, &left, &right)
-            .expect("lock current remote subsource");
-        let RedirectTarget::ArenaPair {
-            left: locked_left,
-            right: locked_right,
-        } = locked_target
-        else {
-            panic!("expected same-pair redirect after lock");
-        };
+        let outcome = state
+            .apply_arena_command(ArenaCommand::LockThread {
+                command_id: ArenaCommandId::forge(),
+                expected_revision: current.revision(),
+                expected_sampler_epoch: current.sampler_epoch(),
+                turn_id: current.id().clone(),
+                action_token: current.action_token().clone(),
+                handle: remote_handle,
+                active: true,
+            })
+            .expect("lock current remote subsource through command");
+        assert_eq!(outcome.status, ArenaCommandStatus::Applied);
+        let locked = outcome.current.expect("current turn after lock");
         assert_eq!(
-            locked_left, left,
+            locked.id(),
+            current.id(),
+            "locking should preserve the active turn id"
+        );
+        assert_eq!(
+            &locked.pair().left,
+            &current.pair().left,
             "locking should not advance the left handle"
         );
         assert_eq!(
-            locked_right, right,
+            &locked.pair().right,
+            &current.pair().right,
             "locking should not advance the right handle"
+        );
+        assert_eq!(
+            locked.sampler_epoch().0,
+            old_epoch.0 + 1,
+            "locking is an immediate sampler transition"
         );
         assert!(
             state
@@ -1323,6 +1337,22 @@ mod tests {
                 .expect("reload subsource lock")
                 .is_some(),
             "locking should persist the session subsource lock"
+        );
+
+        let post_lock_vote = state
+            .apply_arena_command(ArenaCommand::Vote {
+                command_id: ArenaCommandId::forge(),
+                expected_revision: locked.revision(),
+                expected_sampler_epoch: locked.sampler_epoch(),
+                turn_id: locked.id().clone(),
+                action_token: locked.action_token().clone(),
+                winner: locked.pair().left.clone(),
+            })
+            .expect("vote preserved current after lock");
+        assert_eq!(
+            post_lock_vote.status,
+            ArenaCommandStatus::Applied,
+            "the preserved turn should remain commandable in its new sampler epoch"
         );
     }
 

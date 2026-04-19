@@ -50,7 +50,7 @@ impl ArenaScope {
             (Self::LockedThread(current), Lock(thread)) if *current == thread => {
                 ArenaScopeTransition::preserve(self.clone(), ScopeWrite::Preserve)
             }
-            (Self::Global | Self::LockedThread(_), Lock(thread)) => ArenaScopeTransition::reset(
+            (Self::Global | Self::LockedThread(_), Lock(thread)) => ArenaScopeTransition::flush(
                 Self::LockedThread(thread.clone()),
                 ScopeWrite::Set(thread),
             ),
@@ -58,7 +58,7 @@ impl ArenaScope {
                 ArenaScopeTransition::preserve(Self::Global, ScopeWrite::Preserve)
             }
             (Self::LockedThread(_), Unlock) => {
-                ArenaScopeTransition::reset(Self::Global, ScopeWrite::Clear)
+                ArenaScopeTransition::flush(Self::Global, ScopeWrite::Clear)
             }
             (Self::Global, Veto(_)) => {
                 ArenaScopeTransition::reset(Self::Global, ScopeWrite::Preserve)
@@ -91,6 +91,7 @@ pub(super) enum ArenaScopeAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PipelineDisposition {
     Preserve,
+    Flush,
     Reset,
 }
 
@@ -113,6 +114,14 @@ impl ArenaScopeTransition {
         Self {
             next_scope,
             pipeline: PipelineDisposition::Preserve,
+            write,
+        }
+    }
+
+    fn flush(next_scope: ArenaScope, write: ScopeWrite) -> Self {
+        Self {
+            next_scope,
+            pipeline: PipelineDisposition::Flush,
             write,
         }
     }
@@ -166,14 +175,14 @@ mod tests {
 
         assert_eq!(
             ArenaScope::Global.reduce(ArenaScopeAction::Lock(a.clone())),
-            ArenaScopeTransition::reset(
+            ArenaScopeTransition::flush(
                 ArenaScope::LockedThread(a.clone()),
                 ScopeWrite::Set(a.clone()),
             )
         );
         assert_eq!(
             ArenaScope::LockedThread(a.clone()).reduce(ArenaScopeAction::Unlock),
-            ArenaScopeTransition::reset(ArenaScope::Global, ScopeWrite::Clear)
+            ArenaScopeTransition::flush(ArenaScope::Global, ScopeWrite::Clear)
         );
         assert_eq!(
             ArenaScope::Global.reduce(ArenaScopeAction::Unlock),
@@ -200,7 +209,7 @@ mod tests {
         );
         assert_eq!(
             ArenaScope::LockedThread(a).reduce(ArenaScopeAction::Lock(b.clone())),
-            ArenaScopeTransition::reset(ArenaScope::LockedThread(b.clone()), ScopeWrite::Set(b),)
+            ArenaScopeTransition::flush(ArenaScope::LockedThread(b.clone()), ScopeWrite::Set(b),)
         );
     }
 }
