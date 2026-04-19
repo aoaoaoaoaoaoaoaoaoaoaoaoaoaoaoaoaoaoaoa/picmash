@@ -406,6 +406,13 @@ details.rail-menu > .menu-panel {
   opacity: 1;
   visibility: visible;
 }
+.arena-stage-layer:not(.is-visual-ready) .arena-stage {
+  opacity: 0;
+  pointer-events: none;
+}
+.arena-stage-layer.is-visual-ready .arena-stage {
+  opacity: 1;
+}
 .arena-stage-shell.is-transitioning .frame-tools,
 .arena-stage-shell.is-transitioning .vote-surface {
   pointer-events: none;
