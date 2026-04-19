@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -22,6 +23,7 @@ struct CacheEntry {
     path: PathBuf,
     bytes: u64,
     last_used: SystemTime,
+    protected: bool,
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +51,7 @@ impl AppState {
     }
 
     pub fn prune_disk_caches(&self) -> anyhow::Result<()> {
+        let empty = HashSet::new();
         let renditions = prune_cache_tree(
             "renditions",
             &self.cache_root,
@@ -56,7 +59,9 @@ impl AppState {
                 "PICMASH_RENDITION_CACHE_MAX_BYTES",
                 DEFAULT_RENDITION_CACHE_MAX_BYTES,
             ),
+            &empty,
         )?;
+        let source_retention_paths = self.read_store()?.active_external_source_cache_paths()?;
         let sources = prune_cache_tree(
             "sources",
             &self.source_cache_root,
@@ -64,6 +69,7 @@ impl AppState {
                 "PICMASH_SOURCE_CACHE_MAX_BYTES",
                 DEFAULT_SOURCE_CACHE_MAX_BYTES,
             ),
+            &source_retention_paths,
         )?;
         if !sources.removed_paths.is_empty() {
             let removed_paths = sources.removed_paths.clone();
@@ -95,7 +101,12 @@ fn prune_target_bytes(max_bytes: u64) -> u64 {
     max_bytes.saturating_mul(CACHE_PRUNE_TARGET_NUMERATOR) / CACHE_PRUNE_TARGET_DENOMINATOR
 }
 
-fn prune_cache_tree(label: &str, root: &Path, max_bytes: u64) -> anyhow::Result<CachePruneSummary> {
+fn prune_cache_tree(
+    label: &str,
+    root: &Path,
+    max_bytes: u64,
+    protected_paths: &HashSet<PathBuf>,
+) -> anyhow::Result<CachePruneSummary> {
     let target_bytes = prune_target_bytes(max_bytes);
     let mut summary = CachePruneSummary {
         max_bytes,
@@ -136,6 +147,7 @@ fn prune_cache_tree(label: &str, root: &Path, max_bytes: u64) -> anyhow::Result<
             path: entry.path().to_path_buf(),
             bytes,
             last_used,
+            protected: protected_paths.contains(entry.path()),
         });
     }
     summary.bytes_after = summary.bytes_before;
@@ -144,8 +156,9 @@ fn prune_cache_tree(label: &str, root: &Path, max_bytes: u64) -> anyhow::Result<
     }
 
     entries.sort_by(|lhs, rhs| {
-        lhs.last_used
-            .cmp(&rhs.last_used)
+        lhs.protected
+            .cmp(&rhs.protected)
+            .then_with(|| lhs.last_used.cmp(&rhs.last_used))
             .then_with(|| lhs.path.cmp(&rhs.path))
     });
     for entry in entries {
@@ -225,7 +238,7 @@ fn log_prune_summary(label: &str, root: &Path, summary: &CachePruneSummary) {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::HashSet, fs};
 
     use tempfile::TempDir;
 
@@ -242,7 +255,8 @@ mod tests {
         write_file(&root, "b.cache", 10);
         write_file(&root, "c.cache", 10);
 
-        let summary = prune_cache_tree("test", root.path(), 20).expect("prune cache");
+        let summary =
+            prune_cache_tree("test", root.path(), 20, &HashSet::new()).expect("prune cache");
 
         assert_eq!(summary.bytes_before, 30);
         assert!(summary.bytes_after <= 18);
@@ -256,10 +270,31 @@ mod tests {
         write_file(&root, ".tmp-active", 100);
         write_file(&root, "stable.cache", 100);
 
-        let summary = prune_cache_tree("test", root.path(), 10).expect("prune cache");
+        let summary =
+            prune_cache_tree("test", root.path(), 10, &HashSet::new()).expect("prune cache");
 
         assert_eq!(summary.bytes_before, 100);
         assert_eq!(summary.files_removed, 1);
         assert!(root.path().join(".tmp-active").exists());
+    }
+
+    #[test]
+    fn prune_cache_tree_spares_protected_paths_first() {
+        let root = TempDir::new().expect("tempdir");
+        let protected = root.path().join("live.cache");
+        let dead_one = root.path().join("dead-a.cache");
+        let dead_two = root.path().join("dead-b.cache");
+        write_file(&root, "live.cache", 10);
+        write_file(&root, "dead-a.cache", 10);
+        write_file(&root, "dead-b.cache", 10);
+
+        let summary =
+            prune_cache_tree("test", root.path(), 20, &HashSet::from([protected.clone()]))
+                .expect("prune cache");
+
+        assert!(summary.bytes_after <= 18);
+        assert!(protected.exists());
+        assert!(!dead_one.exists());
+        assert!(!dead_two.exists());
     }
 }

@@ -221,6 +221,28 @@ impl Store {
         Ok((total, by_stream))
     }
 
+    pub fn active_external_source_cache_paths(&self) -> anyhow::Result<HashSet<PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT DISTINCT i.cached_path
+            FROM external_items i
+            JOIN external_streams s ON s.id = i.stream_id
+            WHERE s.active = 1
+              AND s.blocked = 0
+              AND i.hidden = 0
+              AND i.resolved_asset_id IS NULL
+              AND i.imported_asset_id IS NULL
+              AND i.cached_path IS NOT NULL
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut paths = HashSet::new();
+        for row in rows {
+            paths.insert(PathBuf::from(row?));
+        }
+        Ok(paths)
+    }
+
     pub fn retire_missing_external_streams(
         &self,
         source_key: &str,

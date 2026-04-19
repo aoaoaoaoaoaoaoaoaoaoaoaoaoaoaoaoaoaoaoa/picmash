@@ -1085,6 +1085,13 @@ pub(super) fn script_block() -> Markup {
                     return seeded;
                   };
 
+                  const preparedLayerMatchesPayload = (layer, payload) => (
+                    !!payload &&
+                    !!layer?.dataset.href &&
+                    layer.dataset.href === payload.href &&
+                    layer.dataset.turnId === payload.turnId
+                  );
+
                   const salvagePreparedCurrent = () => {
                     if (layerImages(currentLayer).length) return false;
                     if (!lookaheadLayer?.dataset.href || !layerImages(lookaheadLayer).length) {
@@ -1195,18 +1202,19 @@ pub(super) fn script_block() -> Markup {
                         });
                         sendAction.catch(() => {});
                         try {
-                          const ready = await ensurePreparedLookahead();
-                          if (ready) {
+                          const prepared = ensurePreparedLookahead();
+                          const payload = await resolveArenaActionPayload(
+                            await sendAction,
+                            form.action,
+                          );
+                          if (!payload) {
+                            return;
+                          }
+                          const ready = await prepared;
+                          if (ready && preparedLayerMatchesPayload(lookaheadLayer, payload)) {
                             const promoted = await promoteLookahead();
                             if (!promoted) {
                               window.location.reload();
-                              return;
-                            }
-                            const payload = await resolveArenaActionPayload(
-                              await sendAction,
-                              form.action,
-                            );
-                            if (!payload) {
                               return;
                             }
                             if (!syncCurrentLayer(payload)) {
@@ -1217,13 +1225,6 @@ pub(super) fn script_block() -> Markup {
                               }
                             }
                             preservePreparedArenaSoon();
-                            return;
-                          }
-                          const payload = await resolveArenaActionPayload(
-                            await sendAction,
-                            form.action,
-                          );
-                          if (!payload) {
                             return;
                           }
                           const seeded = await seedAuthoritativeLayer(payload);

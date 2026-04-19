@@ -254,6 +254,7 @@ impl AppState {
                 })?;
             }
         }
+        self.prune_disk_caches()?;
         Ok(())
     }
 
