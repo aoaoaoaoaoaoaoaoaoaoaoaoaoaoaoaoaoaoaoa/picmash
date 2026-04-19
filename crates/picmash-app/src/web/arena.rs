@@ -757,7 +757,7 @@ fn arena_panel(
                     input type="hidden" name="active" value="true";
                     (tool_button(ImageToolKind::Heart, false, hearted))
                 }
-                form.arena-hide-form data-arena-advance="authoritative" action=(format!("{pair_href}/hide")) method="post" {
+                form.arena-hide-form data-arena-advance="buffered" action=(format!("{pair_href}/hide")) method="post" {
                     (arena_command_inputs(turn))
                     input type="hidden" name="asset_id" value=(handle.slug());
                     input type="hidden" name="hide" value=(if arena_card_hidden(card) { "false" } else { "true" });
