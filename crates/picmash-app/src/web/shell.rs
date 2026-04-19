@@ -405,8 +405,10 @@ pub(super) fn script_block() -> Markup {
                   let preparedEpoch = 0;
                   let queuedLookaheadPayloads = [];
                   let queuedLookaheadRequest = null;
+                  let lookaheadRefillRequest = null;
                   let isTransitioning = false;
                   let isActionPending = false;
+                  let queuedArenaShortcut = null;
                   const telemetry = window.__picmashTelemetry || null;
 
                   const layerStage = (layer) => layer?.querySelector(".arena-stage") ?? null;
@@ -458,6 +460,8 @@ pub(super) fn script_block() -> Markup {
                       : [];
                   const payloadTurnId = (payload) =>
                     typeof payload?.turnId === "string" ? payload.turnId : "";
+                  const currentRevision = () => currentLayer?.dataset.arenaRevision || "";
+                  const currentSamplerEpoch = () => currentLayer?.dataset.arenaSamplerEpoch || "";
                   const layerTurnId = (layer) => layer?.dataset.turnId || "";
                   const collectKnownTurnIds = () => {
                     const known = new Set();
@@ -698,6 +702,28 @@ pub(super) fn script_block() -> Markup {
                     return true;
                   };
 
+                  const retargetPayloadToCurrent = (payload) => {
+                    if (!payload || payload.empty) return payload;
+                    const revision = currentRevision();
+                    const samplerEpoch = currentSamplerEpoch();
+                    if (revision) payload.revision = Number(revision);
+                    if (samplerEpoch) payload.samplerEpoch = Number(samplerEpoch);
+                    return payload;
+                  };
+
+                  const retargetPreparedArenaToCurrent = () => {
+                    if (lookaheadLayer?.dataset.href) {
+                      const revision = currentRevision();
+                      const samplerEpoch = currentSamplerEpoch();
+                      if (revision) lookaheadLayer.dataset.arenaRevision = revision;
+                      if (samplerEpoch) lookaheadLayer.dataset.arenaSamplerEpoch = samplerEpoch;
+                      stampLayerForms(lookaheadLayer);
+                    }
+                    for (const payload of queuedLookaheadPayloads) {
+                      retargetPayloadToCurrent(payload);
+                    }
+                  };
+
                   const transplantSettledArenaImages = (sourceLayer, stage) => {
                     const sourceImages = layerImages(sourceLayer);
                     const stageImages = Array.from(
@@ -752,7 +778,7 @@ pub(super) fn script_block() -> Markup {
                       "",
                       currentLayer.dataset.href || window.location.pathname,
                     );
-                    void refillLookaheadFromReserve();
+                    void refillLookaheadFromReserveOnce();
                     return true;
                   };
 
@@ -772,13 +798,37 @@ pub(super) fn script_block() -> Markup {
                     lookaheadReady = false;
                     queuedLookaheadPayloads = [];
                     queuedLookaheadRequest = null;
+                    lookaheadRefillRequest = null;
                     clearPreparedLayer(lookaheadLayer);
                     return preparedEpoch;
                   };
 
                   const rewarmPreparedArena = async () => {
                     invalidatePreparedArena();
-                    await refillLookaheadFromReserve();
+                    await refillLookaheadFromReserveOnce();
+                  };
+
+                  const drainQueuedArenaShortcut = () => {
+                    if (isTransitioning || isActionPending || !queuedArenaShortcut) return;
+                    const submitShortcut = queuedArenaShortcut;
+                    queuedArenaShortcut = null;
+                    submitShortcut();
+                  };
+
+                  const releaseArenaAction = () => {
+                    isActionPending = false;
+                    window.setTimeout(drainQueuedArenaShortcut, 0);
+                  };
+
+                  const rewarmPreparedArenaSoon = () => {
+                    void rewarmPreparedArena().finally(drainQueuedArenaShortcut);
+                  };
+
+                  const preservePreparedArenaSoon = () => {
+                    retargetPreparedArenaToCurrent();
+                    if (!queuedArenaShortcut) {
+                      void refillLookaheadFromReserveOnce().finally(drainQueuedArenaShortcut);
+                    }
                   };
 
                   const fetchArenaPayload = async (url, interactionId) => {
@@ -825,7 +875,7 @@ pub(super) fn script_block() -> Markup {
                         clearPreparedLayer(lookaheadLayer);
                         return;
                       }
-                      const seeded = await seedPreparedLayer(lookaheadLayer, payload, {
+                      const seeded = await seedPreparedLayer(lookaheadLayer, retargetPayloadToCurrent(payload), {
                         interactionId,
                       });
                       if (epoch !== preparedEpoch) return;
@@ -859,7 +909,7 @@ pub(super) fn script_block() -> Markup {
                         );
                         if (epoch !== preparedEpoch) return;
                         if (!payload) return;
-                        queuedLookaheadPayloads.push(payload);
+                        queuedLookaheadPayloads.push(retargetPayloadToCurrent(payload));
                       }
                     })()
                       .catch((error) => {
@@ -881,7 +931,7 @@ pub(super) fn script_block() -> Markup {
                     while (queuedLookaheadPayloads.length) {
                       const payload = queuedLookaheadPayloads.shift();
                       if (!payload) break;
-                      const seeded = await seedPreparedLayer(lookaheadLayer, payload);
+                      const seeded = await seedPreparedLayer(lookaheadLayer, retargetPayloadToCurrent(payload));
                       if (epoch !== preparedEpoch) return;
                       if (seeded) {
                         lookaheadReady = true;
@@ -895,9 +945,26 @@ pub(super) fn script_block() -> Markup {
                     void queueLookaheadReserve();
                   };
 
+                  const refillLookaheadFromReserveOnce = async () => {
+                    const epoch = preparedEpoch;
+                    if (lookaheadRefillRequest?.epoch === epoch) {
+                      await lookaheadRefillRequest.promise;
+                      return;
+                    }
+                    let request;
+                    const promise = refillLookaheadFromReserve().finally(() => {
+                      if (lookaheadRefillRequest === request) {
+                        lookaheadRefillRequest = null;
+                      }
+                    });
+                    request = { epoch, promise };
+                    lookaheadRefillRequest = request;
+                    await promise;
+                  };
+
                   const ensurePreparedLookahead = async () => {
                     if (lookaheadReady && lookaheadLayer?.dataset.href) return true;
-                    await refillLookaheadFromReserve();
+                    await refillLookaheadFromReserveOnce();
                     return !!(lookaheadReady && lookaheadLayer?.dataset.href);
                   };
 
@@ -981,7 +1048,7 @@ pub(super) fn script_block() -> Markup {
                     currentLayer = incoming;
                     lookaheadLayer = outgoing;
                     lookaheadReady = false;
-                    if (!isActionPending) void refillLookaheadFromReserve();
+                    if (!isActionPending) void refillLookaheadFromReserveOnce();
                     history.replaceState(null, "", currentLayer.dataset.href || window.location.pathname);
                     arenaShell.classList.remove("is-transitioning");
                     isTransitioning = false;
@@ -1127,7 +1194,7 @@ pub(super) fn script_block() -> Markup {
                                 return;
                               }
                             }
-                            await rewarmPreparedArena();
+                            preservePreparedArenaSoon();
                             return;
                           }
                           const payload = await resolveArenaActionPayload(
@@ -1157,12 +1224,12 @@ pub(super) fn script_block() -> Markup {
                             window.location.assign(payload.href);
                             return;
                           }
-                          await rewarmPreparedArena();
+                          preservePreparedArenaSoon();
                         } catch (error) {
                           console.error(error);
                           window.location.reload();
                         } finally {
-                          isActionPending = false;
+                          releaseArenaAction();
                         }
                         return;
                       }
@@ -1215,12 +1282,12 @@ pub(super) fn script_block() -> Markup {
                           window.location.assign(payload.href);
                           return;
                         }
-                        await rewarmPreparedArena();
+                        rewarmPreparedArenaSoon();
                       } catch (error) {
                         console.error(error);
                         window.location.reload();
                       } finally {
-                        isActionPending = false;
+                        releaseArenaAction();
                       }
                       return;
                     }
@@ -1254,7 +1321,10 @@ pub(super) fn script_block() -> Markup {
                     if (!submitShortcut) return;
                     event.preventDefault();
                     event.stopPropagation();
-                    if (isTransitioning || isActionPending) return;
+                    if (isTransitioning || isActionPending) {
+                      queuedArenaShortcut = submitShortcut;
+                      return;
+                    }
                     submitShortcut();
                   });
 
@@ -1266,7 +1336,7 @@ pub(super) fn script_block() -> Markup {
                   });
 
                   if (salvagePreparedCurrent()) {
-                    void refillLookaheadFromReserve();
+                    void refillLookaheadFromReserveOnce();
                   }
 
                   if (!layerImages(currentLayer).length) {
