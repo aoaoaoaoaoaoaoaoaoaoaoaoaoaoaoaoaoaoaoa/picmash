@@ -8,12 +8,10 @@ use ulid::Ulid;
 
 use crate::{
     identity::VisualKey,
-    model::{ArenaHandle, ArenaPair, ArenaView, AssetId, RemoteItemId},
+    model::{ArenaHandle, ArenaPair, ArenaView, RemoteItemId},
 };
 
-use super::{
-    AppState, LockExhaustionPolicy, PipelineDisposition, RedirectTarget, surviving_local_anchor,
-};
+use super::{AppState, LockExhaustionPolicy, PipelineDisposition, RedirectTarget};
 
 const ARENA_PIPELINE_LIMIT: usize = 6;
 const ARENA_COMMAND_REPLAY_LIMIT: usize = 512;
@@ -342,16 +340,12 @@ pub enum SamplerInvalidation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ArenaCommandAdvance {
     Preserve,
-    Reset { local_anchor: Option<AssetId> },
+    Reset,
 }
 
 impl ArenaCommandAdvance {
     fn reset() -> Self {
-        Self::Reset { local_anchor: None }
-    }
-
-    fn reset_preserving(local_anchor: Option<AssetId>) -> Self {
-        Self::Reset { local_anchor }
+        Self::Reset
     }
 }
 
@@ -594,6 +588,7 @@ impl AppState {
 
         match advance {
             ArenaCommandAdvance::Preserve => {
+                self.cull_dead_arena_pipeline(&mut runtime)?;
                 runtime.advance_revision();
                 if runtime.promote_pipeline().is_none() {
                     let turn = self.sample_arena_turn(
@@ -605,15 +600,14 @@ impl AppState {
                     runtime.current = turn;
                 }
             }
-            ArenaCommandAdvance::Reset { local_anchor } => {
-                let next_turn = self.sample_arena_turn_preserving_local_anchor(
+            ArenaCommandAdvance::Reset => {
+                let turn = self.sample_arena_turn(
                     runtime.revision().next(),
                     runtime.sampler_epoch(),
                     &HashSet::new(),
                     LockExhaustionPolicy::ClearAndRetry,
-                    local_anchor.as_ref(),
                 )?;
-                runtime.reset_to(next_turn);
+                runtime.reset_to(turn);
             }
         }
 
@@ -675,13 +669,7 @@ impl AppState {
                     &current_pair.left,
                     &current_pair.right,
                 )?;
-                Ok(match handle {
-                    ArenaHandle::Remote(_) => ArenaCommandAdvance::reset_preserving(
-                        surviving_local_anchor(handle, &current_pair.left, &current_pair.right)
-                            .cloned(),
-                    ),
-                    ArenaHandle::Local(_) => ArenaCommandAdvance::reset(),
-                })
+                Ok(ArenaCommandAdvance::Preserve)
             }
             ArenaCommand::LockThread { handle, active, .. } => {
                 ensure_pair_member(current_pair, handle, "locked handle")?;
@@ -761,24 +749,6 @@ impl AppState {
     ) -> anyhow::Result<Option<ArenaTurn>> {
         Ok(self
             .choose_next_pair(lock_exhaustion, excluded_visual_keys)?
-            .as_ref()
-            .map(|pair| ArenaTurn::forge(revision, sampler_epoch, pair)))
-    }
-
-    fn sample_arena_turn_preserving_local_anchor(
-        &self,
-        revision: ArenaRevision,
-        sampler_epoch: ArenaSamplerEpoch,
-        excluded_visual_keys: &HashSet<VisualKey>,
-        lock_exhaustion: LockExhaustionPolicy,
-        local_anchor: Option<&AssetId>,
-    ) -> anyhow::Result<Option<ArenaTurn>> {
-        Ok(self
-            .choose_next_pair_preserving_local_anchor(
-                local_anchor,
-                lock_exhaustion,
-                excluded_visual_keys,
-            )?
             .as_ref()
             .map(|pair| ArenaTurn::forge(revision, sampler_epoch, pair)))
     }

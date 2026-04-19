@@ -1612,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_remote_hide_command_retires_clicked_remote_before_reroll() {
+    fn arena_hide_command_promotes_issued_lookahead_after_retiring_clicked_remote() {
         let _guard = test_guard();
         let root = test_root("arena-command-remote-hide-retires");
         let corpus_root = root.join("corpus");
@@ -1629,6 +1629,7 @@ mod tests {
         solid_png(&corpus_root.join("seed-a.png"), [32, 48, 64]);
         solid_png(&corpus_root.join("seed-b.png"), [64, 48, 32]);
         solid_png(&source_root.join("remote-a.png"), [180, 40, 60]);
+        solid_png(&source_root.join("remote-b.png"), [40, 180, 60]);
 
         let mut config = app_config_with_source_mix(1.0);
         config.sources = vec![SourceConfig {
@@ -1664,12 +1665,12 @@ mod tests {
 
         let page = state.arena_page_state(None).expect("arena page state");
         let current = page.current.expect("current turn");
-        let (local_handle, remote_handle) = match (&current.pair().left, &current.pair().right) {
-            (ArenaHandle::Local(asset_id), ArenaHandle::Remote(item_id))
-            | (ArenaHandle::Remote(item_id), ArenaHandle::Local(asset_id)) => (
-                ArenaHandle::Local(asset_id.clone()),
-                ArenaHandle::Remote(*item_id),
-            ),
+        let lookahead = page.lookahead.expect("issued lookahead turn");
+        let remote_handle = match (&current.pair().left, &current.pair().right) {
+            (ArenaHandle::Local(_), ArenaHandle::Remote(item_id))
+            | (ArenaHandle::Remote(item_id), ArenaHandle::Local(_)) => {
+                ArenaHandle::Remote(*item_id)
+            }
             _ => panic!("expected a remote arena pair"),
         };
         let ArenaHandle::Remote(remote_item_id) = remote_handle else {
@@ -1702,14 +1703,12 @@ mod tests {
                 .current
                 .as_ref()
                 .is_none_or(|turn| !turn.pair().contains(&remote_handle)),
-            "the authoritative reroll must not return the just-rejected remote"
+            "hide must not promote a turn containing the just-rejected remote"
         );
-        assert!(
-            outcome
-                .current
-                .as_ref()
-                .is_none_or(|turn| turn.pair().contains(&local_handle)),
-            "remote hide should preserve the surviving local anchor while replacing the challenger"
+        assert_eq!(
+            outcome.current.as_ref().map(|turn| turn.id()),
+            Some(lookahead.id()),
+            "hide should consume the same issued pipeline as vote when the pipeline survives the hide effect"
         );
     }
 
