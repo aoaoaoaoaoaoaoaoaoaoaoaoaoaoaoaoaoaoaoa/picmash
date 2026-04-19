@@ -1233,35 +1233,29 @@ pub(super) fn script_block() -> Markup {
 
                   document.addEventListener("keydown", (event) => {
                     if (event.target && ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
-                    if (isTransitioning || isActionPending) return;
-                    const voteForms = currentVoteForms();
-                    const hideForms = currentHideForms();
-                    const vetoThreadForms = currentVetoThreadForms();
+                    let submitShortcut = null;
                     if (event.altKey) {
                       if (event.key === "1") {
-                        event.preventDefault();
-                        hideForms[0]?.requestSubmit();
-                        return;
+                        submitShortcut = () => currentHideForms()[0]?.requestSubmit();
                       }
                       if (event.key === "2") {
-                        event.preventDefault();
-                        hideForms[1]?.requestSubmit();
-                        return;
+                        submitShortcut = () => currentHideForms()[1]?.requestSubmit();
                       }
                       if (event.key === "3") {
-                        event.preventDefault();
-                        vetoThreadForms[0]?.requestSubmit();
-                        return;
+                        submitShortcut = () => currentVetoThreadForms()[0]?.requestSubmit();
                       }
                     }
-                    if (event.key === "1") {
-                      event.preventDefault();
-                      voteForms[0]?.requestSubmit();
+                    if (!event.altKey && event.key === "1") {
+                      submitShortcut = () => currentVoteForms()[0]?.requestSubmit();
                     }
-                    if (event.key === "2") {
-                      event.preventDefault();
-                      voteForms[1]?.requestSubmit();
+                    if (!event.altKey && event.key === "2") {
+                      submitShortcut = () => currentVoteForms()[1]?.requestSubmit();
                     }
+                    if (!submitShortcut) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (isTransitioning || isActionPending) return;
+                    submitShortcut();
                   });
 
                   window.addEventListener("resize", () => {
