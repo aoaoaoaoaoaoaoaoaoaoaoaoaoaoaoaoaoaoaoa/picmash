@@ -790,7 +790,7 @@ pub(super) fn script_block() -> Markup {
                     layer.dataset.arenaRevision = "";
                     layer.dataset.arenaSamplerEpoch = "";
                     layer.dataset.visualKeys = "";
-                    layer.classList.remove("is-visual-ready");
+                    layer.classList.remove("is-visual-ready", "is-incoming", "is-entering");
                     layer.replaceChildren();
                   };
 
@@ -1046,24 +1046,23 @@ pub(super) fn script_block() -> Markup {
                     isTransitioning = true;
                     arenaShell.classList.add("is-transitioning");
                     const incoming = lookaheadLayer;
-                    incoming.classList.remove("is-hidden", "is-lookahead", "is-exiting");
-                    incoming.classList.add("is-entering");
+                    incoming.classList.remove("is-hidden", "is-lookahead");
+                    incoming.classList.add("is-incoming", "is-entering");
                     incoming.setAttribute("aria-hidden", "false");
                     incoming.offsetWidth;
+                    const entered = waitForOpacityTransition(incoming);
                     requestAnimationFrame(() => {
-                      outgoing.classList.add("is-exiting");
                       incoming.classList.remove("is-entering");
                     });
-                    await waitForOpacityTransition(outgoing);
+                    await entered;
                     outgoing.classList.remove(
                       "is-current",
-                      "is-exiting",
                       "is-lookahead",
                     );
                     outgoing.classList.add("is-lookahead", "is-hidden");
                     outgoing.setAttribute("aria-hidden", "true");
                     clearPreparedLayer(outgoing);
-                    incoming.classList.remove("is-entering");
+                    incoming.classList.remove("is-incoming", "is-entering");
                     incoming.classList.add("is-current");
                     currentLayer = incoming;
                     lookaheadLayer = outgoing;
@@ -1094,8 +1093,8 @@ pub(super) fn script_block() -> Markup {
                     const outgoing = currentLayer;
                     outgoing.classList.remove(
                       "is-current",
+                      "is-incoming",
                       "is-entering",
-                      "is-exiting",
                       "is-lookahead",
                     );
                     outgoing.classList.add("is-lookahead", "is-hidden");
@@ -1103,8 +1102,8 @@ pub(super) fn script_block() -> Markup {
                     lookaheadLayer.classList.remove(
                       "is-hidden",
                       "is-lookahead",
+                      "is-incoming",
                       "is-entering",
-                      "is-exiting",
                     );
                     lookaheadLayer.classList.add("is-current");
                     lookaheadLayer.setAttribute("aria-hidden", "false");
