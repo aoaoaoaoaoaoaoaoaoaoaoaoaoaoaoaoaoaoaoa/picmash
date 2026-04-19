@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    io::Cursor,
-};
+use std::{collections::HashSet, env, io::Cursor};
 
 use image::{Rgb, RgbImage};
 use rusqlite::Connection;
@@ -1081,9 +1077,10 @@ fn hierarchical_quality_replay_rebuilds_derived_state_from_event_truth() {
     assert_eq!(restored_session.nudges, expected_session.nudges);
     assert_eq!(restored_session.hearts, expected_session.hearts);
     assert_eq!(
-        restored_offsets,
-        HashMap::from([(expected_left.id, expected_offset)])
+        restored_offsets.keys().collect::<HashSet<_>>(),
+        HashSet::from([&expected_left.id])
     );
+    assert_close(restored_offsets[&expected_left.id], expected_offset);
     assert_eq!(restored_hearts, HashSet::from([expected_right.id]));
     assert_slice_close(&restored_head.weights, &expected_head.weights);
 

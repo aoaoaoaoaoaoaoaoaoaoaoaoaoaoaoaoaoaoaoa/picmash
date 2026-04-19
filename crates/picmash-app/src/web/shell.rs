@@ -559,8 +559,7 @@ pub(super) fn script_block() -> Markup {
                     image.style.transform = `translate(-50%, -50%) rotate(${geometry.turns * 90}deg)`;
                   };
 
-                  const revealLayer = (layer, options = {}) => {
-                    const progressive = options.progressive === true;
+                  const revealLayer = (layer) => {
                     const images = layerImages(layer);
                     if (!images.length) {
                       return false;
@@ -573,7 +572,7 @@ pub(super) fn script_block() -> Markup {
                       return false;
                     }
                     const complete = settledImages.length === images.length;
-                    if (!progressive && !complete) {
+                    if (!complete) {
                       return false;
                     }
                     applyArenaSplit(layer);
@@ -581,13 +580,14 @@ pub(super) fn script_block() -> Markup {
                       fitArenaImage(image);
                       image.classList.add("is-ready");
                     }
-                    return complete || progressive;
+                    layer.classList.add("is-visual-ready");
+                    return true;
                   };
 
-                  const primeLayer = (layer, options = {}) => {
-                    const progressive = options.progressive === true;
+                  const primeLayer = (layer) => {
                     const images = layerImages(layer);
                     if (!layer || !images.length) return Promise.resolve(false);
+                    layer.classList.remove("is-visual-ready");
                     const pending = [];
                     for (const image of images) {
                       if (
@@ -605,7 +605,7 @@ pub(super) fn script_block() -> Markup {
                       pending.push(image);
                     }
                     if (!pending.length) {
-                      return Promise.resolve(revealLayer(layer, { progressive }));
+                      return Promise.resolve(revealLayer(layer));
                     }
                     return new Promise((resolve) => {
                       let remaining = pending.length;
@@ -615,15 +615,15 @@ pub(super) fn script_block() -> Markup {
                         image.dataset.failed = "";
                         image.dataset.settled = "1";
                         remaining -= 1;
-                        const revealed = revealLayer(layer, { progressive });
-                        if (remaining <= 0) resolve(progressive ? revealed : revealed && !failed);
+                        const revealed = revealLayer(layer);
+                        if (remaining <= 0) resolve(revealed && !failed);
                       };
                       const onError = (image) => {
                         if (image.dataset.settled === "1") return;
                         image.dataset.failed = "1";
                         image.dataset.settled = "1";
                         image.classList.remove("is-ready");
-                        revealLayer(layer, { progressive });
+                        layer.classList.remove("is-visual-ready");
                         reportArenaAnomaly("arena_image_error", {
                           layer_role: layerRole(layer),
                           image_src: image.currentSrc || image.getAttribute("src") || "",
@@ -758,16 +758,13 @@ pub(super) fn script_block() -> Markup {
                     layer.replaceChildren(stage);
                     setLayerMetadata(layer, payload);
                     stampLayerForms(layer);
-                    return primeLayer(layer, {
-                      progressive: options.progressive === true,
-                    });
+                    return primeLayer(layer);
                   };
 
                   const refreshCurrentLayer = async (payload) => {
                     if (!currentLayer || !payload?.href || !payload?.html) return false;
                     const refreshed = await seedPreparedLayer(currentLayer, payload, {
                       preserveImagesFromLayer: currentLayer,
-                      progressive: true,
                     });
                     if (!refreshed) {
                       reportArenaAnomaly("arena_refresh_current_failed", {
@@ -793,6 +790,7 @@ pub(super) fn script_block() -> Markup {
                     layer.dataset.arenaRevision = "";
                     layer.dataset.arenaSamplerEpoch = "";
                     layer.dataset.visualKeys = "";
+                    layer.classList.remove("is-visual-ready");
                     layer.replaceChildren();
                   };
 
@@ -1082,7 +1080,6 @@ pub(super) fn script_block() -> Markup {
                     if (!lookaheadLayer) return false;
                     const seeded = await seedPreparedLayer(lookaheadLayer, payload, {
                       preserveImagesFromLayer: currentLayer,
-                      progressive: true,
                       ...options,
                     });
                     lookaheadReady = seeded;
@@ -1371,7 +1368,7 @@ pub(super) fn script_block() -> Markup {
                     });
                   }
 
-                  primeLayer(currentLayer, { progressive: true }).then((primed) => {
+                  primeLayer(currentLayer).then((primed) => {
                     if (!primed) {
                       reportArenaAnomaly("arena_current_layer_empty", {
                         layer_role: "current",
