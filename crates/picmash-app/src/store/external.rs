@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
+const CACHE_PATH_WITHDRAW_CHUNK: usize = 256;
+
 macro_rules! external_frontier_identity_predicate {
     () => {
         r"
@@ -344,6 +346,39 @@ impl Store {
             ),
         );
         self.conn.execute(&sql, params).map_err(Into::into)
+    }
+
+    pub fn withdraw_external_items_by_cached_paths(
+        &self,
+        cached_paths: &[PathBuf],
+    ) -> anyhow::Result<usize> {
+        let now = now_ts();
+        let mut withdrawn = 0;
+        for paths in cached_paths.chunks(CACHE_PATH_WITHDRAW_CHUNK) {
+            if paths.is_empty() {
+                continue;
+            }
+            let placeholders = paths.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "
+                UPDATE external_items
+                SET cached_path = NULL, updated_at = ?1
+                WHERE cached_path IS NOT NULL
+                  AND import_pending = 0
+                  AND resolved_asset_id IS NULL
+                  AND imported_asset_id IS NULL
+                  AND cached_path IN ({placeholders})
+                "
+            );
+            let params =
+                rusqlite::params_from_iter(
+                    std::iter::once(rusqlite::types::Value::from(now)).chain(paths.iter().map(
+                        |path| rusqlite::types::Value::from(path.to_string_lossy().into_owned()),
+                    )),
+                );
+            withdrawn += self.conn.execute(&sql, params)?;
+        }
+        Ok(withdrawn)
     }
 
     pub fn upsert_external_stream(

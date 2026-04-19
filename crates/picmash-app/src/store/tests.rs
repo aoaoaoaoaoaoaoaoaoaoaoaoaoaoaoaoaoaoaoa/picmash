@@ -42,6 +42,17 @@ mod identity_merge;
 mod support;
 use support::*;
 
+fn pin_quality_model(store: &Store, formal_version: QualityFormalVersion) {
+    store
+        .set_active_quality_model(&QualityModelRecord {
+            formal_version,
+            prior_family: QualityPriorFamily::default(),
+            prior_revision: QualityPriorRevision::default(),
+            updated_at: OffsetDateTime::now_utc(),
+        })
+        .expect("pin quality model");
+}
+
 #[test]
 fn session_subsource_lock_round_trips() {
     let root = test_root("session-subsource-lock");
@@ -151,6 +162,9 @@ fn migrates_legacy_asset_schema_without_rewriting_asset_id() {
     drop(conn);
 
     let store = Store::open(&db_path).expect("open migrated store");
+    store
+        .devour_bootstrap_maintenance()
+        .expect("backfill migrated asset identity");
     let asset = store
         .corpus_asset(CorpusId(1), &AssetId(legacy_asset_id.to_owned()))
         .expect("load migrated asset")
@@ -609,6 +623,7 @@ fn hierarchical_quality_replay_rebuilds_derived_state_from_event_truth() {
 
     let db_path = root.join("picmash.sqlite3");
     let mut store = Store::open(&db_path).expect("open store");
+    pin_quality_model(&store, QualityFormalVersion::HierarchicalGaussianV1);
     let embedder = OnnxEngine::disabled_for_tests();
     let corpus_id = store.ensure_corpus_id(&corpus_root).expect("ensure corpus");
     store
@@ -1105,6 +1120,7 @@ fn hierarchical_quality_replay_learns_from_remote_rejects() {
     std::fs::create_dir_all(&corpus_root).expect("create corpus root");
     let db_path = root.join("picmash.sqlite3");
     let mut store = Store::open(&db_path).expect("open store");
+    pin_quality_model(&store, QualityFormalVersion::HierarchicalGaussianV1);
 
     let corpus_id = store.ensure_corpus_id(&corpus_root).expect("ensure corpus");
     let session = store.create_session(corpus_id).expect("create session");
@@ -2130,6 +2146,53 @@ fn withdrawing_specific_external_items_clears_cached_path() {
             .expect("load item after withdraw")
             .is_none(),
         "withdrawn item should no longer resolve as a live remote"
+    );
+}
+
+#[test]
+fn withdrawing_external_items_by_cached_path_clears_pruned_sources() {
+    let root = test_root("withdraw-external-items-by-path");
+    let corpus_root = root.join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("create corpus root");
+    let db_path = root.join("picmash.sqlite3");
+    let store = Store::open(&db_path).expect("open store");
+
+    store
+        .upsert_external_source(
+            "local:test",
+            "dir:dump",
+            "local_directory",
+            "/tmp/dump",
+            None,
+        )
+        .expect("upsert source");
+    let (stream_id, blocked) = store
+        .upsert_external_stream("local:test", &remote_stream(9003, 1))
+        .expect("upsert stream");
+    assert!(!blocked);
+
+    let item_path = root.join("candidate.png");
+    std::fs::write(&item_path, flat_png(128, 128, [90, 80, 70])).expect("write candidate");
+    let item_id = store
+        .upsert_external_item(
+            "local:test",
+            stream_id,
+            "thread 9003",
+            &remote_item(9003, 444, None),
+            Some(&item_path),
+        )
+        .expect("upsert item");
+
+    let withdrawn = store
+        .withdraw_external_items_by_cached_paths(&[item_path])
+        .expect("withdraw by cached path");
+    assert_eq!(withdrawn, 1);
+    assert!(
+        store
+            .remote_item(item_id)
+            .expect("load item after path withdraw")
+            .is_none(),
+        "pruned source-cache paths should leave the external frontier"
     );
 }
 

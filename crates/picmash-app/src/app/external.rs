@@ -462,11 +462,25 @@ impl AppState {
             self.arena_effective_visual_exclusions(store, excluded_visual_keys, None)?;
         let explore = self.arena_explore();
         let external_probability = self.config.read().external_probability();
+        if external_probability_is_certain(external_probability) {
+            let external_pair =
+                self.choose_external_pair(store, field, assets, explore, &effective_excluded)?;
+            if external_pair.is_some() {
+                return Ok(external_pair);
+            }
+            let mut local_pair =
+                choose_local_pair(assets, field, store, explore, &effective_excluded)?;
+            if local_pair.is_none() {
+                local_pair =
+                    choose_local_pair(assets, field, store, explore, excluded_visual_keys)?;
+            }
+            return Ok(local_pair);
+        }
         let mut local_pair = choose_local_pair(assets, field, store, explore, &effective_excluded)?;
-        if local_pair.is_none() && external_probability <= f32::EPSILON {
+        if local_pair.is_none() && external_probability_is_zero(external_probability) {
             local_pair = choose_local_pair(assets, field, store, explore, excluded_visual_keys)?;
         }
-        if external_probability <= f32::EPSILON {
+        if external_probability_is_zero(external_probability) {
             return Ok(local_pair);
         }
         let external_pair =
@@ -1189,6 +1203,27 @@ impl AppState {
         excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
         let explore = self.arena_explore();
+        let external_probability = self.config.read().external_probability();
+        if external_probability_is_certain(external_probability) {
+            let external_pair = self.choose_external_pair_against_anchor(
+                store,
+                field,
+                anchor,
+                explore,
+                excluded_visual_keys,
+            )?;
+            if external_pair.is_some() {
+                return Ok(external_pair);
+            }
+            return choose_local_pair_against_anchor(
+                anchor,
+                assets,
+                field,
+                store,
+                explore,
+                excluded_visual_keys,
+            );
+        }
         let local_pair = choose_local_pair_against_anchor(
             anchor,
             assets,
@@ -1197,6 +1232,9 @@ impl AppState {
             explore,
             excluded_visual_keys,
         )?;
+        if external_probability_is_zero(external_probability) {
+            return Ok(local_pair);
+        }
         let external_pair = self.choose_external_pair_against_anchor(
             store,
             field,
@@ -1206,7 +1244,7 @@ impl AppState {
         )?;
         Ok(choose_pair_source(
             &mut rng(),
-            self.config.read().external_probability(),
+            external_probability,
             local_pair,
             external_pair,
         ))
@@ -1672,6 +1710,14 @@ pub(super) fn choose_pair_source<R: rand::Rng + ?Sized, T>(
             }
         }
     }
+}
+
+fn external_probability_is_zero(value: f32) -> bool {
+    value <= f32::EPSILON
+}
+
+fn external_probability_is_certain(value: f32) -> bool {
+    value >= 1.0 - f32::EPSILON
 }
 
 fn sanitize_source_key(source_key: &str) -> String {

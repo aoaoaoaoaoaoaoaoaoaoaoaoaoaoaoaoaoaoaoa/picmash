@@ -1056,9 +1056,13 @@ pub(super) fn script_block() -> Markup {
                     return true;
                   };
 
-                  const seedAuthoritativeLayer = async (payload) => {
+                  const seedAuthoritativeLayer = async (payload, options = {}) => {
                     if (!lookaheadLayer) return false;
-                    const seeded = await seedPreparedLayer(lookaheadLayer, payload);
+                    const seeded = await seedPreparedLayer(lookaheadLayer, payload, {
+                      preserveImagesFromLayer: currentLayer,
+                      progressive: true,
+                      ...options,
+                    });
                     lookaheadReady = seeded;
                     return seeded;
                   };
@@ -1260,7 +1264,7 @@ pub(super) fn script_block() -> Markup {
                           }
                           return;
                         }
-                        const seeded = await seedPreparedLayer(lookaheadLayer, payload);
+                        const seeded = await seedAuthoritativeLayer(payload);
                         if (epoch !== preparedEpoch) return;
                         lookaheadReady = seeded;
                         if (!seeded) {

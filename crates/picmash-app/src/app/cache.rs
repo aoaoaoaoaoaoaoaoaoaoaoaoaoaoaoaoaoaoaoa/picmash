@@ -33,6 +33,7 @@ struct CachePruneSummary {
     files_seen: usize,
     files_removed: usize,
     bytes_removed: u64,
+    removed_paths: Vec<PathBuf>,
 }
 
 impl AppState {
@@ -64,6 +65,19 @@ impl AppState {
                 DEFAULT_SOURCE_CACHE_MAX_BYTES,
             ),
         )?;
+        if !sources.removed_paths.is_empty() {
+            let removed_paths = sources.removed_paths.clone();
+            let withdrawn = self.with_write_store("withdraw_pruned_source_cache_items", {
+                move |store| store.withdraw_external_items_by_cached_paths(&removed_paths)
+            })?;
+            if withdrawn > 0 {
+                self.purge_duplicate_frontier();
+                info!(
+                    withdrawn,
+                    "withdrew pruned source-cache paths from external frontier"
+                );
+            }
+        }
         log_prune_summary("renditions", &self.cache_root, &renditions);
         log_prune_summary("sources", &self.source_cache_root, &sources);
         Ok(())
@@ -143,6 +157,7 @@ fn prune_cache_tree(label: &str, root: &Path, max_bytes: u64) -> anyhow::Result<
                 summary.files_removed += 1;
                 summary.bytes_removed = summary.bytes_removed.saturating_add(entry.bytes);
                 summary.bytes_after = summary.bytes_after.saturating_sub(entry.bytes);
+                summary.removed_paths.push(entry.path);
             }
             Err(error) => {
                 warn!(cache = label, path = %entry.path.display(), error = %error, "failed to remove cache file");
@@ -232,6 +247,7 @@ mod tests {
         assert_eq!(summary.bytes_before, 30);
         assert!(summary.bytes_after <= 18);
         assert!(summary.files_removed >= 2);
+        assert_eq!(summary.removed_paths.len(), summary.files_removed);
     }
 
     #[test]
