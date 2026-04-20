@@ -71,6 +71,10 @@ impl SourceReadyFrontier {
         self.total_ready >= self.target_total
     }
 
+    pub(super) fn source_idle_warm(&self) -> bool {
+        self.total_ready >= self.target_per_stream
+    }
+
     pub(super) fn stream_saturated(&self, stream_id: i64) -> bool {
         self.ready_by_stream
             .get(&stream_id)

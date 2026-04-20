@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -815,9 +816,9 @@ fn parse_scrfd_outputs(
     }
 
     // Sort each group by descending anchor count (stride 8 has the most)
-    scores.sort_by(|a, b| b.num_anchors.cmp(&a.num_anchors));
-    bboxes.sort_by(|a, b| b.num_anchors.cmp(&a.num_anchors));
-    kps.sort_by(|a, b| b.num_anchors.cmp(&a.num_anchors));
+    scores.sort_by_key(|tensor| Reverse(tensor.num_anchors));
+    bboxes.sort_by_key(|tensor| Reverse(tensor.num_anchors));
+    kps.sort_by_key(|tensor| Reverse(tensor.num_anchors));
 
     let mut result = Vec::with_capacity(3);
     for (idx, &stride) in SCRFD_STRIDES.iter().enumerate() {

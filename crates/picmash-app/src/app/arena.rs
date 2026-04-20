@@ -624,8 +624,7 @@ impl AppState {
         Ok(match handle {
             ArenaHandle::Local(asset_id) => store
                 .corpus_asset(self.active.corpus_id, asset_id)?
-                .filter(|asset| !asset.hidden && asset.path.exists())
-                .is_some(),
+                .is_some_and(|asset| !asset.hidden && asset.path.exists()),
             ArenaHandle::Remote(item_id) => store
                 .arena_remote_item(*item_id)?
                 .is_some_and(|item| item.path.exists()),

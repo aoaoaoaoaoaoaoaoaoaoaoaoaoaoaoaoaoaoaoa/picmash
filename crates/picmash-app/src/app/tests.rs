@@ -20,6 +20,15 @@ fn remote_ready_frontier_has_hard_cap() {
 }
 
 #[test]
+fn remote_ready_frontier_has_lower_idle_floor() {
+    let cold = SourceReadyFrontier::new(2, HashMap::new(), 512, ReadyTargetProfile::for_remote());
+    assert!(!cold.source_idle_warm());
+    let warm = SourceReadyFrontier::new(3, HashMap::new(), 512, ReadyTargetProfile::for_remote());
+    assert!(warm.source_idle_warm());
+    assert!(!warm.source_saturated());
+}
+
+#[test]
 fn ready_frontier_saturates_streams_independently() {
     let mut frontier =
         SourceReadyFrontier::new(0, HashMap::new(), 32, ReadyTargetProfile::for_remote());

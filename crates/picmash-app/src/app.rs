@@ -14,7 +14,7 @@ use rand::{Rng, rng, seq::SliceRandom};
 use serde::Serialize;
 use time::Duration;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     asset_domain::{AssetDomainLabel, AssetDomainOracle, AssetDomainPrediction, AssetDomainStatus},
