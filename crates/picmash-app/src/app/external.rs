@@ -143,7 +143,7 @@ impl AppState {
             active_streams,
             ReadyTargetProfile::for_source(source),
         );
-        if !frontier.source_saturated() {
+        if !frontier.source_idle_warm() {
             return Ok(false);
         }
         let recently_selected = store.external_source_recently_selected(
@@ -345,6 +345,14 @@ impl AppState {
                         QUALITY_FEATURE_REVISION,
                     )?;
                     needs_face_backfill |= warm.needs_face_embedding;
+                    if already_ready
+                        && !warm.needs_inline_work()
+                        && store
+                            .external_item_cached_path(item_id)?
+                            .is_some_and(|path| path.exists())
+                    {
+                        continue;
+                    }
                     let cached_path = match item.materialized_path.as_ref() {
                         Some(path) if path.exists() => path.clone(),
                         Some(_) if source.local_directory().is_some() => continue,

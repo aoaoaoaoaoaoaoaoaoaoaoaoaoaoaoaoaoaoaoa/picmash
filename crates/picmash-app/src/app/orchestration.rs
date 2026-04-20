@@ -181,7 +181,7 @@ impl AppState {
                 continue;
             }
             if !force && self.remote_source_scan_can_rest(&store, &source)? {
-                info!(source = %source_key, "remote source warm buffer saturated; skipping refresh");
+                debug!(source = %source_key, "remote source idle warm buffer sufficient; skipping refresh");
                 continue;
             }
             due_sources.push(source);

@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -129,7 +130,7 @@ impl SourceScanner {
                         && item.shortest_edge() >= board_source.filters.min_shortest_edge
                 })
                 .collect::<Vec<_>>();
-            items.sort_by(|lhs, rhs| rhs.post_no.cmp(&lhs.post_no));
+            items.sort_by_key(|item| Reverse(item.post_no));
             if items.is_empty() {
                 continue;
             }
@@ -250,7 +251,7 @@ impl SourceScanner {
         let streams = grouped
             .into_iter()
             .filter_map(|(stream_rel, mut items)| {
-                items.sort_by(|lhs, rhs| rhs.post_no.cmp(&lhs.post_no));
+                items.sort_by_key(|item| Reverse(item.post_no));
                 let (last_modified, image_count) = stream_meta.get(&stream_rel).copied()?;
                 Some(RemoteStreamSnapshot {
                     thread_no: hashed_local_id(&stream_rel),
