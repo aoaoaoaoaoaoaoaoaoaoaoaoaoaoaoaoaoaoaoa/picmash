@@ -336,6 +336,52 @@ impl Engine {
             .collect()
     }
 
+    /// Admits one already-materialized file without walking the collection.
+    pub fn ingest_occurrence(
+        &self,
+        collection_id: CollectionId,
+        path: impl AsRef<Path>,
+    ) -> Result<AssetId> {
+        let root = self.collection(collection_id)?.root;
+        let path = path.as_ref().canonicalize().at(path.as_ref())?;
+        if !path.starts_with(&root) {
+            return Err(Fault::InvalidInput(format!(
+                "ingested occurrence {} lies outside collection {}",
+                path.display(),
+                root.display()
+            )));
+        }
+        if !supported_path(&path) {
+            return Err(Fault::InvalidInput(format!(
+                "ingested occurrence {} has an unsupported format",
+                path.display()
+            )));
+        }
+        let candidate = inspect_candidate(&path, &self.scan_cache(&root)?)?.0;
+        let now = now_ns()?;
+        let mut connection = self.connection.lock();
+        let tx = connection.transaction()?;
+        let generation = tx.query_row(
+            "SELECT scan_generation FROM pm_collections WHERE id = ?1",
+            [collection_id.get()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let (changed, asset_id) =
+            upsert_candidate(&tx, collection_id, generation, &candidate, now)?;
+        tx.execute(
+            "DELETE FROM pm_scan_failures WHERE collection_id = ?1 AND path = ?2",
+            params![collection_id.get(), encode_path(&candidate.path)],
+        )?;
+        if changed {
+            tx.execute(
+                "UPDATE pm_collections SET catalog_revision = catalog_revision + 1 WHERE id = ?1",
+                [collection_id.get()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(asset_id)
+    }
+
     pub fn set_hidden(
         &self,
         collection_id: CollectionId,
@@ -440,7 +486,7 @@ impl Engine {
         )?;
         let mut changed = false;
         for candidate in candidates {
-            changed |= upsert_candidate(&tx, collection_id, generation, &candidate, now)?;
+            changed |= upsert_candidate(&tx, collection_id, generation, &candidate, now)?.0;
             tx.execute(
                 "DELETE FROM pm_scan_failures WHERE collection_id = ?1 AND path = ?2",
                 params![collection_id.get(), encode_path(&candidate.path)],
@@ -557,7 +603,7 @@ fn upsert_candidate(
     generation: i64,
     candidate: &Candidate,
     now: i64,
-) -> Result<bool> {
+) -> Result<(bool, AssetId)> {
     let existing = tx
         .query_row(
             "SELECT asset_id, blob_digest, width, height, byte_len, present
@@ -633,7 +679,7 @@ fn upsert_candidate(
          VALUES (?1, ?2, ?3) ON CONFLICT(collection_id, asset_id) DO NOTHING",
         params![collection_id.get(), asset_id.as_str(), now],
     )?;
-    Ok(changed)
+    Ok((changed, asset_id))
 }
 
 fn collection_asset_exists(

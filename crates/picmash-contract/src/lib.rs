@@ -3,7 +3,7 @@
 use std::{borrow::Cow, fmt};
 
 /// Native UI contract revision.
-pub const UI_FINGERPRINT: &str = "picmash.ui/2";
+pub const UI_FINGERPRINT: &str = "picmash.ui/3";
 
 /// One member of the active comparison.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -44,6 +44,8 @@ pub enum Target {
     Hide(Side),
     /// Clockwise rotation actuator for one compared image.
     Rotate(Side),
+    /// Reject every candidate belonging to a remote stream.
+    VetoStream(Side),
     /// Collection browser surface.
     Browser,
     /// One visible browser tile.
@@ -69,6 +71,7 @@ impl Target {
             Self::Favorite(side) => Cow::Owned(format!("comparison.favorite/{}", side.wire())),
             Self::Hide(side) => Cow::Owned(format!("comparison.hide/{}", side.wire())),
             Self::Rotate(side) => Cow::Owned(format!("comparison.rotate/{}", side.wire())),
+            Self::VetoStream(side) => Cow::Owned(format!("comparison.veto_stream/{}", side.wire())),
             Self::Browser => Cow::Borrowed("collection.browser"),
             Self::BrowseTile => Cow::Borrowed("collection.browser/tile"),
             Self::Viewer => Cow::Borrowed("collection.viewer"),

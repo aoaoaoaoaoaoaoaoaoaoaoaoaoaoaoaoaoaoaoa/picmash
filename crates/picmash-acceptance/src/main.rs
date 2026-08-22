@@ -29,6 +29,8 @@ struct Observation {
     favorites: usize,
     duels: u64,
     pair_ready: bool,
+    remote_pair: bool,
+    remote_ready: usize,
     pair_rotations: Option<[u8; 2]>,
     images_per_row: u16,
     viewer_open: bool,
@@ -53,6 +55,7 @@ fn main() -> Result<()> {
     empty_session(&testbed, &binary, artifacts.as_deref())?;
     first_session(&testbed, &binary, artifacts.as_deref())?;
     restored_session(&testbed, &binary, artifacts.as_deref())?;
+    remote_session(&testbed, &binary, artifacts.as_deref())?;
     println!("picmash acceptance passed under {}", testbed.id());
     Ok(())
 }
@@ -234,6 +237,82 @@ fn restored_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) 
     Ok(())
 }
 
+fn remote_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> Result<()> {
+    let config = format!(
+        r#"living_water = true
+images_per_row = 5
+
+[remote]
+enabled = true
+sample_probability = 1.0
+reservoir_capacity = 1
+metadata_capacity = 8
+
+[[remote.sources]]
+weight = 1.0
+import_policy = "not_x"
+scan_interval_seconds = 15
+
+[remote.sources.upstream]
+type = "local_directory"
+
+[remote.sources.upstream.settings]
+root = "{}"
+recurse = true
+"#,
+        Testbed::guest_path("remote").display()
+    );
+    let _config = testbed.write_private("xdg/config/picmash/picmash.toml", config.as_bytes())?;
+    let app = launch(testbed, binary, false)?;
+    let session = testbed.x11_session(
+        &app,
+        WindowQuery::title_exact(TITLE),
+        Duration::from_secs(20),
+    )?;
+    session.focus()?;
+    let mut probe: Probe<Observation> = app.witness()?.typed();
+    let _presented = probe.wait_surface_presented(&app, STARTUP)?;
+    let ready = probe.wait(&app, STARTUP, "bounded remote reservoir", |frame| {
+        !frame.state.busy && frame.state.pair_ready && frame.state.remote_ready == 1
+    })?;
+    ensure!(
+        !ready.state.remote_pair,
+        "remote work interrupted a live pair"
+    );
+    click(&session, &app, &mut probe, Target::Choice(Side::Left))?;
+    let challenger = probe.wait(&app, STARTUP, "remote challenger", |frame| {
+        !frame.state.busy && frame.state.remote_pair
+    })?;
+    ensure!(
+        challenger.state.remote_ready == 1,
+        "displayed challenger escaped the reservoir bound"
+    );
+    let _veto = probe.wait_anchor(&app, &Target::VetoStream(Side::Right).to_string(), WAIT)?;
+    for _frame in 0..4 {
+        let _fresh = probe.wait_fresh(&app, WAIT)?;
+    }
+    capture(&session, artifacts, "picmash-remote.png")?;
+    click(&session, &app, &mut probe, Target::Choice(Side::Right))?;
+    let promoted = probe.wait(&app, STARTUP, "promoted remote challenger", |frame| {
+        !frame.state.busy
+            && !frame.state.remote_pair
+            && frame.state.visible_assets == 4
+            && frame.state.duels == 3
+    })?;
+    ensure!(
+        !promoted.state.status.starts_with("FAULT"),
+        "promotion faulted: {}",
+        promoted.state.status
+    );
+    let imported = testbed.private_path("collection/.picmash-imported")?;
+    ensure!(
+        contains_jxl(&imported)?,
+        "remote promotion did not materialize canonical JPEG XL"
+    );
+    app.terminate()?;
+    Ok(())
+}
+
 fn launch<'a>(
     testbed: &'a Testbed,
     binary: &Path,
@@ -286,7 +365,34 @@ fn seed(testbed: &Testbed) -> Result<()> {
         let _written = testbed.write_private(format!("collection/{index}.png"), &bytes)?;
         let _copy = testbed.write_private(format!("collection/{index}-copy.png"), &bytes)?;
     }
+    let _remote = testbed.create_private_dir("remote")?;
+    let remote = fixture(19, (940, 1_180))?;
+    let _written = testbed.write_private("remote/challenger.png", remote)?;
     Ok(())
+}
+
+fn contains_jxl(root: &Path) -> Result<bool> {
+    if !root.is_dir() {
+        return Ok(false);
+    }
+    for source in std::fs::read_dir(root)? {
+        let source = source?.path();
+        if !source.is_dir() {
+            continue;
+        }
+        if std::fs::read_dir(source)?.any(|entry| {
+            entry.ok().is_some_and(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("jxl")
+            })
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn fixture(seed: u8, (width, height): (u32, u32)) -> Result<Vec<u8>> {

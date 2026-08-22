@@ -12,6 +12,7 @@ use crate::{
 };
 
 const PAIR_POLICY: &str = "coverage-anchor-matched-balanced-v2";
+const REMOTE_ADMISSION_POLICY: &str = "remote-admission-v1";
 
 impl Engine {
     pub fn start_session(
@@ -166,30 +167,7 @@ impl Engine {
             |row| row.get::<_, i64>(0),
         )?;
         let prompt = pair.finish(session_id.clone(), now, issued % 2 != 0)?;
-        tx.execute(
-            "INSERT INTO pm_prompts(
-                 id, session_id, left_asset_id, right_asset_id,
-                 left_occurrence_id, right_occurrence_id,
-                 left_render_digest, right_render_digest,
-                 left_rotation_quarters, right_rotation_quarters,
-                 policy_revision, snapshot_id, issued_at_ns
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                prompt.id.as_str(),
-                prompt.session_id.as_str(),
-                prompt.left.asset_id.as_str(),
-                prompt.right.asset_id.as_str(),
-                prompt.left.occurrence_id.get(),
-                prompt.right.occurrence_id.get(),
-                prompt.left.render.as_str(),
-                prompt.right.render.as_str(),
-                prompt.left.rotation_quarters,
-                prompt.right.rotation_quarters,
-                prompt.policy_revision,
-                prompt.snapshot_id.map(SnapshotId::get),
-                prompt.issued_at_ns,
-            ],
-        )?;
+        insert_prompt(&tx, &prompt)?;
         tx.commit()?;
         Ok(prompt)
     }
@@ -230,26 +208,7 @@ impl Engine {
             "asset_duel",
             &digest,
         )?;
-        tx.execute(
-            "INSERT INTO pm_asset_duels(
-                 observation_id, prompt_id, left_asset_id, right_asset_id, winner_asset_id,
-                 left_occurrence_id, right_occurrence_id, left_render_digest, right_render_digest,
-                 left_rotation_quarters, right_rotation_quarters
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                observation_id.get(),
-                prompt.id.as_str(),
-                prompt.left.asset_id.as_str(),
-                prompt.right.asset_id.as_str(),
-                winner.as_str(),
-                prompt.left.occurrence_id.get(),
-                prompt.right.occurrence_id.get(),
-                prompt.left.render.as_str(),
-                prompt.right.render.as_str(),
-                prompt.left.rotation_quarters,
-                prompt.right.rotation_quarters,
-            ],
-        )?;
+        insert_duel(&tx, observation_id, &prompt, winner)?;
         let answered = tx.execute(
             "UPDATE pm_prompts SET answered_observation_id = ?2
              WHERE id = ?1 AND answered_observation_id IS NULL",
@@ -258,6 +217,78 @@ impl Engine {
         if answered != 1 {
             return Err(Fault::StalePrompt(prompt_id.clone()));
         }
+        tx.commit()?;
+        Ok(observation_id)
+    }
+
+    /// Atomically seals the comparison whose challenger became local only after
+    /// the user judged it. No prompt can survive without its matching duel.
+    pub fn record_promoted_comparison(
+        &self,
+        session_id: &SessionId,
+        left: &AssetId,
+        right: &AssetId,
+        winner: &AssetId,
+        command_id: &CommandId,
+        response_ms: Option<u32>,
+    ) -> Result<ObservationId> {
+        if left == right || (winner != left && winner != right) {
+            return Err(Fault::InvalidInput(
+                "a promoted comparison requires two distinct assets and one winner".to_owned(),
+            ));
+        }
+        let now = now_ns()?;
+        let mut connection = self.connection.lock();
+        let tx = connection.transaction()?;
+        let response = response_ms.map_or_else(String::new, |value| value.to_string());
+        let digest = payload_digest(&[
+            "remote-admission-duel-v1",
+            session_id.as_str(),
+            left.as_str(),
+            right.as_str(),
+            winner.as_str(),
+            &response,
+        ]);
+        if let Some(existing) = existing_command(&tx, command_id, &digest)? {
+            return Ok(existing);
+        }
+        let collection = active_session_collection(&tx, session_id)?;
+        let snapshot_id = tx
+            .query_row(
+                "SELECT id FROM pm_preference_snapshots
+                 WHERE collection_id = ?1 ORDER BY id DESC LIMIT 1",
+                [collection.get()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(SnapshotId::from_raw);
+        let prompt = ComparisonPrompt {
+            id: PromptId::fresh(),
+            session_id: session_id.clone(),
+            left: representative(&tx, collection, left)?,
+            right: representative(&tx, collection, right)?,
+            policy_revision: REMOTE_ADMISSION_POLICY.to_owned(),
+            snapshot_id,
+            issued_at_ns: now,
+        };
+        insert_prompt(&tx, &prompt)?;
+        let observation_id = insert_observation(
+            &tx,
+            command_id,
+            session_id,
+            now,
+            "asset-duel-v1",
+            Some(REMOTE_ADMISSION_POLICY),
+            None,
+            response_ms,
+            "asset_duel",
+            &digest,
+        )?;
+        insert_duel(&tx, observation_id, &LoadedPrompt::from(&prompt), winner)?;
+        tx.execute(
+            "UPDATE pm_prompts SET answered_observation_id = ?2 WHERE id = ?1",
+            params![prompt.id.as_str(), observation_id.get()],
+        )?;
         tx.commit()?;
         Ok(observation_id)
     }
@@ -548,6 +579,103 @@ fn validate_presentation(
     }
 }
 
+fn representative(
+    tx: &Transaction<'_>,
+    collection: CollectionId,
+    asset: &AssetId,
+) -> Result<PresentedAsset> {
+    tx.query_row(
+        "SELECT o.id, a.render_digest, o.rotation_quarters
+         FROM pm_occurrences o
+         JOIN pm_assets a ON a.id = o.asset_id
+         JOIN pm_collection_assets ca
+           ON ca.collection_id = o.collection_id AND ca.asset_id = o.asset_id
+         WHERE o.collection_id = ?1 AND o.asset_id = ?2 AND o.present = 1 AND ca.hidden = 0
+         ORDER BY o.width * o.height DESC, o.byte_len DESC, o.path ASC
+         LIMIT 1",
+        params![collection.get(), asset.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )
+    .optional()?
+    .ok_or_else(|| {
+        Fault::InvalidInput(format!(
+            "asset {asset} is not visible in collection {collection}"
+        ))
+    })
+    .and_then(|(occurrence, render, rotation)| {
+        Ok(PresentedAsset {
+            asset_id: asset.clone(),
+            occurrence_id: crate::OccurrenceId::from_raw(occurrence),
+            render: RenderDigest::parse(render)?,
+            rotation_quarters: u8::try_from(rotation)
+                .map_err(|_| Fault::Corrupt("invalid occurrence rotation".to_owned()))?,
+        })
+    })
+}
+
+fn insert_prompt(tx: &Transaction<'_>, prompt: &ComparisonPrompt) -> Result<()> {
+    tx.execute(
+        "INSERT INTO pm_prompts(
+             id, session_id, left_asset_id, right_asset_id,
+             left_occurrence_id, right_occurrence_id,
+             left_render_digest, right_render_digest,
+             left_rotation_quarters, right_rotation_quarters,
+             policy_revision, snapshot_id, issued_at_ns
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            prompt.id.as_str(),
+            prompt.session_id.as_str(),
+            prompt.left.asset_id.as_str(),
+            prompt.right.asset_id.as_str(),
+            prompt.left.occurrence_id.get(),
+            prompt.right.occurrence_id.get(),
+            prompt.left.render.as_str(),
+            prompt.right.render.as_str(),
+            prompt.left.rotation_quarters,
+            prompt.right.rotation_quarters,
+            prompt.policy_revision,
+            prompt.snapshot_id.map(SnapshotId::get),
+            prompt.issued_at_ns,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_duel(
+    tx: &Transaction<'_>,
+    observation: ObservationId,
+    prompt: &LoadedPrompt,
+    winner: &AssetId,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO pm_asset_duels(
+             observation_id, prompt_id, left_asset_id, right_asset_id, winner_asset_id,
+             left_occurrence_id, right_occurrence_id, left_render_digest, right_render_digest,
+             left_rotation_quarters, right_rotation_quarters
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            observation.get(),
+            prompt.id.as_str(),
+            prompt.left.asset_id.as_str(),
+            prompt.right.asset_id.as_str(),
+            winner.as_str(),
+            prompt.left.occurrence_id.get(),
+            prompt.right.occurrence_id.get(),
+            prompt.left.render.as_str(),
+            prompt.right.render.as_str(),
+            prompt.left.rotation_quarters,
+            prompt.right.rotation_quarters,
+        ],
+    )?;
+    Ok(())
+}
+
 struct LoadedPrompt {
     id: PromptId,
     session_id: SessionId,
@@ -555,6 +683,19 @@ struct LoadedPrompt {
     right: PresentedAsset,
     policy_revision: String,
     answered: bool,
+}
+
+impl From<&ComparisonPrompt> for LoadedPrompt {
+    fn from(prompt: &ComparisonPrompt) -> Self {
+        Self {
+            id: prompt.id.clone(),
+            session_id: prompt.session_id.clone(),
+            left: prompt.left.clone(),
+            right: prompt.right.clone(),
+            policy_revision: prompt.policy_revision.clone(),
+            answered: false,
+        }
+    }
 }
 
 fn load_prompt(tx: &Transaction<'_>, id: &PromptId) -> Result<LoadedPrompt> {

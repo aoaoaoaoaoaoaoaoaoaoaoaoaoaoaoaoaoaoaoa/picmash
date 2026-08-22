@@ -65,6 +65,7 @@ impl Viewer {
         &self.sequence[self.slot]
     }
 
+    #[cfg(feature = "egui-test")]
     pub fn ready(&self) -> bool {
         self.texture.is_some()
     }

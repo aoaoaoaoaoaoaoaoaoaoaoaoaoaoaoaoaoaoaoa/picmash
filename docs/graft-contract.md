@@ -32,13 +32,15 @@ The host:
 6. Displays holdout metrics as diagnostics, never as a claim of universal image
    quality.
 
-The graft exposes only local collection browsing, pairwise preference,
-favorites, hiding, and rotation. Similarity is stored but has no authorized
-learner. External sources and face workflows require separate commissions.
+The graft exposes local collection browsing, pairwise preference, favorites,
+hiding, rotation, and explicitly configured remote challengers. Similarity is
+stored but has no authorized learner. Face workflows remain excluded.
 
 The native event loop owns no blocking filesystem, database, image-decoding,
-or model work. A bounded command channel feeds one engine worker. Image blades
-cross back as immutable RGBA buffers and become GPU textures on the UI thread.
+or model work. A bounded command channel feeds one engine worker. Two fixed
+remote effect lanes perform catalog and media work; every mailbox and retained
+frontier is bounded. Image blades cross back as immutable RGBA buffers and
+become GPU textures on the UI thread.
 The external acceptance executable observes only a small one-way state and
 stable target vocabulary from `picmash-contract`.
 
@@ -57,6 +59,13 @@ matches.
 Favorites are current collection state plus immutable set/unset events. Hiding
 changes the preference population and therefore the catalog revision. Rotation
 changes presentation but not asset identity or the preference population.
+
+Remote payloads are cache, never collection occurrences. Promotion first
+decodes the prepared payload, applies the judged rotation, losslessly
+re-encodes it as JPEG XL, verifies exact render identity, and atomically writes
+it beneath `.picmash-imported/`. Only then may the engine ingest the occurrence
+and seal the remote item as promoted. A promoted duel is inserted atomically;
+its command ID survives exact retries.
 
 ## Preference Law
 

@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use atomic_write_file::AtomicWriteFile;
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, after, bounded, select};
 use eternalist_apps::NativeWake;
 use image::{RgbaImage, imageops};
 use picmash_contract::Side;
@@ -17,12 +17,17 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::xdg::Lair;
+use crate::{
+    configuration::{ImportPolicy, Probability, RemoteConfig},
+    remote::{Effect as RemoteEffect, Prepared, Reactor, Summary as RemoteSummary, promote},
+    xdg::Lair,
+};
 
 const COMMAND_CAPACITY: usize = 32;
+const EVENT_CAPACITY: usize = 64;
 const PROMPT_EDGE: u32 = 1_800;
 const THUMB_EDGE: u32 = 360;
 const CONTEXT_REVISION: &str = "poolrooms-pairwise-v1";
@@ -65,10 +70,89 @@ pub struct Blade {
 
 #[derive(Clone, Debug)]
 pub struct Pair {
-    pub left: Card,
-    pub right: Card,
+    pub left: PairCard,
+    pub right: PairCard,
     pub left_blade: Blade,
     pub right_blade: Blade,
+}
+
+#[derive(Clone, Debug)]
+pub enum PairCard {
+    Local(Card),
+    Remote(RemoteCard),
+}
+
+impl PairCard {
+    pub const fn width(&self) -> u32 {
+        match self {
+            Self::Local(card) if card.rotation_quarters % 2 == 0 => card.width,
+            Self::Local(card) => card.height,
+            Self::Remote(card) => card.width,
+        }
+    }
+
+    pub const fn height(&self) -> u32 {
+        match self {
+            Self::Local(card) if card.rotation_quarters % 2 == 0 => card.height,
+            Self::Local(card) => card.width,
+            Self::Remote(card) => card.height,
+        }
+    }
+
+    #[cfg(feature = "egui-test")]
+    pub const fn rotation_quarters(&self) -> u8 {
+        match self {
+            Self::Local(card) => card.rotation_quarters,
+            Self::Remote(card) => card.rotation_quarters,
+        }
+    }
+
+    pub const fn favorite(&self) -> bool {
+        match self {
+            Self::Local(card) => card.favorite,
+            Self::Remote(_) => false,
+        }
+    }
+
+    pub const fn duel_count(&self) -> Option<u32> {
+        match self {
+            Self::Local(card) => Some(card.duel_count),
+            Self::Remote(_) => None,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Local(card) => &card.path,
+            Self::Remote(card) => &card.path,
+        }
+    }
+
+    pub const fn remote(&self) -> Option<&RemoteCard> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(card) => Some(card),
+        }
+    }
+
+    pub(crate) fn local_mut(&mut self) -> Option<&mut Card> {
+        match self {
+            Self::Local(card) => Some(card),
+            Self::Remote(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteCard {
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    #[cfg(feature = "egui-test")]
+    pub rotation_quarters: u8,
+    pub title: String,
+    pub source: String,
+    pub stream: String,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +172,8 @@ pub enum Command {
     FavoriteAsset(AssetId),
     Hide(Side),
     Rotate(Side),
+    VetoStream(Side),
+    ConfigureRemote(RemoteConfig),
     Thumbnail { asset_id: AssetId, bucket: u8 },
     Full { asset_id: AssetId, bound: [u32; 2] },
 }
@@ -103,6 +189,8 @@ pub enum Event {
         cards: Vec<Card>,
     },
     Pair(Pair),
+    Remote(RemoteSummary),
+    RemoteFault(String),
     NoComparison,
     Favorite {
         asset_id: AssetId,
@@ -138,15 +226,30 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(ctx: &egui::Context, lair: Lair, initial: Option<PathBuf>) -> Result<Self> {
+    pub fn spawn(
+        ctx: &egui::Context,
+        lair: Lair,
+        initial: Option<PathBuf>,
+        remote: RemoteConfig,
+    ) -> Result<Self> {
         let (commands, command_rx) = bounded(COMMAND_CAPACITY);
-        let (event_tx, events) = unbounded();
+        let (event_tx, events) = bounded(EVENT_CAPACITY);
         let wake = NativeWake::from_context(ctx);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
             .name("picmash-engine".to_owned())
-            .spawn(move || run(command_rx, event_tx, wake, lair, initial, worker_stop))
+            .spawn(move || {
+                run(
+                    command_rx,
+                    event_tx,
+                    wake,
+                    lair,
+                    initial,
+                    remote,
+                    worker_stop,
+                );
+            })
             .context("spawn Picmash engine worker")?;
         Ok(Self {
             commands,
@@ -172,6 +275,9 @@ impl Drop for Worker {
         let (grave, _receiver) = bounded(0);
         let commands = std::mem::replace(&mut self.commands, grave);
         drop(commands);
+        let (_sender, grave) = bounded(0);
+        let events = std::mem::replace(&mut self.events, grave);
+        drop(events);
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
@@ -186,9 +292,47 @@ struct EngineState {
     stop: Arc<AtomicBool>,
     collection: Option<CollectionId>,
     session: Option<SessionId>,
-    prompt: Option<(ComparisonPrompt, Instant)>,
+    prompt: Option<LivePrompt>,
     cards: Vec<Card>,
     scan_failures: usize,
+    remote: Reactor,
+    remote_probability: Probability,
+    lottery: Lottery,
+    remote_anchor_cursor: usize,
+}
+
+enum LivePrompt {
+    Local {
+        prompt: ComparisonPrompt,
+        born: Instant,
+    },
+    Remote {
+        candidate: Prepared,
+        anchor: AssetId,
+        rotation_quarters: u8,
+        born: Instant,
+        duel_command: CommandId,
+        duel_response_ms: Option<u32>,
+        favorite_command: CommandId,
+    },
+}
+
+struct Lottery(u64);
+
+impl Lottery {
+    fn new() -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        Self(seed ^ 0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn draw(&mut self) -> u16 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % 1_000) as u16
+    }
 }
 
 fn run(
@@ -197,20 +341,28 @@ fn run(
     wake: NativeWake,
     lair: Lair,
     initial: Option<PathBuf>,
+    remote_config: RemoteConfig,
     stop: Arc<AtomicBool>,
 ) {
     let result = Engine::open(lair.database())
-        .map(|engine| EngineState {
-            engine,
-            lair,
-            stop: Arc::clone(&stop),
-            collection: None,
-            session: None,
-            prompt: None,
-            cards: Vec::new(),
-            scan_failures: 0,
-        })
-        .map_err(anyhow::Error::from);
+        .map_err(anyhow::Error::from)
+        .and_then(|engine| {
+            let remote = Reactor::open(&lair, &remote_config)?;
+            Ok(EngineState {
+                engine,
+                lair,
+                stop: Arc::clone(&stop),
+                collection: None,
+                session: None,
+                prompt: None,
+                cards: Vec::new(),
+                scan_failures: 0,
+                remote,
+                remote_probability: remote_config.sample_probability,
+                lottery: Lottery::new(),
+                remote_anchor_cursor: 0,
+            })
+        });
     let mut state = match result {
         Ok(state) => state,
         Err(error) => {
@@ -223,10 +375,20 @@ fn run(
         Some(root) => conduct(&mut state, &events, &wake, Command::Load(root)),
         None => publish(&events, &wake, Event::NeedCollection),
     }
-    while !stop.load(Ordering::Acquire)
-        && let Ok(command) = commands.recv()
-    {
-        conduct(&mut state, &events, &wake, command);
+    let remote_completions = state.remote.completions().clone();
+    while !stop.load(Ordering::Acquire) {
+        let deadline = after(state.remote.wait());
+        select! {
+            recv(commands) -> command => match command {
+                Ok(command) => conduct(&mut state, &events, &wake, command),
+                Err(_) => break,
+            },
+            recv(remote_completions) -> completion => match completion {
+                Ok(completion) => service_remote(&mut state, &events, &wake, Some(completion)),
+                Err(_) => break,
+            },
+            recv(deadline) -> _ => service_remote(&mut state, &events, &wake, None),
+        }
     }
     retire_session(&state);
 }
@@ -240,6 +402,8 @@ fn conduct(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake, c
         Command::FavoriteAsset(asset_id) => favorite_asset(state, events, wake, &asset_id),
         Command::Hide(side) => hide(state, events, wake, side),
         Command::Rotate(side) => rotate(state, events, wake, side),
+        Command::VetoStream(side) => veto_stream(state, events, wake, side),
+        Command::ConfigureRemote(config) => configure_remote(state, events, wake, &config),
         Command::Thumbnail { asset_id, bucket } => {
             let result = thumbnail(state, events, wake, &asset_id, bucket);
             if let Err(error) = result {
@@ -302,6 +466,8 @@ fn load_collection(
     state.session = Some(session.id);
     state.prompt = None;
     state.scan_failures = scan.failures.len();
+    state.remote.activate()?;
+    publish(events, wake, Event::Remote(state.remote.summary()));
     publish_collection(state, events, wake)
 }
 
@@ -317,22 +483,72 @@ fn choose(
     wake: &NativeWake,
     side: Side,
 ) -> Result<()> {
-    let Some((prompt, born)) = state.prompt.as_ref() else {
-        bail!("there is no live comparison to judge");
-    };
-    let prompt = prompt.clone();
-    let born = *born;
+    if let Some(LivePrompt::Remote {
+        born,
+        duel_response_ms,
+        ..
+    }) = state.prompt.as_mut()
+        && duel_response_ms.is_none()
+    {
+        *duel_response_ms = Some(elapsed_ms(*born));
+    }
+    let prompt = state
+        .prompt
+        .as_ref()
+        .context("there is no live comparison to judge")?;
     publish(events, wake, Event::Busy("FORGING NEXT PAIR"));
-    let winner = match side {
-        Side::Left => &prompt.left.asset_id,
-        Side::Right => &prompt.right.asset_id,
-    };
-    let response_ms = u32::try_from(born.elapsed().as_millis()).unwrap_or(u32::MAX);
-    state
-        .engine
-        .record_comparison(&prompt.id, winner, &CommandId::fresh(), Some(response_ms))?;
-    state.prompt = None;
-    publish_collection(state, events, wake)
+    match prompt {
+        LivePrompt::Local { prompt, born } => {
+            let prompt = prompt.clone();
+            let response_ms = elapsed_ms(*born);
+            let winner = match side {
+                Side::Left => &prompt.left.asset_id,
+                Side::Right => &prompt.right.asset_id,
+            };
+            state.engine.record_comparison(
+                &prompt.id,
+                winner,
+                &CommandId::fresh(),
+                Some(response_ms),
+            )?;
+            state.prompt = None;
+            publish_collection(state, events, wake)
+        }
+        LivePrompt::Remote {
+            candidate,
+            anchor,
+            rotation_quarters,
+            born,
+            duel_command,
+            duel_response_ms,
+            ..
+        } => {
+            let candidate = candidate.clone();
+            let anchor = anchor.clone();
+            let rotation_quarters = *rotation_quarters;
+            let duel_command = duel_command.clone();
+            let response_ms = duel_response_ms.unwrap_or_else(|| elapsed_ms(*born));
+            let remote_won = side == Side::Right;
+            if remote_won || candidate.discovery.import_policy == ImportPolicy::NotX {
+                admit_remote(
+                    state,
+                    &candidate,
+                    &anchor,
+                    rotation_quarters,
+                    remote_won,
+                    &duel_command,
+                    response_ms,
+                )?;
+                state.prompt = None;
+                publish_collection(state, events, wake)
+            } else {
+                state.remote.note_duel(&candidate, false)?;
+                state.remote.reject_offer()?;
+                state.prompt = None;
+                forge_pair(state, events, wake)
+            }
+        }
+    }
 }
 
 fn favorite(
@@ -341,12 +557,47 @@ fn favorite(
     wake: &NativeWake,
     side: Side,
 ) -> Result<()> {
-    let prompt = live_prompt(state)?;
-    let asset_id = match side {
-        Side::Left => prompt.left.asset_id.clone(),
-        Side::Right => prompt.right.asset_id.clone(),
-    };
-    favorite_asset(state, events, wake, &asset_id)
+    match state
+        .prompt
+        .as_ref()
+        .context("there is no live comparison")?
+    {
+        LivePrompt::Local { prompt, .. } => {
+            let asset_id = match side {
+                Side::Left => prompt.left.asset_id.clone(),
+                Side::Right => prompt.right.asset_id.clone(),
+            };
+            favorite_asset(state, events, wake, &asset_id)
+        }
+        LivePrompt::Remote {
+            candidate,
+            anchor,
+            rotation_quarters,
+            favorite_command,
+            ..
+        } => match side {
+            Side::Left => {
+                let anchor = anchor.clone();
+                favorite_asset(state, events, wake, &anchor)
+            }
+            Side::Right => {
+                let candidate = candidate.clone();
+                let rotation_quarters = *rotation_quarters;
+                let favorite_command = favorite_command.clone();
+                publish(events, wake, Event::Busy("PROMOTING FAVORITE"));
+                let asset = materialize_remote(state, &candidate, rotation_quarters)?;
+                state.engine.set_favorite(
+                    active_session(state)?,
+                    &asset,
+                    true,
+                    &favorite_command,
+                )?;
+                state.remote.seal_promoted(&candidate)?;
+                state.prompt = None;
+                publish_collection(state, events, wake)
+            }
+        },
+    }
 }
 
 fn favorite_asset(
@@ -391,16 +642,40 @@ fn hide(
     wake: &NativeWake,
     side: Side,
 ) -> Result<()> {
-    let collection = active_collection(state)?;
-    let prompt = live_prompt(state)?;
-    let asset = match side {
-        Side::Left => &prompt.left.asset_id,
-        Side::Right => &prompt.right.asset_id,
-    };
-    publish(events, wake, Event::Busy("WITHDRAWING IMAGE"));
-    state.engine.set_hidden(collection, asset, true)?;
-    state.prompt = None;
-    publish_collection(state, events, wake)
+    match state
+        .prompt
+        .as_ref()
+        .context("there is no live comparison")?
+    {
+        LivePrompt::Local { prompt, .. } => {
+            let asset = match side {
+                Side::Left => prompt.left.asset_id.clone(),
+                Side::Right => prompt.right.asset_id.clone(),
+            };
+            publish(events, wake, Event::Busy("WITHDRAWING IMAGE"));
+            state
+                .engine
+                .set_hidden(active_collection(state)?, &asset, true)?;
+            state.prompt = None;
+            publish_collection(state, events, wake)
+        }
+        LivePrompt::Remote { anchor, .. } => match side {
+            Side::Left => {
+                let anchor = anchor.clone();
+                publish(events, wake, Event::Busy("WITHDRAWING IMAGE"));
+                state
+                    .engine
+                    .set_hidden(active_collection(state)?, &anchor, true)?;
+                state.prompt = None;
+                publish_collection(state, events, wake)
+            }
+            Side::Right => {
+                state.remote.reject_offer()?;
+                state.prompt = None;
+                forge_pair(state, events, wake)
+            }
+        },
+    }
 }
 
 fn rotate(
@@ -409,9 +684,36 @@ fn rotate(
     wake: &NativeWake,
     side: Side,
 ) -> Result<()> {
-    let occurrence = match side {
-        Side::Left => live_prompt(state)?.left.occurrence_id,
-        Side::Right => live_prompt(state)?.right.occurrence_id,
+    if side == Side::Right
+        && let Some(LivePrompt::Remote {
+            candidate,
+            rotation_quarters,
+            ..
+        }) = state.prompt.as_mut()
+    {
+        let candidate = candidate.clone();
+        *rotation_quarters = rotation_quarters.wrapping_add(1) % 4;
+        return publish_remote_pair(state, events, wake, &candidate);
+    }
+    let occurrence = match state
+        .prompt
+        .as_ref()
+        .context("there is no live comparison")?
+    {
+        LivePrompt::Local { prompt, .. } => match side {
+            Side::Left => prompt.left.occurrence_id,
+            Side::Right => prompt.right.occurrence_id,
+        },
+        LivePrompt::Remote { anchor, .. } => {
+            state
+                .engine
+                .assets(active_collection(state)?)?
+                .into_iter()
+                .find(|asset| &asset.id == anchor)
+                .context("remote anchor left the active catalog")?
+                .occurrence
+                .id
+        }
     };
     publish(events, wake, Event::Busy("TURNING IMAGE"));
     let _rotation = state.engine.rotate_occurrence(occurrence, 1)?;
@@ -498,6 +800,30 @@ fn publish_collection(
             cards: state.cards.clone(),
         },
     );
+    forge_pair(state, events, wake)
+}
+
+fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake) -> Result<()> {
+    if !state.cards.is_empty()
+        && (state.cards.len() < 2 || state.remote_probability.draw(state.lottery.draw()))
+        && let Some(candidate) = state.remote.offer()?
+    {
+        let slot = state.remote_anchor_cursor % state.cards.len();
+        state.remote_anchor_cursor = state.remote_anchor_cursor.wrapping_add(1);
+        let anchor = state.cards[slot].asset_id.clone();
+        state.prompt = Some(LivePrompt::Remote {
+            candidate: candidate.clone(),
+            anchor,
+            rotation_quarters: 0,
+            born: Instant::now(),
+            duel_command: CommandId::fresh(),
+            duel_response_ms: None,
+            favorite_command: CommandId::fresh(),
+        });
+        publish_remote_pair(state, events, wake, &candidate)?;
+        publish(events, wake, Event::Remote(state.remote.summary()));
+        return Ok(());
+    }
     if state.cards.len() < 2 {
         state.prompt = None;
         publish(events, wake, Event::NoComparison);
@@ -508,18 +834,176 @@ fn publish_collection(
     let right = card_for(state, &prompt.right.asset_id)?.clone();
     let left_blade = decode_thumbnail(&left.path, left.rotation_quarters, PROMPT_EDGE)?;
     let right_blade = decode_thumbnail(&right.path, right.rotation_quarters, PROMPT_EDGE)?;
-    state.prompt = Some((prompt, Instant::now()));
+    state.prompt = Some(LivePrompt::Local {
+        prompt,
+        born: Instant::now(),
+    });
     publish(
         events,
         wake,
         Event::Pair(Pair {
-            left,
-            right,
+            left: PairCard::Local(left),
+            right: PairCard::Local(right),
             left_blade,
             right_blade,
         }),
     );
     Ok(())
+}
+
+fn publish_remote_pair(
+    state: &EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    candidate: &Prepared,
+) -> Result<()> {
+    let LivePrompt::Remote {
+        anchor,
+        rotation_quarters,
+        ..
+    } = state
+        .prompt
+        .as_ref()
+        .context("remote pair lost its live prompt")?
+    else {
+        bail!("remote pair was replaced by a local prompt");
+    };
+    let left = card_for(state, anchor)?.clone();
+    let left_blade = decode_thumbnail(&left.path, left.rotation_quarters, PROMPT_EDGE)?;
+    let right_blade = decode_thumbnail(&candidate.cache_path, *rotation_quarters, PROMPT_EDGE)?;
+    let (width, height) = if rotation_quarters % 2 == 0 {
+        (candidate.discovery.width, candidate.discovery.height)
+    } else {
+        (candidate.discovery.height, candidate.discovery.width)
+    };
+    publish(
+        events,
+        wake,
+        Event::Pair(Pair {
+            left: PairCard::Local(left),
+            right: PairCard::Remote(RemoteCard {
+                path: candidate.cache_path.clone(),
+                width,
+                height,
+                #[cfg(feature = "egui-test")]
+                rotation_quarters: *rotation_quarters,
+                title: candidate.discovery.title.clone(),
+                source: candidate.discovery.source_name.clone(),
+                stream: candidate.discovery.stream_title.clone(),
+            }),
+            left_blade,
+            right_blade,
+        }),
+    );
+    Ok(())
+}
+
+fn materialize_remote(
+    state: &EngineState,
+    candidate: &Prepared,
+    rotation_quarters: u8,
+) -> Result<AssetId> {
+    let collection = active_collection(state)?;
+    let root = state.engine.collection(collection)?.root;
+    let promotion = promote(&root, candidate, rotation_quarters)?;
+    state
+        .engine
+        .ingest_occurrence(collection, &promotion.path)
+        .map_err(anyhow::Error::from)
+}
+
+fn admit_remote(
+    state: &mut EngineState,
+    candidate: &Prepared,
+    anchor: &AssetId,
+    rotation_quarters: u8,
+    remote_won: bool,
+    command: &CommandId,
+    response_ms: u32,
+) -> Result<()> {
+    let remote = materialize_remote(state, candidate, rotation_quarters)?;
+    if &remote != anchor {
+        let winner = if remote_won { &remote } else { anchor };
+        state.engine.record_promoted_comparison(
+            active_session(state)?,
+            anchor,
+            &remote,
+            winner,
+            command,
+            Some(response_ms),
+        )?;
+    }
+    state.remote.note_duel(candidate, remote_won)?;
+    state.remote.seal_promoted(candidate)
+}
+
+fn veto_stream(
+    state: &mut EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    side: Side,
+) -> Result<()> {
+    ensure_remote_side(state, side)?;
+    state.remote.veto_offer_stream()?;
+    state.prompt = None;
+    forge_pair(state, events, wake)
+}
+
+fn configure_remote(
+    state: &mut EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    config: &RemoteConfig,
+) -> Result<()> {
+    state.remote_probability = config.sample_probability;
+    state.remote.reconfigure(config)?;
+    if matches!(state.prompt.as_ref(), Some(LivePrompt::Remote { .. })) {
+        state.prompt = None;
+    }
+    if state.prompt.is_none() && state.collection.is_some() {
+        forge_pair(state, events, wake)?;
+    }
+    publish(events, wake, Event::Remote(state.remote.summary()));
+    Ok(())
+}
+
+fn service_remote(
+    state: &mut EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    completion: Option<RemoteEffect>,
+) {
+    let result = match completion {
+        Some(completion) => state.remote.settle(completion),
+        None => state.remote.drive(),
+    };
+    match result {
+        Ok(()) => {
+            publish_foreground(events, wake, Event::Remote(state.remote.summary()));
+            if state.prompt.is_none()
+                && state.collection.is_some()
+                && let Err(error) = forge_pair(state, events, wake)
+            {
+                publish(events, wake, Event::RemoteFault(format!("{error:#}")));
+            }
+        }
+        Err(error) => {
+            state.remote.poison();
+            publish(events, wake, Event::RemoteFault(format!("{error:#}")));
+        }
+    }
+}
+
+fn ensure_remote_side(state: &EngineState, side: Side) -> Result<()> {
+    if side == Side::Right && matches!(state.prompt.as_ref(), Some(LivePrompt::Remote { .. })) {
+        Ok(())
+    } else {
+        bail!("only a remote challenger stream can be vetoed")
+    }
+}
+
+fn elapsed_ms(born: Instant) -> u32 {
+    u32::try_from(born.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
 fn decode_thumbnail(path: &Path, rotation_quarters: u8, edge: u32) -> Result<Blade> {
@@ -556,14 +1040,6 @@ fn blade(image: RgbaImage) -> Blade {
     }
 }
 
-fn live_prompt(state: &EngineState) -> Result<&ComparisonPrompt> {
-    state
-        .prompt
-        .as_ref()
-        .map(|(prompt, _)| prompt)
-        .context("there is no live comparison")
-}
-
 fn active_collection(state: &EngineState) -> Result<CollectionId> {
     state.collection.context("no collection is active")
 }
@@ -586,6 +1062,12 @@ fn card_for<'a>(state: &'a EngineState, asset: &AssetId) -> Result<&'a Card> {
 fn publish(events: &Sender<Event>, wake: &NativeWake, event: Event) {
     if events.send(event).is_ok() {
         let _woken = wake.request_repaint();
+    }
+}
+
+fn publish_foreground(events: &Sender<Event>, wake: &NativeWake, event: Event) {
+    if events.send(event).is_ok() {
+        let _woken = wake.request_foreground_repaint();
     }
 }
 
