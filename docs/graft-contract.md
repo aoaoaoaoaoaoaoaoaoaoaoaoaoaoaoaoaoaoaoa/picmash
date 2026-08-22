@@ -37,10 +37,10 @@ hiding, rotation, and explicitly configured remote challengers. Similarity is
 stored but has no authorized learner. Face workflows remain excluded.
 
 The native event loop owns no blocking filesystem, database, image-decoding,
-or model work. A bounded command channel feeds one engine worker. Two fixed
-remote effect lanes perform catalog and media work; every mailbox and retained
-frontier is bounded. Image blades cross back as immutable RGBA buffers and
-become GPU textures on the UI thread.
+or model work. A bounded command channel feeds one engine worker. Three fixed
+remote effect lanes perform catalog, media, and archival work; every mailbox
+and retained frontier is bounded. Image blades cross back as immutable RGBA
+buffers and become GPU textures on the UI thread.
 The external acceptance executable observes only a small one-way state and
 stable target vocabulary from `picmash-contract`.
 
@@ -65,7 +65,10 @@ decodes the prepared payload, applies the judged rotation, losslessly
 re-encodes it as JPEG XL, verifies exact render identity, and atomically writes
 it beneath `.picmash-imported/`. Only then may the engine ingest the occurrence
 and seal the remote item as promoted. A promoted duel is inserted atomically;
-its command ID survives exact retries.
+its command ID survives exact retries. The promotion commitment and exact local
+presentation are durable before the UI advances; the engine reserves the
+judgment's evidence order at the same boundary. Maximum-effort encoding runs on
+a bounded background lane whose cancellation leaves that commitment resumable.
 
 ## Preference Law
 

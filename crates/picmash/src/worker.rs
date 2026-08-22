@@ -6,7 +6,7 @@ use image::{RgbaImage, imageops};
 use picmash_contract::Side;
 use picmash_engine::{
     AssetId, AssetView, CollectionId, CommandId, ComparisonPrompt, Engine, PreferenceEvaluation,
-    ScanProgress, SessionId, canonical_image,
+    PresentedAsset, ScanProgress, SessionId, canonical_image,
 };
 use std::{
     fs,
@@ -22,7 +22,10 @@ use std::{
 
 use crate::{
     configuration::{ImportPolicy, Probability, RemoteConfig},
-    remote::{Effect as RemoteEffect, Prepared, Reactor, Summary as RemoteSummary, promote},
+    remote::{
+        ArchiveEffect, ArchiveLane, DuelVictor, Effect as RemoteEffect, Prepared, PromotionIntent,
+        PromotionJudgment, Reactor, Summary as RemoteSummary,
+    },
     xdg::Lair,
 };
 
@@ -34,11 +37,10 @@ const CONTEXT_REVISION: &str = "poolrooms-pairwise-v1";
 
 #[derive(Clone, Debug)]
 pub struct Card {
-    pub asset_id: AssetId,
+    pub presentation: PresentedAsset,
     pub path: PathBuf,
     pub width: u32,
     pub height: u32,
-    pub rotation_quarters: u8,
     pub occurrence_count: u32,
     pub favorite: bool,
     pub duel_count: u32,
@@ -48,11 +50,15 @@ pub struct Card {
 impl From<&AssetView> for Card {
     fn from(view: &AssetView) -> Self {
         Self {
-            asset_id: view.id.clone(),
+            presentation: PresentedAsset {
+                asset_id: view.id.clone(),
+                occurrence_id: view.occurrence.id,
+                render: view.occurrence.render.clone(),
+                rotation_quarters: view.occurrence.rotation_quarters,
+            },
             path: view.occurrence.path.clone(),
             width: view.occurrence.width,
             height: view.occurrence.height,
-            rotation_quarters: view.occurrence.rotation_quarters,
             occurrence_count: view.occurrence_count,
             favorite: view.favorite,
             duel_count: view.duel_count,
@@ -85,7 +91,7 @@ pub enum PairCard {
 impl PairCard {
     pub const fn width(&self) -> u32 {
         match self {
-            Self::Local(card) if card.rotation_quarters % 2 == 0 => card.width,
+            Self::Local(card) if card.presentation.rotation_quarters % 2 == 0 => card.width,
             Self::Local(card) => card.height,
             Self::Remote(card) => card.width,
         }
@@ -93,7 +99,7 @@ impl PairCard {
 
     pub const fn height(&self) -> u32 {
         match self {
-            Self::Local(card) if card.rotation_quarters % 2 == 0 => card.height,
+            Self::Local(card) if card.presentation.rotation_quarters % 2 == 0 => card.height,
             Self::Local(card) => card.width,
             Self::Remote(card) => card.height,
         }
@@ -102,7 +108,7 @@ impl PairCard {
     #[cfg(feature = "egui-test")]
     pub const fn rotation_quarters(&self) -> u8 {
         match self {
-            Self::Local(card) => card.rotation_quarters,
+            Self::Local(card) => card.presentation.rotation_quarters,
             Self::Remote(card) => card.rotation_quarters,
         }
     }
@@ -188,9 +194,14 @@ pub enum Event {
         summary: Summary,
         cards: Vec<Card>,
     },
-    Pair(Pair),
+    CatalogRefreshed {
+        summary: Summary,
+        cards: Vec<Card>,
+    },
+    Pair(Box<Pair>),
     Remote(RemoteSummary),
     RemoteFault(String),
+    ArchiveFault(String),
     NoComparison,
     Favorite {
         asset_id: AssetId,
@@ -296,6 +307,7 @@ struct EngineState {
     cards: Vec<Card>,
     scan_failures: usize,
     remote: Reactor,
+    archive: ArchiveLane,
     remote_probability: Probability,
     lottery: Lottery,
     remote_anchor_cursor: usize,
@@ -307,8 +319,8 @@ enum LivePrompt {
         born: Instant,
     },
     Remote {
-        candidate: Prepared,
-        anchor: AssetId,
+        candidate: Box<Prepared>,
+        anchor: PresentedAsset,
         rotation_quarters: u8,
         born: Instant,
         duel_command: CommandId,
@@ -347,7 +359,12 @@ fn run(
     let result = Engine::open(lair.database())
         .map_err(anyhow::Error::from)
         .and_then(|engine| {
-            let remote = Reactor::open(&lair, &remote_config)?;
+            let mut remote = Reactor::open(&lair, &remote_config)?;
+            let archive = ArchiveLane::raise()?;
+            for intent in remote.take_restored_promotions() {
+                reserve_promotion(&engine, &intent)?;
+                archive.submit(intent)?;
+            }
             Ok(EngineState {
                 engine,
                 lair,
@@ -358,6 +375,7 @@ fn run(
                 cards: Vec::new(),
                 scan_failures: 0,
                 remote,
+                archive,
                 remote_probability: remote_config.sample_probability,
                 lottery: Lottery::new(),
                 remote_anchor_cursor: 0,
@@ -376,6 +394,7 @@ fn run(
         None => publish(&events, &wake, Event::NeedCollection),
     }
     let remote_completions = state.remote.completions().clone();
+    let archive_completions = state.archive.completions().clone();
     while !stop.load(Ordering::Acquire) {
         let deadline = after(state.remote.wait());
         select! {
@@ -385,6 +404,10 @@ fn run(
             },
             recv(remote_completions) -> completion => match completion {
                 Ok(completion) => service_remote(&mut state, &events, &wake, Some(completion)),
+                Err(_) => break,
+            },
+            recv(archive_completions) -> completion => match completion {
+                Ok(completion) => service_archive(&mut state, &events, &wake, completion),
                 Err(_) => break,
             },
             recv(deadline) -> _ => service_remote(&mut state, &events, &wake, None),
@@ -496,17 +519,9 @@ fn choose(
         .prompt
         .as_ref()
         .context("there is no live comparison to judge")?;
-    publish(
-        events,
-        wake,
-        Event::Busy(if matches!(prompt, LivePrompt::Remote { .. }) {
-            "PROMOTING CHALLENGER"
-        } else {
-            "FORGING NEXT PAIR"
-        }),
-    );
     match prompt {
         LivePrompt::Local { prompt, born } => {
+            publish(events, wake, Event::Busy("FORGING NEXT PAIR"));
             let prompt = prompt.clone();
             let response_ms = elapsed_ms(*born);
             let winner = match side {
@@ -538,23 +553,30 @@ fn choose(
             let response_ms = duel_response_ms.unwrap_or_else(|| elapsed_ms(*born));
             let remote_won = side == Side::Right;
             if remote_won || candidate.discovery.import_policy == ImportPolicy::NotX {
-                admit_remote(
+                let session_id = active_session(state)?.clone();
+                queue_promotion(
                     state,
                     &candidate,
-                    &anchor,
                     rotation_quarters,
-                    remote_won,
-                    &duel_command,
-                    response_ms,
+                    PromotionJudgment::Duel {
+                        session_id,
+                        anchor,
+                        victor: if remote_won {
+                            DuelVictor::Challenger
+                        } else {
+                            DuelVictor::Anchor
+                        },
+                        command_id: duel_command,
+                        response_ms,
+                    },
                 )?;
-                state.prompt = None;
-                publish_collection(state, events, wake)
+                publish(events, wake, Event::Remote(state.remote.summary()));
             } else {
                 state.remote.note_duel(&candidate, false)?;
                 state.remote.reject_offer()?;
-                state.prompt = None;
-                forge_pair(state, events, wake)
             }
+            state.prompt = None;
+            forge_pair(state, events, wake)
         }
     }
 }
@@ -586,23 +608,25 @@ fn favorite(
         } => match side {
             Side::Left => {
                 let anchor = anchor.clone();
-                favorite_asset(state, events, wake, &anchor)
+                favorite_asset(state, events, wake, &anchor.asset_id)
             }
             Side::Right => {
                 let candidate = candidate.clone();
                 let rotation_quarters = *rotation_quarters;
                 let favorite_command = favorite_command.clone();
-                publish(events, wake, Event::Busy("PROMOTING FAVORITE"));
-                let asset = materialize_remote(state, &candidate, rotation_quarters)?;
-                state.engine.set_favorite(
-                    active_session(state)?,
-                    &asset,
-                    true,
-                    &favorite_command,
+                let session_id = active_session(state)?.clone();
+                queue_promotion(
+                    state,
+                    &candidate,
+                    rotation_quarters,
+                    PromotionJudgment::Favorite {
+                        session_id,
+                        command_id: favorite_command,
+                    },
                 )?;
-                state.remote.seal_promoted(&candidate)?;
                 state.prompt = None;
-                publish_collection(state, events, wake)
+                publish(events, wake, Event::Remote(state.remote.summary()));
+                forge_pair(state, events, wake)
             }
         },
     }
@@ -617,7 +641,7 @@ fn favorite_asset(
     let active = !state
         .cards
         .iter()
-        .find(|card| &card.asset_id == asset_id)
+        .find(|card| &card.presentation.asset_id == asset_id)
         .context("comparison asset left the active catalog")?
         .favorite;
     state.engine.set_favorite(
@@ -629,7 +653,7 @@ fn favorite_asset(
     if let Some(card) = state
         .cards
         .iter_mut()
-        .find(|card| &card.asset_id == asset_id)
+        .find(|card| &card.presentation.asset_id == asset_id)
     {
         card.favorite = active;
     }
@@ -673,7 +697,7 @@ fn hide(
                 publish(events, wake, Event::Busy("WITHDRAWING IMAGE"));
                 state
                     .engine
-                    .set_hidden(active_collection(state)?, &anchor, true)?;
+                    .set_hidden(active_collection(state)?, &anchor.asset_id, true)?;
                 state.prompt = None;
                 publish_collection(state, events, wake)
             }
@@ -712,16 +736,7 @@ fn rotate(
             Side::Left => prompt.left.occurrence_id,
             Side::Right => prompt.right.occurrence_id,
         },
-        LivePrompt::Remote { anchor, .. } => {
-            state
-                .engine
-                .assets(active_collection(state)?)?
-                .into_iter()
-                .find(|asset| &asset.id == anchor)
-                .context("remote anchor left the active catalog")?
-                .occurrence
-                .id
-        }
+        LivePrompt::Remote { anchor, .. } => anchor.occurrence_id,
     };
     publish(events, wake, Event::Busy("TURNING IMAGE"));
     let _rotation = state.engine.rotate_occurrence(occurrence, 1)?;
@@ -739,11 +754,11 @@ fn thumbnail(
     let card = state
         .cards
         .iter()
-        .find(|card| &card.asset_id == asset_id)
+        .find(|card| &card.presentation.asset_id == asset_id)
         .context("thumbnail asset left the active catalog")?;
     let blade = decode_thumbnail(
         &card.path,
-        card.rotation_quarters,
+        card.presentation.rotation_quarters,
         THUMB_EDGE.saturating_mul(1_u32 << bucket.min(2)),
     )?;
     publish(
@@ -768,9 +783,9 @@ fn full(
     let card = state
         .cards
         .iter()
-        .find(|card| &card.asset_id == asset_id)
+        .find(|card| &card.presentation.asset_id == asset_id)
         .context("viewer asset left the active catalog")?;
-    let image = decode_rgba(&card.path, card.rotation_quarters)?;
+    let image = decode_rgba(&card.path, card.presentation.rotation_quarters)?;
     let display = (image.width() > bound[0] || image.height() > bound[1])
         .then(|| blade(fitted_thumbnail(&image, bound[0], bound[1])));
     publish(
@@ -791,24 +806,45 @@ fn publish_collection(
     wake: &NativeWake,
 ) -> Result<()> {
     let collection = active_collection(state)?;
+    let (summary, cards) = rebuild_collection(state, collection)?;
+    publish(events, wake, Event::Catalog { summary, cards });
+    forge_pair(state, events, wake)
+}
+
+fn refresh_collection(
+    state: &mut EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    collection: CollectionId,
+) -> Result<()> {
+    if state.collection != Some(collection) {
+        return Ok(());
+    }
+    let (summary, cards) = rebuild_collection(state, collection)?;
+    publish(events, wake, Event::CatalogRefreshed { summary, cards });
+    if state.prompt.is_none() {
+        forge_pair(state, events, wake)?;
+    }
+    Ok(())
+}
+
+fn rebuild_collection(
+    state: &mut EngineState,
+    collection: CollectionId,
+) -> Result<(Summary, Vec<Card>)> {
     let snapshot = state.engine.rebuild_preferences(collection)?;
     let assets = state.engine.assets(collection)?;
     state.cards = assets.iter().map(Card::from).collect();
     let root = state.engine.collection(collection)?.root;
-    publish(
-        events,
-        wake,
-        Event::Catalog {
-            summary: Summary {
-                root,
-                visible_assets: state.cards.len(),
-                scan_failures: state.scan_failures,
-                evaluation: snapshot.evaluation,
-            },
-            cards: state.cards.clone(),
+    Ok((
+        Summary {
+            root,
+            visible_assets: state.cards.len(),
+            scan_failures: state.scan_failures,
+            evaluation: snapshot.evaluation,
         },
-    );
-    forge_pair(state, events, wake)
+        state.cards.clone(),
+    ))
 }
 
 fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake) -> Result<()> {
@@ -818,9 +854,9 @@ fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake
     {
         let slot = state.remote_anchor_cursor % state.cards.len();
         state.remote_anchor_cursor = state.remote_anchor_cursor.wrapping_add(1);
-        let anchor = state.cards[slot].asset_id.clone();
+        let anchor = state.cards[slot].presentation.clone();
         state.prompt = Some(LivePrompt::Remote {
-            candidate: candidate.clone(),
+            candidate: Box::new(candidate.clone()),
             anchor,
             rotation_quarters: 0,
             born: Instant::now(),
@@ -840,8 +876,13 @@ fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake
     let prompt = state.engine.propose_comparison(active_session(state)?)?;
     let left = card_for(state, &prompt.left.asset_id)?.clone();
     let right = card_for(state, &prompt.right.asset_id)?.clone();
-    let left_blade = decode_thumbnail(&left.path, left.rotation_quarters, PROMPT_EDGE)?;
-    let right_blade = decode_thumbnail(&right.path, right.rotation_quarters, PROMPT_EDGE)?;
+    let left_blade =
+        decode_thumbnail(&left.path, left.presentation.rotation_quarters, PROMPT_EDGE)?;
+    let right_blade = decode_thumbnail(
+        &right.path,
+        right.presentation.rotation_quarters,
+        PROMPT_EDGE,
+    )?;
     state.prompt = Some(LivePrompt::Local {
         prompt,
         born: Instant::now(),
@@ -849,12 +890,12 @@ fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake
     publish(
         events,
         wake,
-        Event::Pair(Pair {
+        Event::Pair(Box::new(Pair {
             left: PairCard::Local(left),
             right: PairCard::Local(right),
             left_blade,
             right_blade,
-        }),
+        })),
     );
     Ok(())
 }
@@ -876,8 +917,9 @@ fn publish_remote_pair(
     else {
         bail!("remote pair was replaced by a local prompt");
     };
-    let left = card_for(state, anchor)?.clone();
-    let left_blade = decode_thumbnail(&left.path, left.rotation_quarters, PROMPT_EDGE)?;
+    let left = card_for(state, &anchor.asset_id)?.clone();
+    let left_blade =
+        decode_thumbnail(&left.path, left.presentation.rotation_quarters, PROMPT_EDGE)?;
     let right_blade = decode_thumbnail(&candidate.cache_path, *rotation_quarters, PROMPT_EDGE)?;
     let (width, height) = if rotation_quarters % 2 == 0 {
         (candidate.discovery.width, candidate.discovery.height)
@@ -887,7 +929,7 @@ fn publish_remote_pair(
     publish(
         events,
         wake,
-        Event::Pair(Pair {
+        Event::Pair(Box::new(Pair {
             left: PairCard::Local(left),
             right: PairCard::Remote(RemoteCard {
                 path: candidate.cache_path.clone(),
@@ -901,48 +943,111 @@ fn publish_remote_pair(
             }),
             left_blade,
             right_blade,
-        }),
+        })),
     );
     Ok(())
 }
 
-fn materialize_remote(
-    state: &EngineState,
-    candidate: &Prepared,
-    rotation_quarters: u8,
-) -> Result<AssetId> {
-    let collection = active_collection(state)?;
-    let root = state.engine.collection(collection)?.root;
-    let promotion = promote(&root, candidate, rotation_quarters)?;
-    state
-        .engine
-        .ingest_occurrence(collection, &promotion.path)
-        .map_err(anyhow::Error::from)
-}
-
-fn admit_remote(
+fn queue_promotion(
     state: &mut EngineState,
     candidate: &Prepared,
-    anchor: &AssetId,
     rotation_quarters: u8,
-    remote_won: bool,
-    command: &CommandId,
-    response_ms: u32,
+    judgment: PromotionJudgment,
 ) -> Result<()> {
-    let remote = materialize_remote(state, candidate, rotation_quarters)?;
-    if &remote != anchor {
-        let winner = if remote_won { &remote } else { anchor };
-        state.engine.record_promoted_comparison(
-            active_session(state)?,
-            anchor,
-            &remote,
-            winner,
-            command,
-            Some(response_ms),
-        )?;
+    let collection = active_collection(state)?;
+    let root = state.engine.collection(collection)?.root;
+    let intent = state
+        .remote
+        .begin_promotion(candidate, root, rotation_quarters, judgment)?;
+    if let Err(error) = reserve_promotion(&state.engine, &intent) {
+        state.remote.abort_promotion(&intent)?;
+        return Err(error);
     }
-    state.remote.note_duel(candidate, remote_won)?;
-    state.remote.seal_promoted(candidate)
+    if let Err(error) = state.archive.submit(intent.clone()) {
+        state.remote.abort_promotion(&intent)?;
+        state
+            .engine
+            .cancel_promoted_reservation(intent.judgment.command_id())?;
+        return Err(error);
+    }
+    state.remote.drive()
+}
+
+fn reserve_promotion(engine: &Engine, intent: &PromotionIntent) -> Result<()> {
+    let identity = intent.candidate.discovery.item_id.as_str();
+    match &intent.judgment {
+        PromotionJudgment::Duel {
+            session_id,
+            anchor,
+            victor,
+            command_id,
+            response_ms,
+        } => {
+            engine.reserve_promoted_comparison(
+                session_id,
+                identity,
+                anchor,
+                intent.rotation_quarters,
+                *victor,
+                command_id,
+                *response_ms,
+            )?;
+        }
+        PromotionJudgment::Favorite {
+            session_id,
+            command_id,
+        } => {
+            engine.reserve_promoted_favorite(session_id, identity, command_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn commit_promotion(
+    state: &mut EngineState,
+    intent: &PromotionIntent,
+    path: &Path,
+) -> Result<CollectionId> {
+    let session_id = intent.judgment.session_id();
+    let collection = state.engine.session_collection(session_id)?;
+    let root = state.engine.collection(collection)?.root;
+    anyhow::ensure!(
+        root == intent.collection_root,
+        "promotion collection changed before admission"
+    );
+    let challenger = state.engine.ingest_occurrence(collection, path)?;
+    let identity = intent.candidate.discovery.item_id.as_str();
+    match &intent.judgment {
+        PromotionJudgment::Duel {
+            anchor,
+            victor,
+            command_id,
+            response_ms,
+            ..
+        } => {
+            if challenger == anchor.asset_id {
+                state.engine.cancel_promoted_reservation(command_id)?;
+            } else {
+                state.engine.record_promoted_comparison(
+                    session_id,
+                    identity,
+                    anchor,
+                    &challenger,
+                    intent.rotation_quarters,
+                    *victor,
+                    command_id,
+                    *response_ms,
+                )?;
+            }
+        }
+        PromotionJudgment::Favorite { command_id, .. } => {
+            state
+                .engine
+                .set_promoted_favorite(session_id, identity, &challenger, command_id)?;
+        }
+    }
+    state.remote.seal_promoted(intent)?;
+    Ok(collection)
 }
 
 fn veto_stream(
@@ -998,6 +1103,52 @@ fn service_remote(
         Err(error) => {
             state.remote.poison();
             publish(events, wake, Event::RemoteFault(format!("{error:#}")));
+        }
+    }
+}
+
+fn service_archive(
+    state: &mut EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    effect: ArchiveEffect,
+) {
+    let item = effect.intent.candidate.discovery.item_id.clone();
+    let result = effect
+        .result
+        .map_err(anyhow::Error::msg)
+        .and_then(|promotion| commit_promotion(state, &effect.intent, &promotion.path));
+    match result {
+        Ok(collection) => {
+            if let Err(error) = state.remote.drive() {
+                state.remote.poison();
+                publish(events, wake, Event::RemoteFault(format!("{error:#}")));
+            }
+            publish_foreground(events, wake, Event::Remote(state.remote.summary()));
+            if let Err(error) = refresh_collection(state, events, wake, collection) {
+                publish(
+                    events,
+                    wake,
+                    Event::ArchiveFault(format!("admitted archive could not refresh: {error:#}")),
+                );
+            }
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            if let Err(store_error) = state.remote.promotion_failed(&item, &message) {
+                publish(
+                    events,
+                    wake,
+                    Event::ArchiveFault(format!("{message}; persistence fault: {store_error:#}")),
+                );
+            } else {
+                publish(
+                    events,
+                    wake,
+                    Event::ArchiveFault(format!("{message}; restart Picmash to retry")),
+                );
+            }
+            publish_foreground(events, wake, Event::Remote(state.remote.summary()));
         }
     }
 }
@@ -1063,7 +1214,7 @@ fn card_for<'a>(state: &'a EngineState, asset: &AssetId) -> Result<&'a Card> {
     state
         .cards
         .iter()
-        .find(|card| &card.asset_id == asset)
+        .find(|card| &card.presentation.asset_id == asset)
         .context("prompt asset left the active catalog")
 }
 

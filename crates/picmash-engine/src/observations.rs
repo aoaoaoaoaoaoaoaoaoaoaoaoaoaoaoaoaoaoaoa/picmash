@@ -8,13 +8,28 @@ use crate::{
     fault::{Fault, Result},
     ids::{AssetId, CollectionId, CommandId, ObservationId, PromptId, SessionId, SnapshotId},
     media::RenderDigest,
-    model::{ComparisonPrompt, JudgmentSession, PresentedAsset, ThresholdJudgment},
+    model::{ComparisonPrompt, DuelVictor, JudgmentSession, PresentedAsset, ThresholdJudgment},
 };
 
 const PAIR_POLICY: &str = "coverage-anchor-matched-balanced-v2";
 const REMOTE_ADMISSION_POLICY: &str = "remote-admission-v1";
 
 impl Engine {
+    /// Returns the collection that owned a judgment session, including an
+    /// ended session with deferred archive work.
+    pub fn session_collection(&self, session_id: &SessionId) -> Result<CollectionId> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT collection_id FROM pm_sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(CollectionId::from_raw)
+            .ok_or_else(|| Fault::InvalidInput(format!("unknown judgment session {session_id}")))
+    }
+
     pub fn start_session(
         &self,
         collection_id: CollectionId,
@@ -221,58 +236,40 @@ impl Engine {
         Ok(observation_id)
     }
 
-    /// Atomically seals the comparison whose challenger became local only after
-    /// the user judged it. No prompt can survive without its matching duel.
-    pub fn record_promoted_comparison(
+    /// Reserves the durable order of a comparison while its remote challenger
+    /// is still being archived. Repetition with the same command is idempotent.
+    pub fn reserve_promoted_comparison(
         &self,
         session_id: &SessionId,
-        left: &AssetId,
-        right: &AssetId,
-        winner: &AssetId,
+        remote_identity: &str,
+        anchor: &PresentedAsset,
+        challenger_rotation_quarters: u8,
+        victor: DuelVictor,
         command_id: &CommandId,
-        response_ms: Option<u32>,
+        response_ms: u32,
     ) -> Result<ObservationId> {
-        if left == right || (winner != left && winner != right) {
-            return Err(Fault::InvalidInput(
-                "a promoted comparison requires two distinct assets and one winner".to_owned(),
-            ));
+        validate_remote_identity(remote_identity)?;
+        if challenger_rotation_quarters >= 4 {
+            return Err(Fault::InvalidInput(format!(
+                "invalid remote presentation rotation {challenger_rotation_quarters}"
+            )));
         }
+        let digest = promoted_duel_digest(
+            session_id,
+            remote_identity,
+            anchor,
+            challenger_rotation_quarters,
+            victor,
+            response_ms,
+        );
         let now = now_ns()?;
         let mut connection = self.connection.lock();
         let tx = connection.transaction()?;
-        let response = response_ms.map_or_else(String::new, |value| value.to_string());
-        let digest = payload_digest(&[
-            "remote-admission-duel-v1",
-            session_id.as_str(),
-            left.as_str(),
-            right.as_str(),
-            winner.as_str(),
-            &response,
-        ]);
         if let Some(existing) = existing_command(&tx, command_id, &digest)? {
             return Ok(existing);
         }
-        let collection = active_session_collection(&tx, session_id)?;
-        let snapshot_id = tx
-            .query_row(
-                "SELECT id FROM pm_preference_snapshots
-                 WHERE collection_id = ?1 ORDER BY id DESC LIMIT 1",
-                [collection.get()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(SnapshotId::from_raw);
-        let prompt = ComparisonPrompt {
-            id: PromptId::fresh(),
-            session_id: session_id.clone(),
-            left: representative(&tx, collection, left)?,
-            right: representative(&tx, collection, right)?,
-            policy_revision: REMOTE_ADMISSION_POLICY.to_owned(),
-            snapshot_id,
-            issued_at_ns: now,
-        };
-        insert_prompt(&tx, &prompt)?;
-        let observation_id = insert_observation(
+        validate_deferred_presentation(&tx, session_id, anchor)?;
+        let observation = insert_observation(
             &tx,
             command_id,
             session_id,
@@ -280,17 +277,84 @@ impl Engine {
             "asset-duel-v1",
             Some(REMOTE_ADMISSION_POLICY),
             None,
-            response_ms,
+            Some(response_ms),
             "asset_duel",
             &digest,
         )?;
-        insert_duel(&tx, observation_id, &LoadedPrompt::from(&prompt), winner)?;
+        tx.commit()?;
+        Ok(observation)
+    }
+
+    /// Seals a previously reserved comparison after its challenger becomes a
+    /// local asset. The exact anchor seen by the user remains authoritative
+    /// even if that occurrence has since been hidden or rotated.
+    pub fn record_promoted_comparison(
+        &self,
+        session_id: &SessionId,
+        remote_identity: &str,
+        anchor: &PresentedAsset,
+        challenger: &AssetId,
+        challenger_rotation_quarters: u8,
+        victor: DuelVictor,
+        command_id: &CommandId,
+        response_ms: u32,
+    ) -> Result<ObservationId> {
+        if &anchor.asset_id == challenger {
+            return Err(Fault::InvalidInput(
+                "a promoted comparison requires two distinct assets".to_owned(),
+            ));
+        }
+        validate_remote_identity(remote_identity)?;
+        let digest = promoted_duel_digest(
+            session_id,
+            remote_identity,
+            anchor,
+            challenger_rotation_quarters,
+            victor,
+            response_ms,
+        );
+        let mut connection = self.connection.lock();
+        let tx = connection.transaction()?;
+        let observation = existing_command(&tx, command_id, &digest)?.ok_or_else(|| {
+            Fault::InvalidInput("promoted comparison was not reserved".to_owned())
+        })?;
+        let sealed = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pm_asset_duels WHERE observation_id = ?1)",
+            [observation.get()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if sealed {
+            return Ok(observation);
+        }
+        let collection = session_collection(&tx, session_id)?.0;
+        validate_historical_presentation(&tx, collection, anchor)?;
+        let issued_at_ns = tx.query_row(
+            "SELECT recorded_at_ns FROM pm_observations WHERE id = ?1",
+            [observation.get()],
+            |row| row.get(0),
+        )?;
+        let right = historical_representative(&tx, collection, challenger)?;
+        let prompt = ComparisonPrompt {
+            id: PromptId::fresh(),
+            session_id: session_id.clone(),
+            left: anchor.clone(),
+            right,
+            policy_revision: REMOTE_ADMISSION_POLICY.to_owned(),
+            snapshot_id: None,
+            issued_at_ns,
+        };
+        insert_prompt(&tx, &prompt)?;
+        let winner = match victor {
+            DuelVictor::Anchor => &anchor.asset_id,
+            DuelVictor::Challenger => challenger,
+        };
+        insert_duel(&tx, observation, &LoadedPrompt::from(&prompt), winner)?;
         tx.execute(
             "UPDATE pm_prompts SET answered_observation_id = ?2 WHERE id = ?1",
-            params![prompt.id.as_str(), observation_id.get()],
+            params![prompt.id.as_str(), observation.get()],
         )?;
         tx.commit()?;
-        Ok(observation_id)
+        Ok(observation)
     }
 
     pub fn set_favorite(
@@ -347,6 +411,101 @@ impl Engine {
         )?;
         tx.commit()?;
         Ok(observation_id)
+    }
+
+    /// Reserves the durable order of a favorite command while its remote asset
+    /// is still being archived.
+    pub fn reserve_promoted_favorite(
+        &self,
+        session_id: &SessionId,
+        remote_identity: &str,
+        command_id: &CommandId,
+    ) -> Result<ObservationId> {
+        validate_remote_identity(remote_identity)?;
+        let digest = promoted_favorite_digest(session_id, remote_identity);
+        let now = now_ns()?;
+        let mut connection = self.connection.lock();
+        let tx = connection.transaction()?;
+        if let Some(existing) = existing_command(&tx, command_id, &digest)? {
+            return Ok(existing);
+        }
+        let _collection = session_collection(&tx, session_id)?;
+        let observation = insert_observation(
+            &tx,
+            command_id,
+            session_id,
+            now,
+            "favorite-v1",
+            Some(REMOTE_ADMISSION_POLICY),
+            None,
+            None,
+            "favorite_set",
+            &digest,
+        )?;
+        tx.commit()?;
+        Ok(observation)
+    }
+
+    /// Seals a previously reserved favorite command after its asset becomes
+    /// local. The originating session may since have ended.
+    pub fn set_promoted_favorite(
+        &self,
+        session_id: &SessionId,
+        remote_identity: &str,
+        asset_id: &AssetId,
+        command_id: &CommandId,
+    ) -> Result<ObservationId> {
+        validate_remote_identity(remote_identity)?;
+        let digest = promoted_favorite_digest(session_id, remote_identity);
+        let now = now_ns()?;
+        let mut connection = self.connection.lock();
+        let tx = connection.transaction()?;
+        let observation = existing_command(&tx, command_id, &digest)?
+            .ok_or_else(|| Fault::InvalidInput("promoted favorite was not reserved".to_owned()))?;
+        let sealed = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pm_favorite_events WHERE observation_id = ?1)",
+            [observation.get()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if sealed {
+            return Ok(observation);
+        }
+        let collection = session_collection(&tx, session_id)?.0;
+        let changed = tx.execute(
+            "UPDATE pm_collection_assets SET favorite = 1, updated_at_ns = ?3
+             WHERE collection_id = ?1 AND asset_id = ?2",
+            params![collection.get(), asset_id.as_str(), now],
+        )?;
+        if changed != 1 {
+            return Err(Fault::InvalidInput(format!(
+                "asset {asset_id} does not belong to session collection {collection}"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO pm_favorite_events(observation_id, collection_id, asset_id, active)
+             VALUES (?1, ?2, ?3, 1)",
+            params![observation.get(), collection.get(), asset_id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(observation)
+    }
+
+    /// Removes an unsealed remote reservation when its outer archival
+    /// commitment is rolled back. Sealed evidence is never touched.
+    pub fn cancel_promoted_reservation(&self, command_id: &CommandId) -> Result<()> {
+        let connection = self.connection.lock();
+        connection.execute(
+            "DELETE FROM pm_observations
+             WHERE command_id = ?1 AND policy_revision = ?2
+               AND NOT EXISTS(
+                   SELECT 1 FROM pm_asset_duels WHERE observation_id = pm_observations.id
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM pm_favorite_events WHERE observation_id = pm_observations.id
+               )",
+            params![command_id.as_str(), REMOTE_ADMISSION_POLICY],
+        )?;
+        Ok(())
     }
 
     pub fn record_threshold(
@@ -533,6 +692,16 @@ fn insert_observation(
 }
 
 fn active_session_collection(tx: &Transaction<'_>, id: &SessionId) -> Result<CollectionId> {
+    let (collection_id, ended) = session_collection(tx, id)?;
+    if ended.is_some() {
+        return Err(Fault::InvalidInput(format!(
+            "judgment session {id} has ended"
+        )));
+    }
+    Ok(collection_id)
+}
+
+fn session_collection(tx: &Transaction<'_>, id: &SessionId) -> Result<(CollectionId, Option<i64>)> {
     let (collection_id, ended) = tx
         .query_row(
             "SELECT collection_id, ended_at_ns FROM pm_sessions WHERE id = ?1",
@@ -541,12 +710,7 @@ fn active_session_collection(tx: &Transaction<'_>, id: &SessionId) -> Result<Col
         )
         .optional()?
         .ok_or_else(|| Fault::InvalidInput(format!("unknown judgment session {id}")))?;
-    if ended.is_some() {
-        return Err(Fault::InvalidInput(format!(
-            "judgment session {id} has ended"
-        )));
-    }
-    Ok(CollectionId::from_raw(collection_id))
+    Ok((CollectionId::from_raw(collection_id), ended))
 }
 
 fn validate_presentation(
@@ -579,7 +743,56 @@ fn validate_presentation(
     }
 }
 
-fn representative(
+fn validate_deferred_presentation(
+    tx: &Transaction<'_>,
+    session_id: &SessionId,
+    presented: &PresentedAsset,
+) -> Result<()> {
+    let collection = session_collection(tx, session_id)?.0;
+    validate_historical_presentation(tx, collection, presented)?;
+    let rotation_matches = tx.query_row(
+        "SELECT rotation_quarters = ?2 FROM pm_occurrences WHERE id = ?1",
+        params![presented.occurrence_id.get(), presented.rotation_quarters],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if rotation_matches {
+        Ok(())
+    } else {
+        Err(Fault::InvalidInput(
+            "presented asset rotation no longer matches its occurrence".to_owned(),
+        ))
+    }
+}
+
+fn validate_historical_presentation(
+    tx: &Transaction<'_>,
+    collection: CollectionId,
+    presented: &PresentedAsset,
+) -> Result<()> {
+    let valid = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pm_occurrences o JOIN pm_assets a ON a.id = o.asset_id
+             WHERE o.id = ?1 AND o.collection_id = ?2 AND o.asset_id = ?3
+               AND a.render_digest = ?4
+         )",
+        params![
+            presented.occurrence_id.get(),
+            collection.get(),
+            presented.asset_id.as_str(),
+            presented.render.as_str(),
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if valid {
+        Ok(())
+    } else {
+        Err(Fault::InvalidInput(
+            "presented asset does not belong to its session collection".to_owned(),
+        ))
+    }
+}
+
+fn historical_representative(
     tx: &Transaction<'_>,
     collection: CollectionId,
     asset: &AssetId,
@@ -590,7 +803,7 @@ fn representative(
          JOIN pm_assets a ON a.id = o.asset_id
          JOIN pm_collection_assets ca
            ON ca.collection_id = o.collection_id AND ca.asset_id = o.asset_id
-         WHERE o.collection_id = ?1 AND o.asset_id = ?2 AND o.present = 1 AND ca.hidden = 0
+         WHERE o.collection_id = ?1 AND o.asset_id = ?2 AND o.present = 1
          ORDER BY o.width * o.height DESC, o.byte_len DESC, o.path ASC
          LIMIT 1",
         params![collection.get(), asset.as_str()],
@@ -605,7 +818,7 @@ fn representative(
     .optional()?
     .ok_or_else(|| {
         Fault::InvalidInput(format!(
-            "asset {asset} is not visible in collection {collection}"
+            "asset {asset} has no present occurrence in collection {collection}"
         ))
     })
     .and_then(|(occurrence, render, rotation)| {
@@ -775,6 +988,54 @@ fn payload_digest(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     format!("command-v1:{}", hasher.finalize().to_hex())
+}
+
+fn validate_remote_identity(remote_identity: &str) -> Result<()> {
+    if remote_identity.is_empty() {
+        Err(Fault::InvalidInput(
+            "remote promotion identity cannot be empty".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn promoted_duel_digest(
+    session_id: &SessionId,
+    remote_identity: &str,
+    anchor: &PresentedAsset,
+    challenger_rotation_quarters: u8,
+    victor: DuelVictor,
+    response_ms: u32,
+) -> String {
+    let occurrence = anchor.occurrence_id.to_string();
+    let anchor_rotation = anchor.rotation_quarters.to_string();
+    let challenger_rotation = challenger_rotation_quarters.to_string();
+    let response = response_ms.to_string();
+    payload_digest(&[
+        "remote-admission-duel-v2",
+        session_id.as_str(),
+        remote_identity,
+        anchor.asset_id.as_str(),
+        &occurrence,
+        anchor.render.as_str(),
+        &anchor_rotation,
+        &challenger_rotation,
+        match victor {
+            DuelVictor::Anchor => "anchor",
+            DuelVictor::Challenger => "challenger",
+        },
+        &response,
+    ])
+}
+
+fn promoted_favorite_digest(session_id: &SessionId, remote_identity: &str) -> String {
+    payload_digest(&[
+        "remote-admission-favorite-v1",
+        session_id.as_str(),
+        remote_identity,
+        "true",
+    ])
 }
 
 fn similarity_digest_parts(

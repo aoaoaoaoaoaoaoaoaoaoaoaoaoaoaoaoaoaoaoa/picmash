@@ -357,7 +357,7 @@ fn image_box(card: &Card, screen: egui::Vec2) -> egui::Vec2 {
         (screen.x - VIEWER_MARGIN * 2.0).max(64.0),
         (screen.y - VIEWER_MARGIN * 2.0 - VIEWER_CHROME).max(64.0),
     );
-    let image = if card.rotation_quarters.is_multiple_of(2) {
+    let image = if card.presentation.rotation_quarters.is_multiple_of(2) {
         egui::vec2(card.width as f32, card.height as f32)
     } else {
         egui::vec2(card.height as f32, card.width as f32)
