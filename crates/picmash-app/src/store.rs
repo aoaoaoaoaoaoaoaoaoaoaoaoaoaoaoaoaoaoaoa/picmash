@@ -36,6 +36,7 @@ use crate::{
 mod corpus;
 mod events;
 mod external;
+mod external_frontier;
 mod faces;
 mod maintenance;
 mod quality;
@@ -45,7 +46,11 @@ mod session;
 mod tests;
 mod vectors;
 
-pub use external::{ExternalIdentityDisposition, UpsertedExternalStreamBatchEntry};
+pub use external::ExternalStreamWarmCandidate;
+pub use external_frontier::{
+    ExternalIdentityDisposition, ExternalReadyCachePath, ExternalStreamFrontierCounts,
+    UpsertedExternalStreamBatchEntry,
+};
 pub use faces::{FaceIdentityRecord, FaceRecord, FacemashIdentityCandidate};
 pub use schema::{
     BOOTSTRAP_PHASE_FACE_IDENTITY_BINDINGS, BOOTSTRAP_PHASE_INITIAL, BootstrapMaintenanceProgress,

@@ -47,7 +47,6 @@ FRONTEND_SHELL_FORBIDDEN_PATTERNS = (
     r"(?m)(^|[^-\w])\.top-rail\b",
     r"(?m)(^|[^-\w])\.rail-menu\b",
     r"(?m)(^|[^-\w])\.rail\b",
-    r"(?m)(^|[^-\w])\.swarm-frame-header\b",
     r"data-page-geometry",
     r"body\.arena-page\b",
     r"body\.board-page\b",

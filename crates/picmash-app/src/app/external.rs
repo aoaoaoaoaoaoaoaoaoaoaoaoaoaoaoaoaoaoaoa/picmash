@@ -23,6 +23,12 @@ struct PreparedRemoteImport {
     embedding: Option<crate::model::EmbeddingRecord>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ExternalWarmOutcome {
+    became_ready: bool,
+    needs_face_backfill: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct RemoteSourceArenaBonuses {
     pub(super) stream_size: f32,
@@ -95,6 +101,9 @@ impl AppState {
         if let Some(field) = self.session_field_cache.write().as_mut() {
             field.subsource_lock = transition.next_lock();
         }
+        if active && let Some(lock) = transition.next_lock() {
+            self.request_locked_stream_refresh(lock);
+        }
         Ok(transition.pipeline())
     }
 
@@ -106,6 +115,139 @@ impl AppState {
         })?;
         if let Some(field) = self.session_field_cache.write().as_mut() {
             field.subsource_lock = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn locked_stream_ready_target(live_items: usize) -> usize {
+        live_items.min(EXTERNAL_LOCKED_STREAM_READY_TARGET)
+    }
+
+    fn locked_stream_frontier_counts(
+        &self,
+        store: &Store,
+        lock: &crate::model::SessionSubsourceLock,
+    ) -> anyhow::Result<Option<crate::store::ExternalStreamFrontierCounts>> {
+        store.external_stream_frontier_counts(
+            &lock.source_key,
+            lock.stream_id,
+            self.embedder.model_name(),
+        )
+    }
+
+    pub(super) fn locked_source_needs_refresh(
+        &self,
+        store: &Store,
+        source: &SourceConfig,
+    ) -> anyhow::Result<bool> {
+        let Some(lock) = store.session_subsource_lock(self.active.session_id)? else {
+            return Ok(false);
+        };
+        let source_key = source.source_key();
+        if lock.source_key != source_key {
+            return Ok(false);
+        }
+        let Some(counts) = self.locked_stream_frontier_counts(store, &lock)? else {
+            return Ok(true);
+        };
+        Ok(counts.ready_items < Self::locked_stream_ready_target(counts.live_items))
+    }
+
+    pub(super) fn locked_stream_should_hold_lock(
+        &self,
+        store: &Store,
+        lock: &crate::model::SessionSubsourceLock,
+    ) -> anyhow::Result<bool> {
+        let Some(source) = self.source_config_for_key(&lock.source_key) else {
+            return Ok(false);
+        };
+        let Some(counts) = self.locked_stream_frontier_counts(store, lock)? else {
+            return Ok(source.scan_interval_seconds > 0);
+        };
+        if counts.ready_items < counts.live_items {
+            return Ok(true);
+        }
+        if source.scan_interval_seconds == 0 {
+            return Ok(false);
+        }
+        store.external_scan_due(
+            &lock.source_key,
+            Duration::seconds(source.scan_interval_seconds as i64),
+        )
+    }
+
+    pub(super) fn refill_locked_source_now(
+        &self,
+        lock: &crate::model::SessionSubsourceLock,
+    ) -> anyhow::Result<()> {
+        let Some(source) = self.source_config_for_key(&lock.source_key) else {
+            return Ok(());
+        };
+        self.warm_locked_stream_from_store(&source, lock)?;
+        let store = self.read_store()?;
+        if !self.locked_source_needs_refresh(&store, &source)? {
+            return Ok(());
+        }
+        drop(store);
+        if source.local_directory().is_some() {
+            self.devour_local_directory_refresh(&lock.source_key)?;
+            self.warm_locked_stream_from_store(&source, lock)?;
+        }
+        Ok(())
+    }
+
+    pub fn refresh_locked_stream_now(
+        &self,
+        lock: &crate::model::SessionSubsourceLock,
+    ) -> anyhow::Result<()> {
+        let Some(active_lock) = self
+            .read_store()?
+            .session_subsource_lock(self.active.session_id)?
+        else {
+            return Ok(());
+        };
+        if active_lock != *lock {
+            return Ok(());
+        }
+        self.refill_locked_source_now(lock)
+    }
+
+    fn warm_locked_stream_from_store(
+        &self,
+        source: &SourceConfig,
+        lock: &crate::model::SessionSubsourceLock,
+    ) -> anyhow::Result<()> {
+        let store = Store::open_hot(&self.db_path)?;
+        let Some(counts) = self.locked_stream_frontier_counts(&store, lock)? else {
+            return Ok(());
+        };
+        let target = Self::locked_stream_ready_target(counts.live_items);
+        if counts.ready_items >= target {
+            return Ok(());
+        }
+        let candidates = store.external_stream_warm_candidates(&lock.source_key, lock.stream_id)?;
+        let mut ready_items = counts.ready_items;
+        let mut needs_face_backfill = false;
+        for candidate in candidates {
+            if ready_items >= target {
+                break;
+            }
+            let outcome = self.devour_external_warm_candidate(
+                &store,
+                source,
+                &lock.source_key,
+                lock.stream_id,
+                candidate.item_id,
+                &candidate.snapshot,
+            )?;
+            needs_face_backfill |= outcome.needs_face_backfill;
+            ready_items += usize::from(outcome.became_ready);
+        }
+        if needs_face_backfill {
+            self.schedule_external_face_embedding_backfill(&lock.source_key);
+        }
+        if ready_items > counts.ready_items {
+            self.purge_duplicate_frontier();
         }
         Ok(())
     }
@@ -130,13 +272,28 @@ impl AppState {
         if source.local_directory().is_some() {
             return Ok(false);
         }
+        if self.locked_source_needs_refresh(store, source)? {
+            return Ok(false);
+        }
         let source_key = source.source_key();
         let (active_streams, _, _) = store.external_source_counts(&source_key)?;
         if active_streams == 0 {
             return Ok(false);
         }
+        let recently_selected = store.external_source_recently_selected(
+            self.active.session_id,
+            &source_key,
+            OffsetDateTime::now_utc().unix_timestamp()
+                - REMOTE_SOURCE_IDLE_SCAN_GRACE.whole_seconds(),
+        )?;
         let (total_ready, _) =
             store.external_source_ready_profile(&source_key, self.embedder.model_name())?;
+        if total_ready == 0
+            && !recently_selected
+            && !store.external_scan_due(&source_key, REMOTE_SOURCE_EMPTY_SCAN_BACKOFF)?
+        {
+            return Ok(true);
+        }
         let frontier = SourceReadyFrontier::new(
             total_ready,
             HashMap::new(),
@@ -146,12 +303,6 @@ impl AppState {
         if !frontier.source_idle_warm() {
             return Ok(false);
         }
-        let recently_selected = store.external_source_recently_selected(
-            self.active.session_id,
-            &source_key,
-            OffsetDateTime::now_utc().unix_timestamp()
-                - REMOTE_SOURCE_IDLE_SCAN_GRACE.whole_seconds(),
-        )?;
         Ok(!recently_selected)
     }
 
@@ -272,14 +423,16 @@ impl AppState {
         }
 
         let store = Store::open_hot(&self.db_path)?;
+        let ready_target_profile = self.remote_source_materialization_profile(&store, source)?;
         let (total_ready, ready_by_stream) =
             store.external_source_ready_profile(&source_key, self.embedder.model_name())?;
         let mut ready_frontier = SourceReadyFrontier::new(
             total_ready,
             ready_by_stream,
             harvest.streams.len(),
-            ReadyTargetProfile::for_source(source),
+            ready_target_profile,
         );
+        let active_lock = store.session_subsource_lock(self.active.session_id)?;
         let mut needs_face_backfill = false;
 
         let mut chunk_start = 0usize;
@@ -311,6 +464,10 @@ impl AppState {
                 }
                 let stream_id = outcome.stream_id;
                 let item_ids = outcome.item_ids;
+                let locked_stream_target = active_lock
+                    .as_ref()
+                    .filter(|lock| lock.source_key == source_key && lock.stream_id == stream_id)
+                    .map(|_| Self::locked_stream_ready_target(stream.items.len()));
 
                 for item in &stream.items {
                     let item_id = item_ids.get(&item.post_no).copied().with_context(|| {
@@ -323,123 +480,29 @@ impl AppState {
                         continue;
                     }
 
-                    let already_ready =
-                        store.external_item_frontier_ready(item_id, self.embedder.model_name())?;
-                    let should_devour = if already_ready {
+                    let should_devour = if store
+                        .external_item_frontier_ready(item_id, self.embedder.model_name())?
+                    {
                         true
                     } else {
-                        !ready_frontier.source_saturated()
+                        locked_stream_target.is_some_and(|target| {
+                            ready_frontier.ready_in_stream(stream_id) < target
+                        }) || !ready_frontier.source_saturated()
                             || !ready_frontier.stream_saturated(stream_id)
                     };
                     if !should_devour {
                         continue;
                     }
-
-                    let warm = store.external_item_warm_state(
+                    let outcome = self.devour_external_warm_candidate(
+                        &store,
+                        source,
+                        &source_key,
+                        stream_id,
                         item_id,
-                        self.embedder.model_name(),
-                        self.embedder
-                            .clip_enabled()
-                            .then_some(self.embedder.clip_model_name()),
-                        self.embedder.recognition_model_name(),
-                        QUALITY_FEATURE_REVISION,
+                        item,
                     )?;
-                    needs_face_backfill |= warm.needs_face_embedding;
-                    if already_ready
-                        && !warm.needs_inline_work()
-                        && store
-                            .external_item_cached_path(item_id)?
-                            .is_some_and(|path| path.exists())
-                    {
-                        continue;
-                    }
-                    let cached_path = match item.materialized_path.as_ref() {
-                        Some(path) if path.exists() => path.clone(),
-                        Some(_) if source.local_directory().is_some() => continue,
-                        Some(_) | None => {
-                            self.source_scanner.cache_remote_image(&source_key, item)?
-                        }
-                    };
-                    if !cached_path.exists() {
-                        continue;
-                    }
-
-                    if !warm.needs_inline_work() {
-                        continue;
-                    }
-
-                    let bytes = if warm.needs_identity || warm.needs_quality_features {
-                        Some(fs::read(&cached_path).with_context(|| {
-                            format!("reading cached remote {}", cached_path.display())
-                        })?)
-                    } else {
-                        None
-                    };
-
-                    if warm.needs_identity {
-                        let bytes = bytes
-                            .as_deref()
-                            .context("missing cached bytes for identity")?;
-                        let identity = inspect_image_bytes(bytes).with_context(|| {
-                            format!(
-                                "inspecting cached remote identity {}",
-                                cached_path.display()
-                            )
-                        })?;
-                        let disposition =
-                            self.with_write_store("save_external_item_identity", {
-                                let cached_path = cached_path.clone();
-                                move |store| {
-                                    store.save_external_item_identity(
-                                        item_id,
-                                        &identity,
-                                        &cached_path,
-                                    )
-                                }
-                            })?;
-                        if disposition != crate::store::ExternalIdentityDisposition::Active {
-                            continue;
-                        }
-                    }
-
-                    if warm.needs_quality_features
-                        && let Some(bytes) = bytes.as_deref()
-                        && let Ok(features) =
-                            crate::quality_features::extract_asset_quality_features(bytes)
-                    {
-                        self.with_write_store(
-                            "save_external_item_quality_features",
-                            move |store| {
-                                store.save_external_item_quality_features(
-                                    item_id,
-                                    QUALITY_FEATURE_REVISION,
-                                    &features,
-                                )
-                            },
-                        )?;
-                    }
-
-                    if warm.needs_embedding
-                        && let Some(embedding) = self.embedder.embed(&cached_path)?
-                    {
-                        let cached_path = cached_path.clone();
-                        self.with_write_store("save_external_embedding", move |store| {
-                            store.save_external_embedding(item_id, &embedding, &cached_path)
-                        })?;
-                    }
-
-                    if warm.needs_clip_embedding
-                        && let Some(embedding) = self.embedder.clip_embed(&cached_path)?
-                    {
-                        self.with_write_store("save_external_clip_embedding", move |store| {
-                            store.save_external_clip_embedding(item_id, &embedding)
-                        })?;
-                    }
-
-                    if !already_ready
-                        && store
-                            .external_item_frontier_ready(item_id, self.embedder.model_name())?
-                    {
+                    needs_face_backfill |= outcome.needs_face_backfill;
+                    if outcome.became_ready {
                         ready_frontier.note_ready(stream_id);
                     }
                 }
@@ -453,6 +516,156 @@ impl AppState {
 
         self.purge_duplicate_frontier();
         Ok(())
+    }
+
+    fn devour_external_warm_candidate(
+        &self,
+        store: &Store,
+        source: &SourceConfig,
+        source_key: &str,
+        stream_id: i64,
+        item_id: RemoteItemId,
+        item: &crate::sources::RemoteItemSnapshot,
+    ) -> anyhow::Result<ExternalWarmOutcome> {
+        let already_ready =
+            store.external_item_frontier_ready(item_id, self.embedder.model_name())?;
+        let warm = store.external_item_warm_state(
+            item_id,
+            self.embedder.model_name(),
+            self.embedder
+                .clip_enabled()
+                .then_some(self.embedder.clip_model_name()),
+            self.embedder.recognition_model_name(),
+            QUALITY_FEATURE_REVISION,
+        )?;
+        let mut outcome = ExternalWarmOutcome {
+            became_ready: false,
+            needs_face_backfill: warm.needs_face_embedding,
+        };
+        if already_ready
+            && !warm.needs_inline_work()
+            && store
+                .external_item_cached_path(item_id)?
+                .is_some_and(|path| path.exists())
+        {
+            return Ok(outcome);
+        }
+
+        let cached_path = match item.materialized_path.as_ref() {
+            Some(path) if path.exists() => path.clone(),
+            Some(_) if source.local_directory().is_some() => return Ok(outcome),
+            Some(_) | None => self.source_scanner.cache_remote_image(source_key, item)?,
+        };
+        if !cached_path.exists() {
+            return Ok(outcome);
+        }
+
+        if warm.needs_materialization && !warm.needs_identity {
+            self.with_write_store("save_external_item_cached_path", {
+                let cached_path = cached_path.clone();
+                move |store| store.save_external_item_cached_path(item_id, &cached_path)
+            })?;
+        }
+
+        if warm.needs_inline_work() {
+            let bytes =
+                if warm.needs_identity || warm.needs_quality_features {
+                    Some(fs::read(&cached_path).with_context(|| {
+                        format!("reading cached remote {}", cached_path.display())
+                    })?)
+                } else {
+                    None
+                };
+
+            if warm.needs_identity {
+                let bytes = bytes
+                    .as_deref()
+                    .context("missing cached bytes for identity")?;
+                let identity = inspect_image_bytes(bytes).with_context(|| {
+                    format!(
+                        "inspecting cached remote identity {}",
+                        cached_path.display()
+                    )
+                })?;
+                let disposition = self.with_write_store("save_external_item_identity", {
+                    let cached_path = cached_path.clone();
+                    move |store| store.save_external_item_identity(item_id, &identity, &cached_path)
+                })?;
+                if disposition != crate::store::ExternalIdentityDisposition::Active {
+                    return Ok(outcome);
+                }
+            }
+
+            if warm.needs_quality_features
+                && let Some(bytes) = bytes.as_deref()
+                && let Ok(features) = crate::quality_features::extract_asset_quality_features(bytes)
+            {
+                self.with_write_store("save_external_item_quality_features", move |store| {
+                    store.save_external_item_quality_features(
+                        item_id,
+                        QUALITY_FEATURE_REVISION,
+                        &features,
+                    )
+                })?;
+            }
+
+            if warm.needs_embedding
+                && let Some(embedding) = self.embedder.embed(&cached_path)?
+            {
+                let cached_path = cached_path.clone();
+                self.with_write_store("save_external_embedding", move |store| {
+                    store.save_external_embedding(item_id, &embedding, &cached_path)
+                })?;
+            }
+
+            if warm.needs_clip_embedding
+                && let Some(embedding) = self.embedder.clip_embed(&cached_path)?
+            {
+                self.with_write_store("save_external_clip_embedding", move |store| {
+                    store.save_external_clip_embedding(item_id, &embedding)
+                })?;
+            }
+        }
+
+        if !already_ready
+            && store.external_item_frontier_ready(item_id, self.embedder.model_name())?
+        {
+            outcome.became_ready = true;
+        }
+        if outcome.became_ready {
+            debug!(
+                source = %source_key,
+                stream_id,
+                item_id = item_id.0,
+                "warmed locked external frontier item"
+            );
+        }
+        Ok(outcome)
+    }
+
+    fn remote_source_materialization_profile(
+        &self,
+        store: &Store,
+        source: &SourceConfig,
+    ) -> anyhow::Result<ReadyTargetProfile> {
+        let profile = ReadyTargetProfile::for_source(source);
+        if source.local_directory().is_some() {
+            return Ok(profile);
+        }
+        let source_key = source.source_key();
+        let recent_since = OffsetDateTime::now_utc().unix_timestamp()
+            - REMOTE_SOURCE_IDLE_SCAN_GRACE.whole_seconds();
+        Ok(
+            if store.external_source_recently_selected(
+                self.active.session_id,
+                &source_key,
+                recent_since,
+            )? {
+                profile.capped(REMOTE_SOURCE_RECENT_READY_CAP)
+            } else {
+                profile.capped(profile.idle_floor())
+            },
+        )
     }
 
     pub(super) fn choose_pair_with_store(
@@ -1376,19 +1589,29 @@ impl AppState {
         )?;
         prune_unmaterialized_remote_candidates(source, &mut candidates)?;
         candidates.retain(|candidate| candidate.item.stream_id == lock.stream_id);
-        candidates.retain(|candidate| !remote_visual_key_excluded(candidate, excluded_visual_keys));
         if candidates.is_empty() {
             return Ok(None);
         }
+        let visible_candidates = candidates
+            .iter()
+            .filter(|candidate| !remote_visual_key_excluded(candidate, excluded_visual_keys))
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidates = if visible_candidates.is_empty() {
+            candidates
+        } else {
+            visible_candidates
+        };
         let recent_item_ids = store
             .recent_selected_external_item_ids(self.active.session_id, EXTERNAL_RECENT_EXCLUDE)?;
         let recent_item_set = recent_item_ids.into_iter().collect::<HashSet<_>>();
         let filtered = candidates
-            .into_iter()
+            .iter()
             .filter(|candidate| !recent_item_set.contains(&candidate.item.id))
+            .cloned()
             .collect::<Vec<_>>();
         let candidates = if filtered.is_empty() {
-            return Ok(None);
+            candidates
         } else {
             filtered
         };
@@ -1678,18 +1901,34 @@ impl AppState {
     }
 
     pub(super) fn note_remote_pair_selected(&self, pair: &ArenaPair) -> anyhow::Result<()> {
-        let (local_asset_id, remote_item_id) = match (&pair.left, &pair.right) {
+        let (local_asset_id, remote) = match (&pair.left, &pair.right) {
             (ArenaCard::Local(local), ArenaCard::Remote(remote))
             | (ArenaCard::Remote(remote), ArenaCard::Local(local)) => {
-                (local.asset.id.clone(), remote.item.id)
+                (local.asset.id.clone(), remote)
             }
             _ => return Ok(()),
         };
+        let remote_item_id = remote.item.id;
         let session_id = self.active.session_id;
         let corpus_id = self.active.corpus_id;
         self.with_write_store("note_external_selected", move |store| {
             store.note_external_selected(session_id, corpus_id, remote_item_id, &local_asset_id)
-        })
+        })?;
+        if remote.stream_locked {
+            let store = self.read_store()?;
+            if let Some(counts) = store.external_stream_frontier_counts(
+                &remote.item.source_key,
+                remote.item.stream_id,
+                self.embedder.model_name(),
+            )? && counts.ready_items < Self::locked_stream_ready_target(counts.live_items)
+            {
+                self.request_locked_stream_refresh(crate::model::SessionSubsourceLock {
+                    source_key: remote.item.source_key.clone(),
+                    stream_id: remote.item.stream_id,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
