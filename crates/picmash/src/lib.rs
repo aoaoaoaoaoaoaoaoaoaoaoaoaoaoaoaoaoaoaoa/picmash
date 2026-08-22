@@ -4,6 +4,7 @@ mod app;
 mod commands;
 mod configuration;
 mod host;
+mod remote;
 mod viewer;
 mod witness;
 mod worker;

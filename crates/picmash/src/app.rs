@@ -24,10 +24,11 @@ use std::{
 
 use crate::{
     commands::{self, Edict},
-    configuration::Config,
+    configuration::{Config, Probability, ReservoirCapacity},
+    remote::Summary as RemoteSummary,
     viewer::{Action as ViewerAction, Viewer},
     witness,
-    worker::{Blade, Card, Command, Event, Pair, Summary, Worker},
+    worker::{Blade, Card, Command, Event, Pair, PairCard, Summary, Worker},
     xdg::Lair,
 };
 
@@ -41,6 +42,21 @@ const WATER: SettingSpec = SettingSpec::new(
     "living_water",
     "LIVING WATER",
     "Let controls and image choices displace the chamber's one water body.",
+);
+const REMOTE: SettingSpec = SettingSpec::new(
+    "remote.enabled",
+    "REMOTE SOURCES",
+    "Maintain a bounded reservoir of challengers from configured sources.",
+);
+const REMOTE_CHANCE: SettingSpec = SettingSpec::new(
+    "remote.sample_probability",
+    "REMOTE CHANCE",
+    "Chance that the next comparison draws a ready remote challenger.",
+);
+const REMOTE_RESERVOIR: SettingSpec = SettingSpec::new(
+    "remote.reservoir_capacity",
+    "REMOTE RESERVOIR",
+    "Hard cap on downloaded candidates, including fetching and displayed images.",
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +94,7 @@ enum Action {
     Favorite(Side),
     Hide(Side),
     Rotate(Side),
+    VetoStream(Side),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -91,6 +108,7 @@ pub struct Picmash {
     chooser: Option<Receiver<Option<PathBuf>>>,
     mode: Mode,
     summary: Option<Summary>,
+    remote_summary: RemoteSummary,
     pending_collection: Option<PathBuf>,
     cards: Vec<Card>,
     browse_indices: Vec<usize>,
@@ -115,11 +133,13 @@ pub struct Picmash {
 impl Picmash {
     pub fn open(ctx: &egui::Context, initial: Option<PathBuf>) -> Result<Self> {
         let lair = Lair::claim()?;
-        let configuration: ConfigurationLedger<Config> = ConfigurationLedger::raise(
+        let fallback = Config::legacy_fallback(&lair.legacy_configuration())?;
+        let configuration: ConfigurationLedger<Config> = ConfigurationLedger::raise_with_fallback(
             "picmash-configuration",
             ctx,
             lair.configuration(),
             CONFIG_SETTLE,
+            fallback,
         )?;
         let wetness = if configuration.live().living_water {
             Wetness::Wet
@@ -130,12 +150,13 @@ impl Picmash {
             .live()
             .images_per_row
             .clamp(MIN_IMAGES_PER_ROW, MAX_IMAGES_PER_ROW);
-        let worker = Worker::spawn(ctx, lair, initial)?;
+        let worker = Worker::spawn(ctx, lair, initial, configuration.live().remote.clone())?;
         Ok(Self {
             worker,
             chooser: None,
             mode: Mode::Compare,
             summary: None,
+            remote_summary: RemoteSummary::default(),
             pending_collection: None,
             cards: Vec::new(),
             browse_indices: Vec::new(),
@@ -312,6 +333,24 @@ impl Picmash {
                     datum(ui, "LOG LOSS", format!("{:.3}", evaluation.log_loss));
                     let _caution = ui.label(chrome::muted("DIAGNOSTIC, NOT QUALITY"));
                 }
+            }
+            if self.remote_summary.enabled_sources > 0 {
+                ui.add_space(4.0);
+                let _label = ui.label(chrome::eyebrow("REMOTE RESERVOIR"));
+                datum(
+                    ui,
+                    "READY",
+                    (self.remote_summary.prepared + usize::from(self.remote_summary.offered))
+                        .to_string(),
+                );
+                datum(ui, "FETCHING", self.remote_summary.fetching.to_string());
+                if self.remote_summary.cataloging > 0 {
+                    datum(ui, "CATALOGING", self.remote_summary.cataloging.to_string());
+                }
+                if self.remote_summary.backing_off > 0 {
+                    datum(ui, "BACKOFF", self.remote_summary.backing_off.to_string());
+                }
+                datum(ui, "DISCOVERED", self.remote_summary.discovered.to_string());
             }
             ui.add_space(4.0);
             let _status = ui.label(chrome::muted(&self.status));
@@ -529,10 +568,25 @@ impl Picmash {
         match action {
             Action::Choose(side) => self.send(Command::Choose(side), true, "FORGING NEXT PAIR"),
             Action::Favorite(side) => {
-                self.send(Command::Favorite(side), false, "MARKING FAVORITE");
+                let remote = self.pair.as_ref().is_some_and(|pair| match side {
+                    Side::Left => pair.pair.left.remote().is_some(),
+                    Side::Right => pair.pair.right.remote().is_some(),
+                });
+                self.send(
+                    Command::Favorite(side),
+                    remote,
+                    if remote {
+                        "PROMOTING FAVORITE"
+                    } else {
+                        "MARKING FAVORITE"
+                    },
+                );
             }
             Action::Hide(side) => self.send(Command::Hide(side), true, "WITHDRAWING IMAGE"),
             Action::Rotate(side) => self.send(Command::Rotate(side), true, "TURNING IMAGE"),
+            Action::VetoStream(side) => {
+                self.send(Command::VetoStream(side), true, "VETOING REMOTE STREAM");
+            }
         }
     }
 
@@ -648,6 +702,7 @@ impl Picmash {
                 self.rebuild_browse_indices();
             }
             Event::Pair(pair) => {
+                let remote = pair.right.remote().is_some();
                 let left_texture = upload(ctx, "picmash-left", &pair.left_blade);
                 let right_texture = upload(ctx, "picmash-right", &pair.right_blade);
                 self.pair = Some(PairView {
@@ -657,7 +712,18 @@ impl Picmash {
                 });
                 self.busy = false;
                 self.scan_progress = None;
-                "CHOOSE THE STRONGER IMAGE".clone_into(&mut self.status);
+                if remote {
+                    "REMOTE CHALLENGER · CHOOSE, HEART, X, OR TX"
+                } else {
+                    "CHOOSE THE STRONGER IMAGE"
+                }
+                .clone_into(&mut self.status);
+            }
+            Event::Remote(summary) => {
+                self.remote_summary = summary;
+            }
+            Event::RemoteFault(message) => {
+                self.status = format!("REMOTE SUSPENDED · {message}");
             }
             Event::NoComparison => {
                 self.pair = None;
@@ -673,7 +739,9 @@ impl Picmash {
                 }
                 if let Some(pair) = &mut self.pair {
                     for card in [&mut pair.pair.left, &mut pair.pair.right] {
-                        if card.asset_id == asset_id {
+                        if let Some(card) = card.local_mut()
+                            && card.asset_id == asset_id
+                        {
                             card.favorite = active;
                         }
                     }
@@ -935,6 +1003,10 @@ impl Picmash {
 
     fn show_settings(&mut self, ctx: &egui::Context) {
         let mut living_water = self.configuration.live().living_water;
+        let mut remote_enabled = self.configuration.live().remote.enabled;
+        let mut remote_chance = self.configuration.live().remote.sample_probability.ratio();
+        let mut remote_reservoir =
+            f64::from(self.configuration.live().remote.reservoir_capacity.get());
         let fault = self.configuration.fault().map(ToString::to_string);
         let file = fault.as_deref().map_or_else(
             || SettingsFile::ready(self.configuration.path()),
@@ -943,13 +1015,38 @@ impl Picmash {
         let response = self.settings.show(ctx, &mut self.water, file, |settings| {
             settings.section("PRESENTATION");
             let _water = settings.boolean(WATER, &mut living_water);
+            settings.section("ACQUISITION");
+            let _enabled = settings.boolean(REMOTE, &mut remote_enabled);
+            let _chance = settings.number(REMOTE_CHANCE, &mut remote_chance, 0.0..=1.0, 0.05, 2);
+            let _reservoir =
+                settings.number(REMOTE_RESERVOIR, &mut remote_reservoir, 1.0..=8.0, 1.0, 0);
         });
-        if living_water != self.configuration.live().living_water
-            && let Err(error) = self
-                .configuration
-                .revise(|config| config.living_water = living_water)
-        {
-            self.status = format!("FAULT · {error:#}");
+        let remote_changed = remote_enabled != self.configuration.live().remote.enabled
+            || remote_chance != self.configuration.live().remote.sample_probability.ratio()
+            || remote_reservoir
+                != f64::from(self.configuration.live().remote.reservoir_capacity.get());
+        if living_water != self.configuration.live().living_water || remote_changed {
+            let remote = Probability::try_from(remote_chance).and_then(|probability| {
+                Ok((
+                    probability,
+                    ReservoirCapacity::try_from(remote_reservoir.round() as u8)?,
+                ))
+            });
+            match remote {
+                Ok((probability, reservoir)) => {
+                    match self.configuration.revise(|config| {
+                        config.living_water = living_water;
+                        config.remote.enabled = remote_enabled;
+                        config.remote.sample_probability = probability;
+                        config.remote.reservoir_capacity = reservoir;
+                    }) {
+                        Ok(true) => self.adopt_configuration(),
+                        Ok(false) => {}
+                        Err(error) => self.status = format!("FAULT · {error:#}"),
+                    }
+                }
+                Err(error) => self.status = format!("FAULT · {error:#}"),
+            }
         }
         if response.reload_requested()
             && let Err(error) = self.configuration.request_reload()
@@ -970,6 +1067,11 @@ impl Picmash {
             .live()
             .images_per_row
             .clamp(MIN_IMAGES_PER_ROW, MAX_IMAGES_PER_ROW);
+        if let Err(error) = self.worker.send(Command::ConfigureRemote(
+            self.configuration.live().remote.clone(),
+        )) {
+            self.status = format!("REMOTE CONFIGURATION FAULT · {error:#}");
+        }
     }
 
     #[cfg(feature = "egui-test")]
@@ -987,10 +1089,15 @@ impl Picmash {
             favorites: favorite_total(&self.cards),
             duels: duel_total(&self.cards),
             pair_ready: self.pair.is_some(),
+            remote_pair: self
+                .pair
+                .as_ref()
+                .is_some_and(|pair| pair.pair.right.remote().is_some()),
+            remote_ready: self.remote_summary.prepared + usize::from(self.remote_summary.offered),
             pair_rotations: self.pair.as_ref().map(|pair| {
                 [
-                    pair.pair.left.rotation_quarters,
-                    pair.pair.right.rotation_quarters,
+                    pair.pair.left.rotation_quarters(),
+                    pair.pair.right.rotation_quarters(),
                 ]
             }),
             images_per_row: self.images_per_row,
@@ -1007,7 +1114,7 @@ fn comparison_card(
     ui: &mut egui::Ui,
     water: &mut Surface,
     side: Side,
-    card: &Card,
+    card: &PairCard,
     texture: &TextureHandle,
     slot: egui::Rect,
 ) -> Option<Action> {
@@ -1042,7 +1149,24 @@ fn comparison_card(
     painter.text(
         top.right_center() - egui::vec2(10.0, 0.0),
         egui::Align2::RIGHT_CENTER,
-        format!("{}×{} · {} DUELS", card.width, card.height, card.duel_count),
+        card.remote().map_or_else(
+            || {
+                format!(
+                    "{}×{} · {} DUELS",
+                    card.width(),
+                    card.height(),
+                    card.duel_count().unwrap_or(0)
+                )
+            },
+            |remote| {
+                format!(
+                    "{}×{} · {}",
+                    card.width(),
+                    card.height(),
+                    remote.source.to_uppercase()
+                )
+            },
+        ),
         egui::FontId::new(12.0, egui::FontFamily::Proportional),
         chrome::MUTED,
     );
@@ -1058,14 +1182,16 @@ fn comparison_card(
     );
     controls.set_clip_rect(controls.clip_rect().intersect(controls_rect));
     let favorite = Monoglyph::symbol(Symbol::Heart)
-        .finish(if card.favorite {
+        .finish(if card.favorite() {
             MonoglyphFinish::Love
         } else {
             MonoglyphFinish::BrightCut
         })
         .size(MechanismSize::Medium)
         .show(&mut controls)
-        .on_hover_text(if card.favorite {
+        .on_hover_text(if card.remote().is_some() {
+            "Promote and mark favorite"
+        } else if card.favorite() {
             "Withdraw favorite"
         } else {
             "Mark favorite"
@@ -1088,15 +1214,29 @@ fn comparison_card(
         .finish(MonoglyphFinish::BrightCut)
         .size(MechanismSize::Medium)
         .show(&mut controls)
-        .on_hover_text("Hide from this collection");
+        .on_hover_text(if card.remote().is_some() {
+            "Reject this remote candidate"
+        } else {
+            "Hide from this collection"
+        });
     water.monoglyph(&hide);
     witness::response(&controls, Target::Hide(side), &hide);
     if hide.clicked() {
         action = Some(Action::Hide(side));
     }
+    if card.remote().is_some() {
+        let veto = compact_plate(&mut controls, "TX").on_hover_text("Reject this entire stream");
+        witness::response(&controls, Target::VetoStream(side), &veto);
+        if veto.clicked() {
+            action = Some(Action::VetoStream(side));
+        }
+    }
 
     chrome::tension(ui, &response);
-    let response = response.on_hover_text(file_name(&card.path));
+    let response = response.on_hover_text(card.remote().map_or_else(
+        || file_name(card.path()),
+        |remote| format!("{}\n{}\n{}", remote.title, remote.source, remote.stream),
+    ));
     witness::response(ui, Target::Choice(side), &response);
     if action.is_none() && response.clicked() {
         water.select(rect);
@@ -1337,6 +1477,13 @@ fn plate(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     response
 }
 
+fn compact_plate(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let button = egui::Button::new(chrome::section_title(label)).min_size(egui::vec2(38.0, 28.0));
+    let response = ui.add(button);
+    chrome::tension(ui, &response);
+    response
+}
+
 fn plate_enabled(ui: &mut egui::Ui, enabled: bool, label: &str, selected: bool) -> egui::Response {
     let button = egui::Button::new(chrome::section_title(label))
         .selected(selected)
@@ -1391,6 +1538,8 @@ pub struct Observation {
     favorites: usize,
     duels: u64,
     pair_ready: bool,
+    remote_pair: bool,
+    remote_ready: usize,
     pair_rotations: Option<[u8; 2]>,
     images_per_row: u16,
     viewer_open: bool,

@@ -12,10 +12,11 @@ The product exposes only the evidence-bearing local workflow:
 - mark favorites;
 - hide images without deleting their files;
 - correct display rotation;
-- browse the visible collection in preference order.
+- browse the visible collection in preference order;
+- optionally compare bounded remote challengers and promote accepted images.
 
-External discovery, faces, embeddings, and the former unified-quality models
-were rejected rather than transplanted from the web application.
+Faces, embeddings, triads, and the former unified-quality models were rejected
+rather than transplanted from the web application.
 
 ## Run
 
@@ -28,10 +29,13 @@ collection, and **Open Collection** invokes the platform directory chooser.
 Press `A` or `D` to choose the left or right image, `1` or `2` to change
 chambers, `F1` for the generated command guide, and `F2` for settings.
 
-The currently proved product coordinate is Linux/X11. Corpus access is
-read-only. Picmash places its database under the platform data directory, the
-active-collection pointer under state, and `picmash.toml` under configuration.
-No mutable product state belongs in the checkout.
+The currently proved product coordinate is Linux/X11. Ordinary catalog work is
+read-only. When remote acquisition is enabled, promotion writes canonical
+lossless JPEG XL files beneath the selected collection's
+`.picmash-imported/` directory. Picmash places databases under platform data,
+the active-collection pointer under state, disposable remote payloads under
+cache, and `picmash.toml` under configuration. No mutable product state belongs
+in the checkout. Promotion requires `cjxl` on `PATH`.
 
 ## Install
 
@@ -51,6 +55,14 @@ The native `picmash` crate owns presentation and sends bounded commands to one
 engine worker; scanning, SQLite, image decoding, and preference fitting never
 run on the event-loop thread. `picmash-contract` contains the dependency-light
 UI vocabulary shared with the external `picmash-acceptance` executable.
+
+Remote source definitions, sampling chance, reservoir capacity, filters, and
+import policy live under `[remote]` in `picmash.toml`. Existing web-app source
+configuration is migrated once as a fallback. The native pipeline has one
+catalog lane, one media-fetch lane, bounded metadata, and a reservoir that
+counts fetching, ready, and displayed challengers. See
+[Remote Acquisition](docs/remote-acquisition.md) for its state and resource
+laws.
 
 An asset is one exact, EXIF-oriented RGBA rendering. An occurrence is one path
 and byte blob in one collection. Judgments retain both identities, rotation,
@@ -77,5 +89,6 @@ scripts/test-acceptance /tmp/picmash-acceptance
 ```
 
 The canonical gate formats, lints, and tests the workspace. The hermetic native
-story seeds a real image corpus, then proves favorite, rotation, voting, hiding,
-browsing, and restart persistence without network access.
+story proves favorite, rotation, voting, hiding, browsing, restart persistence,
+a bounded local-source reservoir, and canonical remote promotion without
+network access.
