@@ -13,6 +13,23 @@ impl AppState {
         EXTERNAL_SCAN_PULSE
     }
 
+    pub fn request_external_refresh(&self) {
+        self.external_refresh_notify.notify_one();
+    }
+
+    pub fn request_locked_stream_refresh(&self, lock: crate::model::SessionSubsourceLock) {
+        *self.locked_stream_refresh.lock() = Some(lock);
+        self.request_external_refresh();
+    }
+
+    pub fn take_locked_stream_refresh_request(&self) -> Option<crate::model::SessionSubsourceLock> {
+        self.locked_stream_refresh.lock().take()
+    }
+
+    pub async fn wait_for_external_refresh_signal(&self) {
+        self.external_refresh_notify.notified().await;
+    }
+
     pub fn quality_refresh_is_inline(&self) -> anyhow::Result<bool> {
         let store = self.read_store()?;
         Ok(matches!(
@@ -168,7 +185,9 @@ impl AppState {
         let store = self.read_store()?;
         for source in self.configured_sources() {
             let source_key = source.source_key();
+            let lock_hungry = !force && self.locked_source_needs_refresh(&store, &source)?;
             let due = force
+                || lock_hungry
                 || store.external_scan_due(
                     &source_key,
                     Duration::seconds(source.scan_interval_seconds as i64),
@@ -180,7 +199,7 @@ impl AppState {
                 due_local_sources.push(source_key);
                 continue;
             }
-            if !force && self.remote_source_scan_can_rest(&store, &source)? {
+            if !force && !lock_hungry && self.remote_source_scan_can_rest(&store, &source)? {
                 debug!(source = %source_key, "remote source idle warm buffer sufficient; skipping refresh");
                 continue;
             }

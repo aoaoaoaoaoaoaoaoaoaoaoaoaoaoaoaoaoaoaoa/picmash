@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Once,
 };
 
 use anyhow::{Context, bail};
@@ -62,6 +63,15 @@ const ARCFACE_SCALE: f32 = 128.0;
 // ─── shared ──────────────────────────────────────────────────
 
 const DOWNLOAD_LOG_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const CUDA_RUNTIME_SENTINELS: &[&str] = &["libcudnn.so.9"];
+const CUDA_LIBRARY_SEARCH_ROOTS: &[&str] = &[
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+    "/usr/local/cuda/lib64",
+    "/opt/cuda/lib64",
+];
 
 // ─── session wrappers ────────────────────────────────────────
 
@@ -431,12 +441,61 @@ fn init_ort_environment() {
 
 fn build_session(model_path: &Path) -> anyhow::Result<Session> {
     let builder = Session::builder().context("creating ONNX session builder")?;
-    let mut builder = builder
-        .with_execution_providers([ep::CUDA::default().build()])
-        .map_err(|error| anyhow::anyhow!("configuring execution providers: {error}"))?;
+    let mut builder = if let Some(missing) = missing_cuda_runtime_libraries() {
+        note_missing_cuda_runtime_libraries(&missing);
+        builder
+    } else {
+        builder
+            .with_execution_providers([ep::CUDA::default().build()])
+            .map_err(|error| anyhow::anyhow!("configuring execution providers: {error}"))?
+    };
     builder
         .commit_from_file(model_path)
         .with_context(|| format!("loading ONNX model from {}", model_path.display()))
+}
+
+fn missing_cuda_runtime_libraries() -> Option<Vec<&'static str>> {
+    let missing = CUDA_RUNTIME_SENTINELS
+        .iter()
+        .copied()
+        .filter(|library| !shared_library_visible(library))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
+fn note_missing_cuda_runtime_libraries(missing: &[&str]) {
+    static LOGGED: Once = Once::new();
+    LOGGED.call_once(|| {
+        info!(
+            missing = missing.join(","),
+            "CUDA runtime libraries missing; skipping CUDA execution provider"
+        );
+    });
+}
+
+fn shared_library_visible(library: &str) -> bool {
+    shared_library_search_roots()
+        .into_iter()
+        .any(|root| root.join(library).exists())
+}
+
+fn shared_library_search_roots() -> Vec<PathBuf> {
+    let mut roots = env::var_os("LD_LIBRARY_PATH")
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Ok(exe_path) = env::current_exe()
+        && let Some(parent) = exe_path.parent()
+    {
+        roots.push(parent.to_path_buf());
+    }
+    roots.extend(CUDA_LIBRARY_SEARCH_ROOTS.iter().map(PathBuf::from));
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn ignite_dino(cache_root: &Path, model_name: &str) -> anyhow::Result<DinoSession> {

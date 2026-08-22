@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -9,7 +9,10 @@ use time::Duration;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
-use super::AppState;
+use super::{
+    AppState, REMOTE_SOURCE_IDLE_SCAN_GRACE, REMOTE_SOURCE_RECENT_READY_CAP, ReadyTargetProfile,
+};
+use crate::store::{ExternalReadyCachePath, Store};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const DEFAULT_RENDITION_CACHE_MAX_BYTES: u64 = GIB;
@@ -17,7 +20,6 @@ const DEFAULT_SOURCE_CACHE_MAX_BYTES: u64 = GIB;
 const DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS: u64 = 60;
 const CACHE_PRUNE_TARGET_NUMERATOR: u64 = 9;
 const CACHE_PRUNE_TARGET_DENOMINATOR: u64 = 10;
-
 #[derive(Debug)]
 struct CacheEntry {
     path: PathBuf,
@@ -61,7 +63,7 @@ impl AppState {
             ),
             &empty,
         )?;
-        let source_retention_paths = self.read_store()?.active_external_source_cache_paths()?;
+        let source_retention_paths = self.source_cache_retention_paths()?;
         let sources = prune_cache_tree(
             "sources",
             &self.source_cache_root,
@@ -87,6 +89,83 @@ impl AppState {
         log_prune_summary("renditions", &self.cache_root, &renditions);
         log_prune_summary("sources", &self.source_cache_root, &sources);
         Ok(())
+    }
+
+    fn source_cache_retention_paths(&self) -> anyhow::Result<HashSet<PathBuf>> {
+        let store = self.read_store()?;
+        let mut retained = HashSet::new();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let recent_since = now - REMOTE_SOURCE_IDLE_SCAN_GRACE.whole_seconds();
+        let active_lock = store.session_subsource_lock(self.active.session_id)?;
+
+        for source in self.configured_sources() {
+            if source.local_directory().is_some() {
+                continue;
+            }
+            let source_key = source.source_key();
+            let ready_paths =
+                store.external_source_ready_paths(&source_key, self.embedder.model_name())?;
+            if ready_paths.is_empty() {
+                continue;
+            }
+
+            let selected = if let Some(lock) = active_lock.as_ref() {
+                if lock.source_key == source_key {
+                    let limit = store
+                        .external_stream_frontier_counts(
+                            &lock.source_key,
+                            lock.stream_id,
+                            self.embedder.model_name(),
+                        )?
+                        .map_or(crate::app::EXTERNAL_LOCKED_STREAM_READY_TARGET, |counts| {
+                            Self::locked_stream_ready_target(counts.live_items)
+                        });
+                    lock_retention_paths(ready_paths, lock.stream_id, limit)
+                } else {
+                    let limit = self.remote_source_retention_limit(
+                        &store,
+                        &source_key,
+                        ReadyTargetProfile::for_source(&source),
+                        recent_since,
+                    )?;
+                    round_robin_retention_paths(ready_paths, limit)
+                }
+            } else {
+                let limit = self.remote_source_retention_limit(
+                    &store,
+                    &source_key,
+                    ReadyTargetProfile::for_source(&source),
+                    recent_since,
+                )?;
+                round_robin_retention_paths(ready_paths, limit)
+            };
+            retained.extend(selected);
+        }
+        Ok(retained)
+    }
+
+    fn remote_source_retention_limit(
+        &self,
+        store: &Store,
+        source_key: &str,
+        profile: ReadyTargetProfile,
+        recent_since: i64,
+    ) -> anyhow::Result<usize> {
+        let (active_streams, _, _) = store.external_source_counts(source_key)?;
+        Ok(
+            if store.external_source_recently_selected(
+                self.active.session_id,
+                source_key,
+                recent_since,
+            )? {
+                profile
+                    .target_total(active_streams)
+                    .min(REMOTE_SOURCE_RECENT_READY_CAP)
+                    .max(profile.idle_floor())
+            } else {
+                profile.idle_floor()
+            },
+        )
     }
 }
 
@@ -181,6 +260,56 @@ fn prune_cache_tree(
     Ok(summary)
 }
 
+fn lock_retention_paths(
+    ready_paths: Vec<ExternalReadyCachePath>,
+    locked_stream_id: i64,
+    limit: usize,
+) -> HashSet<PathBuf> {
+    ready_paths
+        .into_iter()
+        .filter(|entry| entry.stream_id == locked_stream_id)
+        .map(|entry| entry.path)
+        .take(limit)
+        .collect()
+}
+
+fn round_robin_retention_paths(
+    ready_paths: Vec<ExternalReadyCachePath>,
+    limit: usize,
+) -> HashSet<PathBuf> {
+    if limit == 0 {
+        return HashSet::new();
+    }
+    let mut streams = Vec::<(i64, VecDeque<PathBuf>)>::new();
+    for entry in ready_paths {
+        if let Some((_, queued)) = streams
+            .iter_mut()
+            .find(|(stream_id, _)| *stream_id == entry.stream_id)
+        {
+            queued.push_back(entry.path);
+        } else {
+            streams.push((entry.stream_id, VecDeque::from([entry.path])));
+        }
+    }
+    let mut retained = HashSet::new();
+    while retained.len() < limit {
+        let mut advanced = false;
+        for (_, queued) in &mut streams {
+            if retained.len() >= limit {
+                break;
+            }
+            if let Some(path) = queued.pop_front() {
+                retained.insert(path);
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    retained
+}
+
 fn is_active_cache_temp(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -238,11 +367,16 @@ fn log_prune_summary(label: &str, root: &Path, summary: &CachePruneSummary) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs};
+    use std::{collections::HashSet, fs, path::PathBuf};
 
     use tempfile::TempDir;
 
-    use super::prune_cache_tree;
+    use crate::store::ExternalReadyCachePath;
+
+    use super::{
+        REMOTE_SOURCE_RECENT_READY_CAP, ReadyTargetProfile, lock_retention_paths, prune_cache_tree,
+        round_robin_retention_paths,
+    };
 
     fn write_file(root: &TempDir, name: &str, len: usize) {
         fs::write(root.path().join(name), vec![b'x'; len]).expect("write cache fixture");
@@ -296,5 +430,78 @@ mod tests {
         assert!(protected.exists());
         assert!(!dead_one.exists());
         assert!(!dead_two.exists());
+    }
+
+    #[test]
+    fn round_robin_retention_spreads_across_streams_before_doubling_up() {
+        let retained = round_robin_retention_paths(
+            vec![
+                ExternalReadyCachePath {
+                    stream_id: 10,
+                    path: PathBuf::from("10-a"),
+                },
+                ExternalReadyCachePath {
+                    stream_id: 10,
+                    path: PathBuf::from("10-b"),
+                },
+                ExternalReadyCachePath {
+                    stream_id: 20,
+                    path: PathBuf::from("20-a"),
+                },
+                ExternalReadyCachePath {
+                    stream_id: 20,
+                    path: PathBuf::from("20-b"),
+                },
+                ExternalReadyCachePath {
+                    stream_id: 30,
+                    path: PathBuf::from("30-a"),
+                },
+            ],
+            4,
+        );
+
+        assert_eq!(retained.len(), 4);
+        assert!(retained.contains(&PathBuf::from("10-a")));
+        assert!(retained.contains(&PathBuf::from("20-a")));
+        assert!(retained.contains(&PathBuf::from("30-a")));
+    }
+
+    #[test]
+    fn lock_retention_only_keeps_the_locked_stream() {
+        let retained = lock_retention_paths(
+            vec![
+                ExternalReadyCachePath {
+                    stream_id: 10,
+                    path: PathBuf::from("10-a"),
+                },
+                ExternalReadyCachePath {
+                    stream_id: 11,
+                    path: PathBuf::from("11-a"),
+                },
+                ExternalReadyCachePath {
+                    stream_id: 10,
+                    path: PathBuf::from("10-b"),
+                },
+            ],
+            10,
+            8,
+        );
+
+        assert_eq!(
+            retained,
+            HashSet::from([PathBuf::from("10-a"), PathBuf::from("10-b")])
+        );
+    }
+
+    #[test]
+    fn recent_remote_retention_cap_stays_above_idle_floor() {
+        let profile = ReadyTargetProfile::for_remote();
+        assert_eq!(
+            profile
+                .target_total(128)
+                .min(REMOTE_SOURCE_RECENT_READY_CAP)
+                .max(profile.idle_floor()),
+            REMOTE_SOURCE_RECENT_READY_CAP
+        );
     }
 }

@@ -2,6 +2,11 @@ use super::*;
 use crate::identity::VisualKey;
 use std::collections::HashSet;
 
+enum LockedStarvationDisposition {
+    Retry,
+    Stop,
+}
+
 impl AppState {
     pub fn arena_target(&self) -> anyhow::Result<RedirectTarget> {
         self.arena_current_target()
@@ -1235,11 +1240,12 @@ impl AppState {
         lock_exhaustion: LockExhaustionPolicy,
         excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
-        for _ in 0..2 {
+        let mut refilled_locked_source = false;
+        for _ in 0..3 {
             let store = self.read_store()?;
             let field = self.session_field(&store)?;
             let assets = visible_assets(&store, self.active.corpus_id)?;
-            if field.subsource_lock.is_some() {
+            if let Some(lock) = field.subsource_lock.as_ref() {
                 let pair = self.choose_pair_in_locked_subsource_with_store(
                     &store,
                     &field,
@@ -1250,11 +1256,15 @@ impl AppState {
                 if pair.is_some() {
                     return Ok(pair);
                 }
-                if lock_exhaustion == LockExhaustionPolicy::PreserveAndStop {
-                    return Ok(None);
+                match self.resolve_locked_pair_starvation(
+                    store,
+                    lock.clone(),
+                    lock_exhaustion,
+                    &mut refilled_locked_source,
+                )? {
+                    LockedStarvationDisposition::Retry => continue,
+                    LockedStarvationDisposition::Stop => return Ok(None),
                 }
-                self.clear_external_subsource_lock()?;
-                continue;
             }
             return self.choose_pair_with_store(&store, &field, &assets, excluded_visual_keys);
         }
@@ -1267,10 +1277,11 @@ impl AppState {
         lock_exhaustion: LockExhaustionPolicy,
         excluded_visual_keys: &HashSet<VisualKey>,
     ) -> anyhow::Result<Option<ArenaPair>> {
-        for _ in 0..2 {
+        let mut refilled_locked_source = false;
+        for _ in 0..3 {
             let store = self.read_store()?;
             let field = self.session_field(&store)?;
-            if field.subsource_lock.is_some() {
+            if let Some(lock) = field.subsource_lock.as_ref() {
                 let assets = visible_assets(&store, self.active.corpus_id)?;
                 let pair = self.choose_pair_in_locked_subsource_with_store(
                     &store,
@@ -1282,11 +1293,15 @@ impl AppState {
                 if pair.is_some() {
                     return Ok(pair);
                 }
-                if lock_exhaustion == LockExhaustionPolicy::PreserveAndStop {
-                    return Ok(None);
+                match self.resolve_locked_pair_starvation(
+                    store,
+                    lock.clone(),
+                    lock_exhaustion,
+                    &mut refilled_locked_source,
+                )? {
+                    LockedStarvationDisposition::Retry => continue,
+                    LockedStarvationDisposition::Stop => return Ok(None),
                 }
-                self.clear_external_subsource_lock()?;
-                continue;
             }
             return self.choose_pair_preserving_local_anchor_with_store(
                 &store,
@@ -1296,6 +1311,31 @@ impl AppState {
             );
         }
         Ok(None)
+    }
+
+    fn resolve_locked_pair_starvation(
+        &self,
+        store: Store,
+        lock: crate::model::SessionSubsourceLock,
+        lock_exhaustion: LockExhaustionPolicy,
+        refilled_locked_source: &mut bool,
+    ) -> anyhow::Result<LockedStarvationDisposition> {
+        if lock_exhaustion == LockExhaustionPolicy::PreserveAndStop {
+            return Ok(LockedStarvationDisposition::Stop);
+        }
+        let should_hold_lock = self.locked_stream_should_hold_lock(&store, &lock)?;
+        drop(store);
+        if should_hold_lock {
+            if !*refilled_locked_source {
+                self.refill_locked_source_now(&lock)?;
+                *refilled_locked_source = true;
+                return Ok(LockedStarvationDisposition::Retry);
+            }
+            self.request_locked_stream_refresh(lock);
+            return Ok(LockedStarvationDisposition::Stop);
+        }
+        self.clear_external_subsource_lock()?;
+        Ok(LockedStarvationDisposition::Retry)
     }
 
     fn redirect_target_for_next_pair(

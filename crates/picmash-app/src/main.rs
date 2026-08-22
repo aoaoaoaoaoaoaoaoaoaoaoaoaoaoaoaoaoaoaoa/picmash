@@ -188,7 +188,27 @@ fn spawn_external_source_loop(state: Arc<AppState>) {
         }
         let pulse = u64::try_from(state.external_scan_pulse().whole_seconds().max(5)).unwrap_or(20);
         loop {
-            tokio::time::sleep(StdDuration::from_secs(pulse)).await;
+            tokio::select! {
+                _ = state.wait_for_external_refresh_signal() => {}
+                _ = tokio::time::sleep(StdDuration::from_secs(pulse)) => {}
+            }
+            if let Some(lock) = state.take_locked_stream_refresh_request() {
+                let state = state.clone();
+                match tokio::task::spawn_blocking(move || state.refresh_locked_stream_now(&lock))
+                    .instrument(debug_span!("external.refresh.loop.locked"))
+                    .await
+                {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => {
+                        error!(error = %format!("{error:#}"), "locked stream refresh failed");
+                        continue;
+                    }
+                    Err(error) => {
+                        error!(error = %format!("{error:#}"), "locked stream refresh task crashed");
+                        continue;
+                    }
+                }
+            }
             let state = state.clone();
             match tokio::task::spawn_blocking(move || state.refresh_external_sources_if_due(false))
                 .instrument(debug_span!("external.refresh.loop.tick"))

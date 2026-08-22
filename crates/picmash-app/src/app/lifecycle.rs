@@ -174,6 +174,8 @@ impl AppState {
             duplicate_frontier: RwLock::new(None),
             face_oracle: RwLock::new(None),
             maintenance_notify: Notify::new(),
+            external_refresh_notify: Notify::new(),
+            locked_stream_refresh: Mutex::new(None),
             arena_session: Mutex::new(ArenaSessionRuntime::default()),
             recent_facemash_pairs: Mutex::new(VecDeque::with_capacity(
                 FACEMASH_RECENT_PAIR_EXCLUDE,
@@ -599,6 +601,19 @@ mod tests {
     fn solid_png(path: &Path, rgb: [u8; 3]) {
         let image = image::RgbImage::from_fn(96, 96, |_x, _y| image::Rgb(rgb));
         image.save(path).expect("write test png");
+    }
+
+    fn patterned_png(path: &Path, seed: u8) {
+        let image = image::RgbImage::from_fn(96, 96, |x, y| {
+            let x = x as u8;
+            let y = y as u8;
+            image::Rgb([
+                x.wrapping_mul(13).wrapping_add(seed.wrapping_mul(17)),
+                y.wrapping_mul(19).wrapping_add(seed.wrapping_mul(23)),
+                x ^ y ^ seed.wrapping_mul(29),
+            ])
+        });
+        image.save(path).expect("write patterned test png");
     }
 
     fn app_config_with_source_mix(external_probability: f32) -> AppConfig {
@@ -2023,9 +2038,30 @@ mod tests {
         let prefetch = state
             .arena_prefetch_target_preserving_local_anchor(Some(&local_anchor))
             .expect("prefetch target under exhausted lock");
-        assert!(
-            matches!(prefetch, RedirectTarget::ArenaRoot),
-            "speculative exhausted prefetch should decline to invent an unlocked pair"
+        let RedirectTarget::ArenaPair { left, right } = prefetch else {
+            panic!("expected speculative prefetch to keep serving the locked stream");
+        };
+        let prefetched_remote = match (&left, &right) {
+            (ArenaHandle::Local(_), ArenaHandle::Remote(item_id))
+            | (ArenaHandle::Remote(item_id), ArenaHandle::Local(_)) => *item_id,
+            _ => panic!("expected a local-vs-remote prefetch pair under lock"),
+        };
+        let prefetched_item = state
+            .read_store()
+            .expect("open read store for locked prefetch item")
+            .remote_item(prefetched_remote)
+            .expect("load locked prefetch item")
+            .expect("locked prefetch item present");
+        let locked_stream_id = state
+            .read_store()
+            .expect("open read store for original locked item")
+            .remote_item(locked_item_id)
+            .expect("load original locked item")
+            .expect("original locked item present")
+            .stream_id;
+        assert_eq!(
+            prefetched_item.stream_id, locked_stream_id,
+            "speculative prefetch should not invent an unlocked fallback pair"
         );
         assert!(
             state
@@ -2037,4 +2073,6 @@ mod tests {
             "speculative prefetch must not clear an exhausted subsource lock"
         );
     }
+
+    include!("lifecycle_lock_tests.incl.rs");
 }

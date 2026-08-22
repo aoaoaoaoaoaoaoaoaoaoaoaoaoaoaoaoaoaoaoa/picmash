@@ -1,3 +1,4 @@
+use super::external_frontier::ExternalItemWarmState;
 use super::*;
 use std::collections::{HashMap, HashSet};
 
@@ -16,233 +17,13 @@ macro_rules! external_frontier_identity_predicate {
     };
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ExternalItemWarmState {
-    pub(crate) needs_materialization: bool,
-    pub(crate) needs_identity: bool,
-    pub(crate) needs_quality_features: bool,
-    pub(crate) needs_embedding: bool,
-    pub(crate) needs_clip_embedding: bool,
-    pub(crate) needs_face_embedding: bool,
-}
-
-impl ExternalItemWarmState {
-    pub(crate) fn needs_inline_work(self) -> bool {
-        self.needs_materialization
-            || self.needs_identity
-            || self.needs_quality_features
-            || self.needs_embedding
-            || self.needs_clip_embedding
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalIdentityDisposition {
-    Active,
-    Tombstoned,
-    Resolved(AssetId),
-}
-
 #[derive(Debug, Clone)]
-pub struct UpsertedExternalStreamBatchEntry {
-    pub stream_id: i64,
-    pub blocked: bool,
-    pub item_ids: HashMap<i64, RemoteItemId>,
+pub struct ExternalStreamWarmCandidate {
+    pub item_id: RemoteItemId,
+    pub snapshot: RemoteItemSnapshot,
 }
 
 impl Store {
-    pub fn external_scan_due(&self, source_key: &str, interval: Duration) -> anyhow::Result<bool> {
-        let last_scanned = self
-            .conn
-            .query_row(
-                r"
-                SELECT last_scanned_at
-                FROM external_sources
-                WHERE source_key = ?1
-                ",
-                params![source_key],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(last_scanned
-            .is_none_or(|last_scanned| now_ts() - last_scanned >= interval.whole_seconds()))
-    }
-
-    pub fn upsert_external_source(
-        &self,
-        source_key: &str,
-        display_name: &str,
-        kind: &str,
-        board: &str,
-        last_error: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.conn.execute(
-            r"
-            INSERT INTO external_sources (
-                source_key,
-                display_name,
-                kind,
-                board,
-                last_scanned_at,
-                last_error,
-                updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5)
-            ON CONFLICT(source_key) DO UPDATE SET
-                display_name = excluded.display_name,
-                kind = excluded.kind,
-                board = excluded.board,
-                last_scanned_at = excluded.last_scanned_at,
-                last_error = excluded.last_error,
-                updated_at = excluded.updated_at
-            ",
-            params![source_key, display_name, kind, board, now_ts(), last_error],
-        )?;
-        Ok(())
-    }
-
-    pub fn external_scan_fault(&self, source_key: &str, error: &str) -> anyhow::Result<()> {
-        self.conn.execute(
-            r"
-            INSERT INTO external_sources (
-                source_key,
-                display_name,
-                kind,
-                board,
-                last_scanned_at,
-                last_error,
-                updated_at
-            ) VALUES (?1, ?1, 'unknown', '', ?2, ?3, ?2)
-            ON CONFLICT(source_key) DO UPDATE SET
-                last_scanned_at = excluded.last_scanned_at,
-                last_error = excluded.last_error,
-                updated_at = excluded.updated_at
-            ",
-            params![source_key, now_ts(), error],
-        )?;
-        Ok(())
-    }
-
-    pub fn external_source_counts(
-        &self,
-        source_key: &str,
-    ) -> anyhow::Result<(usize, usize, usize)> {
-        let active_streams = self
-            .conn
-            .query_row(
-                r"
-                SELECT COUNT(*)
-                FROM external_streams
-                WHERE source_key = ?1 AND active = 1 AND blocked = 0
-                ",
-                params![source_key],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        let blocked_streams = self
-            .conn
-            .query_row(
-                r"
-                SELECT COUNT(*)
-                FROM external_streams
-                WHERE source_key = ?1 AND blocked = 1
-                ",
-                params![source_key],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        let mut cached_stmt = self.conn.prepare(
-            r"
-            SELECT i.cached_path
-            FROM external_items i
-            JOIN external_streams s ON s.id = i.stream_id
-            WHERE i.source_key = ?1
-              AND s.active = 1
-              AND s.blocked = 0
-              AND i.hidden = 0
-              AND i.import_pending = 0
-              AND i.resolved_asset_id IS NULL
-              AND i.imported_asset_id IS NULL
-              AND i.cached_path IS NOT NULL
-              AND i.embedding IS NOT NULL
-            ",
-        )?;
-        let cached_items = cached_stmt
-            .query_map(params![source_key], |row| row.get::<_, String>(0))?
-            .filter_map(Result::ok)
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-            .count();
-        Ok((
-            usize::try_from(active_streams).unwrap_or_default(),
-            usize::try_from(blocked_streams).unwrap_or_default(),
-            cached_items,
-        ))
-    }
-
-    pub fn external_source_ready_profile(
-        &self,
-        source_key: &str,
-        model_name: &str,
-    ) -> anyhow::Result<(usize, HashMap<i64, usize>)> {
-        let mut stmt = self.conn.prepare(concat!(
-            r"
-            SELECT i.stream_id, i.cached_path
-            FROM external_items i
-            JOIN external_streams s ON s.id = i.stream_id
-            WHERE i.source_key = ?1
-              AND s.active = 1
-              AND s.blocked = 0
-              AND i.hidden = 0
-              AND i.import_pending = 0
-              AND i.resolved_asset_id IS NULL
-              AND i.imported_asset_id IS NULL
-              AND i.cached_path IS NOT NULL
-              AND i.embedding IS NOT NULL
-              AND i.embedding_model = ?2
-            ",
-            external_frontier_identity_predicate!(),
-        ))?;
-        let mut by_stream = HashMap::new();
-        let mut total = 0usize;
-        let rows = stmt.query_map(params![source_key, model_name], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (stream_id, cached_path) = row?;
-            if !PathBuf::from(cached_path).exists() {
-                continue;
-            }
-            total += 1;
-            *by_stream.entry(stream_id).or_default() += 1;
-        }
-        Ok((total, by_stream))
-    }
-
-    pub fn active_external_source_cache_paths(&self) -> anyhow::Result<HashSet<PathBuf>> {
-        let mut stmt = self.conn.prepare(
-            r"
-            SELECT DISTINCT i.cached_path
-            FROM external_items i
-            JOIN external_streams s ON s.id = i.stream_id
-            WHERE s.active = 1
-              AND s.blocked = 0
-              AND i.hidden = 0
-              AND i.resolved_asset_id IS NULL
-              AND i.imported_asset_id IS NULL
-              AND i.cached_path IS NOT NULL
-            ",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut paths = HashSet::new();
-        for row in rows {
-            paths.insert(PathBuf::from(row?));
-        }
-        Ok(paths)
-    }
-
     pub fn retire_missing_external_streams(
         &self,
         source_key: &str,
@@ -1261,6 +1042,27 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn save_external_item_cached_path(
+        &self,
+        item_id: RemoteItemId,
+        cached_path: &Path,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            r"
+            UPDATE external_items
+            SET cached_path = ?2,
+                updated_at = ?3
+            WHERE id = ?1
+            ",
+            params![
+                item_id.0,
+                cached_path.to_string_lossy().into_owned(),
+                now_ts(),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn save_external_item_identity(
         &self,
         item_id: RemoteItemId,
@@ -1714,6 +1516,66 @@ impl Store {
                 })
             },
         )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn external_stream_warm_candidates(
+        &self,
+        source_key: &str,
+        stream_id: i64,
+    ) -> anyhow::Result<Vec<ExternalStreamWarmCandidate>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT
+                i.id,
+                i.thread_no,
+                i.post_no,
+                i.title,
+                i.image_url,
+                i.thumb_url,
+                i.ext,
+                i.md5,
+                i.width,
+                i.height,
+                i.cached_path
+            FROM external_items i
+            JOIN external_streams s ON s.id = i.stream_id
+            WHERE i.source_key = ?1
+              AND i.stream_id = ?2
+              AND s.active = 1
+              AND s.blocked = 0
+              AND i.hidden = 0
+              AND i.import_pending = 0
+              AND i.resolved_asset_id IS NULL
+              AND i.imported_asset_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM external_item_tombstones tombstone
+                  WHERE tombstone.visual_key = i.visual_key
+              )
+            ORDER BY i.post_no DESC
+            ",
+        )?;
+        let rows = stmt.query_map(params![source_key, stream_id], |row| {
+            let image_url = row.get::<_, String>(4)?;
+            let cached_path = row.get::<_, Option<String>>(10)?.map(PathBuf::from);
+            Ok(ExternalStreamWarmCandidate {
+                item_id: RemoteItemId(row.get(0)?),
+                snapshot: RemoteItemSnapshot {
+                    thread_no: row.get(1)?,
+                    post_no: row.get(2)?,
+                    title: row.get(3)?,
+                    image_url: image_url.clone(),
+                    thumb_url: row.get(5)?,
+                    ext: row.get(6)?,
+                    md5: row.get(7)?,
+                    width: u32::try_from(row.get::<_, i64>(8)?).unwrap_or_default(),
+                    height: u32::try_from(row.get::<_, i64>(9)?).unwrap_or_default(),
+                    file_size: 0,
+                    materialized_path: cached_path.or_else(|| file_url_to_path(&image_url)),
+                },
+            })
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -2386,6 +2248,10 @@ fn quality_payload_into_rusqlite(error: anyhow::Error) -> rusqlite::Error {
         rusqlite::types::Type::Text,
         Box::new(std::io::Error::other(error.to_string())),
     )
+}
+
+fn file_url_to_path(image_url: &str) -> Option<PathBuf> {
+    image_url.strip_prefix("file://").map(PathBuf::from)
 }
 
 fn touch_session_tx(tx: &Transaction<'_>, session_id: SessionId) -> anyhow::Result<()> {

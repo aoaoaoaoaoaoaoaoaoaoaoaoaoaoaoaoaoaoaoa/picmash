@@ -9,6 +9,8 @@ const LOCAL_DIRECTORY_READY_TARGET_CAP: usize = 64;
 const REMOTE_READY_TARGET_PER_STREAM: usize = 3;
 const REMOTE_READY_TARGET_CAP: usize = 96;
 pub(super) const REMOTE_SOURCE_IDLE_SCAN_GRACE: Duration = Duration::minutes(10);
+pub(super) const REMOTE_SOURCE_EMPTY_SCAN_BACKOFF: Duration = Duration::minutes(30);
+pub(super) const REMOTE_SOURCE_RECENT_READY_CAP: usize = 12;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ReadyTargetProfile {
@@ -38,6 +40,24 @@ impl ReadyTargetProfile {
             cap: REMOTE_READY_TARGET_CAP,
         }
     }
+
+    pub(super) const fn idle_floor(self) -> usize {
+        self.per_stream
+    }
+
+    pub(super) fn target_total(self, stream_count: usize) -> usize {
+        stream_count
+            .saturating_mul(self.per_stream)
+            .min(self.cap)
+            .max(self.per_stream)
+    }
+
+    pub(super) fn capped(self, cap: usize) -> Self {
+        Self {
+            per_stream: self.per_stream,
+            cap: self.cap.min(cap).max(self.per_stream),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,10 +75,7 @@ impl SourceReadyFrontier {
         stream_count: usize,
         profile: ReadyTargetProfile,
     ) -> Self {
-        let target_total = stream_count
-            .saturating_mul(profile.per_stream)
-            .min(profile.cap)
-            .max(profile.per_stream);
+        let target_total = profile.target_total(stream_count);
         Self {
             total_ready,
             ready_by_stream,
@@ -81,6 +98,13 @@ impl SourceReadyFrontier {
             .copied()
             .unwrap_or_default()
             >= self.target_per_stream
+    }
+
+    pub(super) fn ready_in_stream(&self, stream_id: i64) -> usize {
+        self.ready_by_stream
+            .get(&stream_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(super) fn note_ready(&mut self, stream_id: i64) {

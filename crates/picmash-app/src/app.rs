@@ -77,7 +77,8 @@ pub use self::arena_session::{
     SamplerInvalidation,
 };
 use self::ready_frontier::{
-    REMOTE_SOURCE_IDLE_SCAN_GRACE, ReadyTargetProfile, SourceReadyFrontier,
+    REMOTE_SOURCE_EMPTY_SCAN_BACKOFF, REMOTE_SOURCE_IDLE_SCAN_GRACE,
+    REMOTE_SOURCE_RECENT_READY_CAP, ReadyTargetProfile, SourceReadyFrontier,
 };
 use self::runtime::surviving_local_anchor;
 use self::state::{
@@ -141,6 +142,7 @@ const EXPLORE_TRIAD_NEIGHBORS: usize = 8;
 const EXPLORE_SELECTION_NEIGHBORS: usize = 14;
 const EXPLORE_TRIAD_TOP_K: usize = 12;
 const EXTERNAL_RECENT_EXCLUDE: usize = 14;
+const EXTERNAL_LOCKED_STREAM_READY_TARGET: usize = EXTERNAL_RECENT_EXCLUDE + 1;
 const EXTERNAL_STREAM_RECENT_EXCLUDE: usize = 8;
 const EXTERNAL_STREAM_HARD_EXCLUDE: usize = 16;
 const EXTERNAL_SOURCE_RECENT_EXCLUDE_CAP: usize = 6;
@@ -218,6 +220,8 @@ pub struct AppState {
     duplicate_frontier: RwLock<Option<DuplicateFrontier>>,
     face_oracle: RwLock<Option<FaceOracle>>,
     maintenance_notify: Notify,
+    external_refresh_notify: Notify,
+    locked_stream_refresh: Mutex<Option<crate::model::SessionSubsourceLock>>,
     arena_session: Mutex<ArenaSessionRuntime>,
     recent_facemash_pairs: Mutex<VecDeque<FacemashPairKey>>,
     recent_facemash_identities: Mutex<VecDeque<FaceIdentityId>>,
