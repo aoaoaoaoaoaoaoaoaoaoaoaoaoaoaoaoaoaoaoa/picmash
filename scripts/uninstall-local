@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+install_root=${1:-${PICMASH_INSTALL_ROOT:-$HOME/.local}}
+
+rm -f \
+    "$install_root/bin/picmash" \
+    "$install_root/share/applications/picmash.desktop"
+printf 'removed Picmash from %s\n' "$install_root"
