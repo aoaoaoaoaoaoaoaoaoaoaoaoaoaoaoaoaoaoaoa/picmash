@@ -14,29 +14,33 @@ global database ID is its recorded order.
 A **snapshot** is a derived, reproducible preference projection over one
 catalog revision and one duel frontier. It is not primary evidence.
 
-## Host Obligations
+## Native Boundary
 
-The Poolrooms graft should treat the engine as its sole authority for catalog
+The native application treats the engine as its sole authority for catalog
 identity, judgment persistence, favorites, and preference scores. UI state,
-navigation, image presentation, and application lifecycle remain host
-concerns.
+navigation, image presentation, and application lifecycle remain host concerns.
 
-The host must:
+The host:
 
-1. Supply a durable state-database path and a corpus path.
-2. Give each judgment surface a stable context revision.
-3. Render the exact occurrence, render digest, and rotation in the issued
+1. Supplies a durable database path under platform data and a corpus path.
+2. Gives each judgment surface a stable context revision.
+3. Renders the exact occurrence, render digest, and rotation in the issued
    prompt.
-4. Mint one command ID per user intent and reuse it only for an exact retry.
-5. Rebuild preferences off the interaction path, then adopt the returned
-   snapshot atomically.
-6. Display holdout metrics as diagnostics, never as a claim of universal image
+4. Mints one command ID per user intent and reuses it only for an exact retry.
+5. Rebuilds preferences on the engine worker, then adopts its collection and
+   prompt projections in event order.
+6. Displays holdout metrics as diagnostics, never as a claim of universal image
    quality.
 
-The first graft should expose only local collection browsing, pairwise
-preference, favorites, hiding, and rotation. Similarity is stored but has no
-authorized learner. External sources and face workflows require separate
-commissions.
+The graft exposes only local collection browsing, pairwise preference,
+favorites, hiding, and rotation. Similarity is stored but has no authorized
+learner. External sources and face workflows require separate commissions.
+
+The native event loop owns no blocking filesystem, database, image-decoding,
+or model work. A bounded command channel feeds one engine worker. Image blades
+cross back as immutable RGBA buffers and become GPU textures on the UI thread.
+The external acceptance executable observes only a small one-way state and
+stable target vocabulary from `picmash-contract`.
 
 ## Persistence Law
 

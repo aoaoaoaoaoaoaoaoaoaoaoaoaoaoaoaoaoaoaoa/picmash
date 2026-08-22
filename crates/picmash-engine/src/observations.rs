@@ -11,7 +11,7 @@ use crate::{
     model::{ComparisonPrompt, JudgmentSession, PresentedAsset, ThresholdJudgment},
 };
 
-const PAIR_POLICY: &str = "coverage-matched-balanced-v1";
+const PAIR_POLICY: &str = "coverage-anchor-matched-balanced-v2";
 
 impl Engine {
     pub fn start_session(
@@ -107,28 +107,36 @@ impl Engine {
                       ON ps.snapshot_id = ls.id AND ps.asset_id = r.asset_id
                     LEFT JOIN duel_counts dc ON dc.asset_id = r.asset_id
                     WHERE r.rank = 1
-                ), pairs AS (
-                    SELECT l.asset_id AS left_id, l.occurrence_id AS left_occurrence,
-                           l.render_digest AS left_render, l.rotation_quarters AS left_rotation,
-                           r.asset_id AS right_id, r.occurrence_id AS right_occurrence,
-                           r.render_digest AS right_render, r.rotation_quarters AS right_rotation,
-                           ABS(l.score - r.score) AS score_gap,
-                           MAX(l.duel_count, r.duel_count) AS exposure,
-                           (
-                               SELECT COUNT(*) FROM pm_asset_duels d
-                               JOIN pm_observations o ON o.id = d.observation_id
-                               JOIN pm_sessions s ON s.id = o.session_id
-                               WHERE s.collection_id = ?1
-                                 AND ((d.left_asset_id = l.asset_id AND d.right_asset_id = r.asset_id)
-                                   OR (d.left_asset_id = r.asset_id AND d.right_asset_id = l.asset_id))
-                           ) AS pair_duels
-                    FROM visible l JOIN visible r ON l.asset_id < r.asset_id
+                ), anchor AS (
+                    SELECT * FROM visible
+                    ORDER BY duel_count ASC, asset_id ASC
+                    LIMIT 1
+                ), pair_counts AS (
+                    SELECT
+                        CASE WHEN d.left_asset_id < d.right_asset_id
+                            THEN d.left_asset_id ELSE d.right_asset_id END AS low_id,
+                        CASE WHEN d.left_asset_id < d.right_asset_id
+                            THEN d.right_asset_id ELSE d.left_asset_id END AS high_id,
+                        COUNT(*) AS duel_count
+                    FROM pm_asset_duels d
+                    JOIN pm_observations o ON o.id = d.observation_id
+                    JOIN pm_sessions s ON s.id = o.session_id
+                    WHERE s.collection_id = ?1
+                    GROUP BY low_id, high_id
                 )
-                SELECT left_id, left_occurrence, left_render, left_rotation,
-                       right_id, right_occurrence, right_render, right_rotation,
+                SELECT a.asset_id, a.occurrence_id, a.render_digest, a.rotation_quarters,
+                       opponent.asset_id, opponent.occurrence_id,
+                       opponent.render_digest, opponent.rotation_quarters,
                        (SELECT id FROM latest_snapshot)
-                FROM pairs
-                ORDER BY pair_duels ASC, exposure ASC, score_gap ASC, left_id ASC, right_id ASC
+                FROM anchor a
+                JOIN visible opponent ON opponent.asset_id != a.asset_id
+                LEFT JOIN pair_counts pc ON
+                    pc.low_id = MIN(a.asset_id, opponent.asset_id)
+                    AND pc.high_id = MAX(a.asset_id, opponent.asset_id)
+                ORDER BY COALESCE(pc.duel_count, 0) ASC,
+                         opponent.duel_count ASC,
+                         ABS(a.score - opponent.score) ASC,
+                         opponent.asset_id ASC
                 LIMIT 1
                 ",
                 [collection_id.get()],

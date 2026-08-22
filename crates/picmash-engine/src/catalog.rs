@@ -24,14 +24,24 @@ struct Candidate {
 
 impl Engine {
     pub fn scan(&self, root: impl AsRef<Path>) -> Result<ScanReport> {
+        self.scan_with_halt(root, || false)?
+            .ok_or_else(|| Fault::Corrupt("an unconditional collection scan halted".to_owned()))
+    }
+
+    pub fn scan_with_halt(
+        &self,
+        root: impl AsRef<Path>,
+        mut halt: impl FnMut() -> bool,
+    ) -> Result<Option<ScanReport>> {
         let root = root.as_ref().canonicalize().at(root.as_ref())?;
-        let now = now_ns()?;
-        let collection_id = self.ensure_collection(&root, now)?;
         let mut candidates = Vec::new();
         let mut failures = Vec::new();
         let mut complete = true;
 
         for entry in WalkDir::new(&root).follow_links(false) {
+            if halt() {
+                return Ok(None);
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -58,7 +68,13 @@ impl Engine {
             }
         }
 
+        if halt() {
+            return Ok(None);
+        }
+        let now = now_ns()?;
+        let collection_id = self.ensure_collection(&root, now)?;
         self.apply_scan(collection_id, candidates, failures, complete, now)
+            .map(Some)
     }
 
     pub fn collection(&self, id: CollectionId) -> Result<Collection> {
