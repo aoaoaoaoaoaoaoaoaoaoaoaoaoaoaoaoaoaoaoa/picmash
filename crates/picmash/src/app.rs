@@ -55,6 +55,7 @@ impl Mode {
         }
     }
 
+    #[cfg(feature = "egui-test")]
     const fn wire(self) -> &'static str {
         match self {
             Self::Compare => "compare",

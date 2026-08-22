@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+install_root=${1:-${PICMASH_INSTALL_ROOT:-$HOME/.local}}
+
+cargo build \
+    --manifest-path "$root/Cargo.toml" \
+    --package picmash \
+    --release \
+    --locked
+target_directory=$(cargo metadata \
+    --manifest-path "$root/Cargo.toml" \
+    --format-version 1 \
+    --no-deps \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+test -n "$target_directory"
+
+install -Dm755 "$target_directory/release/picmash" \
+    "$install_root/bin/picmash"
+install -Dm644 "$root/assets/picmash.desktop" \
+    "$install_root/share/applications/picmash.desktop"
+
+"$install_root/bin/picmash" --version >/dev/null
+printf 'installed %s\n' "$install_root/bin/picmash"

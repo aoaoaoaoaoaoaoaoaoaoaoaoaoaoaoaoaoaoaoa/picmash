@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Picmash
+Comment=Learn preferences over a local image collection
+Exec=picmash
+Terminal=false
+Categories=Graphics;Photography;
+StartupNotify=false
+X-GNOME-UsesNotifications=false

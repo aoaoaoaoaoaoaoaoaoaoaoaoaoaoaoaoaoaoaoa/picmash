@@ -33,6 +33,16 @@ read-only. Picmash places its database under the platform data directory, the
 active-collection pointer under state, and `picmash.toml` under configuration.
 No mutable product state belongs in the checkout.
 
+## Install
+
+```console
+scripts/install-local
+```
+
+This installs the executable and desktop launcher under `~/.local`. Remove
+them with `scripts/uninstall-local`; configuration, state, and image data are
+left intact.
+
 ## Architecture
 
 `picmash-engine` is the synchronous authority for exact asset and occurrence
