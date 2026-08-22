@@ -1,7 +1,7 @@
 use anyhow::Result;
 use brass_poolrooms::{
     chrome::{self, Checkbox, MechanismSize, Monoglyph, MonoglyphFinish, Symbol},
-    water::{Surface, Wetness},
+    water::{Floor, Surface, Wetness},
 };
 use crossbeam_channel::{Receiver, bounded};
 use egui::{ColorImage, TextureHandle, TextureOptions};
@@ -290,10 +290,12 @@ impl Picmash {
     }
 
     fn chamber(&mut self, ui: &mut egui::Ui) {
+        let arena = ui.available_rect_before_wrap();
+        self.water
+            .set_floor(self.busy.then_some(Floor::shallow(arena)));
         match (self.busy, self.summary.is_some(), self.mode) {
             (true, _, _) => {
-                let arena = ui.available_rect_before_wrap();
-                let _rect = self.living_wait.bouncer_with(ui, arena, &self.status);
+                let _rect = self.living_wait.bouncer(ui, arena);
             }
             (false, false, _) => self.first_contact(ui),
             (false, true, Mode::Compare) => self.comparison(ui),
