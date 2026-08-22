@@ -135,6 +135,10 @@ ownership is bounded by the reservoir; atomic replacement may transiently add
 one staging payload. The result channel holds at most the two extant lane
 completions, and the UI event channel holds 64 events.
 
+Promotion invokes the lossless JPEG XL encoder at effort 5 and kills it after
+ten seconds. An overdue or failed encode leaves the offer intact and retryable;
+it cannot hold the engine worker indefinitely.
+
 ## Liveness
 
 Assume an enabled source remains reachable, its configured interval expires,

@@ -496,7 +496,15 @@ fn choose(
         .prompt
         .as_ref()
         .context("there is no live comparison to judge")?;
-    publish(events, wake, Event::Busy("FORGING NEXT PAIR"));
+    publish(
+        events,
+        wake,
+        Event::Busy(if matches!(prompt, LivePrompt::Remote { .. }) {
+            "PROMOTING CHALLENGER"
+        } else {
+            "FORGING NEXT PAIR"
+        }),
+    );
     match prompt {
         LivePrompt::Local { prompt, born } => {
             let prompt = prompt.clone();

@@ -566,7 +566,18 @@ impl Picmash {
 
     fn apply_action(&mut self, action: Action) {
         match action {
-            Action::Choose(side) => self.send(Command::Choose(side), true, "FORGING NEXT PAIR"),
+            Action::Choose(side) => {
+                let status = if self
+                    .pair
+                    .as_ref()
+                    .is_some_and(|pair| pair.pair.right.remote().is_some())
+                {
+                    "PROMOTING CHALLENGER"
+                } else {
+                    "FORGING NEXT PAIR"
+                };
+                self.send(Command::Choose(side), true, status);
+            }
             Action::Favorite(side) => {
                 let remote = self.pair.as_ref().is_some_and(|pair| match side {
                     Side::Left => pair.pair.left.remote().is_some(),
