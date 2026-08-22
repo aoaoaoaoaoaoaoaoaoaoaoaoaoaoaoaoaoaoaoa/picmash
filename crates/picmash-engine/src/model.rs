@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::{
+    fault::{Fault, Result},
     ids::{AssetId, CollectionId, ObservationId, OccurrenceId, PromptId, SessionId, SnapshotId},
     media::{BlobDigest, RenderDigest},
 };
@@ -87,12 +88,47 @@ pub struct JudgmentSession {
     pub ended_at_ns: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresentedAsset {
     pub asset_id: AssetId,
     pub occurrence_id: OccurrenceId,
     pub render: RenderDigest,
     pub rotation_quarters: u8,
+}
+
+impl PresentedAsset {
+    /// Reconstitutes an exact presentation captured by a durable outer
+    /// protocol. This does not assert that the occurrence is still present;
+    /// the engine checks that relationship when the presentation is used.
+    pub fn from_persisted(
+        asset_id: AssetId,
+        occurrence_id: i64,
+        render_digest: String,
+        rotation_quarters: u8,
+    ) -> Result<Self> {
+        if occurrence_id <= 0 {
+            return Err(Fault::Corrupt(format!(
+                "invalid persisted occurrence id {occurrence_id}"
+            )));
+        }
+        if rotation_quarters >= 4 {
+            return Err(Fault::Corrupt(format!(
+                "invalid persisted rotation {rotation_quarters}"
+            )));
+        }
+        Ok(Self {
+            asset_id,
+            occurrence_id: OccurrenceId::from_raw(occurrence_id),
+            render: RenderDigest::parse(render_digest)?,
+            rotation_quarters,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuelVictor {
+    Anchor,
+    Challenger,
 }
 
 #[derive(Debug, Clone)]

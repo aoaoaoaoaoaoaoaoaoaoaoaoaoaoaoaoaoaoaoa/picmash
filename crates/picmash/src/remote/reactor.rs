@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
     sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -13,7 +14,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use super::{
     CatalogIntent, Epoch, FetchIntent, FetchSettlement, Harvest, Harvester, Machine, Moment,
-    Prepared, RemoteStore, Summary,
+    Prepared, PromotionIntent, PromotionJudgment, RemoteItemId, RemoteStore, Summary,
 };
 use crate::{configuration::RemoteConfig, xdg::Lair};
 
@@ -44,6 +45,7 @@ pub struct Reactor {
     catalog_lane: Option<Sender<CatalogIntent>>,
     fetch_lane: Option<Sender<FetchIntent>>,
     threads: Vec<JoinHandle<()>>,
+    restored_promotions: Vec<PromotionIntent>,
 }
 
 impl Reactor {
@@ -53,7 +55,7 @@ impl Reactor {
         let harvester = Arc::new(Harvester::new(cache.clone())?);
         let store = RemoteStore::open(&lair.remote_database(), cache)?;
         let mut machine = Machine::new(config, Epoch::INITIAL, Moment::ZERO)?;
-        restore(&mut machine, &store, config)?;
+        let restored_promotions = restore(&mut machine, &store, config)?;
         let (completion_tx, completions) = bounded(EFFECT_CAPACITY);
         let (catalog_lane, catalog_rx) = bounded::<CatalogIntent>(1);
         let (fetch_lane, fetch_rx) = bounded::<FetchIntent>(1);
@@ -119,6 +121,7 @@ impl Reactor {
             catalog_lane: Some(catalog_lane),
             fetch_lane: Some(fetch_lane),
             threads: vec![catalog_thread, fetch_thread],
+            restored_promotions,
         })
     }
 
@@ -133,7 +136,7 @@ impl Reactor {
         for candidate in retired {
             self.store.release(&candidate)?;
         }
-        restore(&mut self.machine, &self.store, config)?;
+        let _already_running = restore(&mut self.machine, &self.store, config)?;
         self.poisoned = false;
         self.drive()
     }
@@ -213,6 +216,47 @@ impl Reactor {
         Ok(self.machine.offer()?.cloned())
     }
 
+    pub fn take_restored_promotions(&mut self) -> Vec<PromotionIntent> {
+        std::mem::take(&mut self.restored_promotions)
+    }
+
+    pub fn begin_promotion(
+        &mut self,
+        expected: &Prepared,
+        collection_root: PathBuf,
+        rotation_quarters: u8,
+        judgment: PromotionJudgment,
+    ) -> Result<PromotionIntent> {
+        let candidate = self.machine.begin_promotion()?;
+        if candidate.discovery.item_id != expected.discovery.item_id {
+            self.machine.abort_promotion(&candidate.discovery.item_id)?;
+            anyhow::bail!("remote offer changed before archival commitment");
+        }
+        let intent = PromotionIntent {
+            candidate,
+            collection_root,
+            rotation_quarters,
+            judgment,
+        };
+        if let Err(error) = self.store.begin_promotion(&intent) {
+            self.machine
+                .abort_promotion(&intent.candidate.discovery.item_id)?;
+            return Err(error);
+        }
+        Ok(intent)
+    }
+
+    pub fn abort_promotion(&mut self, intent: &PromotionIntent) -> Result<()> {
+        self.store
+            .abort_promotion(&intent.candidate.discovery.item_id)?;
+        self.machine
+            .abort_promotion(&intent.candidate.discovery.item_id)
+    }
+
+    pub fn promotion_failed(&self, item: &RemoteItemId, message: &str) -> Result<()> {
+        self.store.promotion_failed(item, message)
+    }
+
     pub fn reject_offer(&mut self) -> Result<()> {
         let candidate = self
             .machine
@@ -236,17 +280,16 @@ impl Reactor {
         self.drive()
     }
 
-    pub fn seal_promoted(&mut self, expected: &Prepared) -> Result<()> {
-        let candidate = self
-            .machine
-            .retire_offer()?
-            .context("there is no remote offer to promote")?;
+    pub fn seal_promoted(&mut self, expected: &PromotionIntent) -> Result<()> {
+        let item = &expected.candidate.discovery.item_id;
+        let candidate = self.machine.promotion(item)?;
         ensure!(
-            candidate.discovery.item_id == expected.discovery.item_id,
-            "remote offer changed during promotion"
+            candidate.discovery.item_id == *item,
+            "remote promotion changed"
         );
-        self.store.promoted(&candidate)?;
-        self.drive()
+        self.store.promoted(candidate)?;
+        let _finished = self.machine.finish_promotion(item)?;
+        Ok(())
     }
 
     pub fn note_duel(&self, candidate: &Prepared, remote_won: bool) -> Result<()> {
@@ -299,15 +342,25 @@ fn recover<T>(error: TrySendError<T>) -> T {
     }
 }
 
-fn restore(machine: &mut Machine, store: &RemoteStore, config: &RemoteConfig) -> Result<()> {
-    let (discovered, prepared) = store.restore(config)?;
+fn restore(
+    machine: &mut Machine,
+    store: &RemoteStore,
+    config: &RemoteConfig,
+) -> Result<Vec<PromotionIntent>> {
+    let restored = store.restore(config)?;
+    machine.restore_promoting(
+        restored
+            .promotions
+            .iter()
+            .map(|intent| intent.candidate.clone()),
+    )?;
     if !config.enabled {
-        for candidate in prepared {
+        for candidate in restored.prepared {
             store.release(&candidate)?;
         }
-        return Ok(());
+        return Ok(restored.promotions);
     }
-    let discarded = machine.restore_prepared(prepared)?;
+    let discarded = machine.restore_prepared(restored.prepared)?;
     let mut released = HashMap::new();
     for candidate in discarded {
         store.release(&candidate)?;
@@ -317,11 +370,19 @@ fn restore(machine: &mut Machine, store: &RemoteStore, config: &RemoteConfig) ->
             .1
             .push(candidate.discovery);
     }
-    machine.restore_discovered(discovered.into_iter().chain(released.into_iter().map(
-        |(source, (source_identity, discoveries))| Harvest {
-            source,
-            source_identity,
-            discoveries,
-        },
-    )))
+    machine.restore_discovered(
+        restored
+            .harvests
+            .into_iter()
+            .chain(
+                released
+                    .into_iter()
+                    .map(|(source, (source_identity, discoveries))| Harvest {
+                        source,
+                        source_identity,
+                        discoveries,
+                    }),
+            ),
+    )?;
+    Ok(restored.promotions)
 }

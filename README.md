@@ -59,8 +59,9 @@ UI vocabulary shared with the external `picmash-acceptance` executable.
 Remote source definitions, sampling chance, reservoir capacity, filters, and
 import policy live under `[remote]` in `picmash.toml`. Existing web-app source
 configuration is migrated once as a fallback. The native pipeline has one
-catalog lane, one media-fetch lane, bounded metadata, and a reservoir that
-counts fetching, ready, and displayed challengers. See
+catalog lane, one media-fetch lane, one maximum-effort archive lane, bounded
+metadata, and a reservoir that counts fetching, ready, and displayed
+challengers. See
 [Remote Acquisition](docs/remote-acquisition.md) for its state and resource
 laws.
 
@@ -90,5 +91,5 @@ scripts/test-acceptance /tmp/picmash-acceptance
 
 The canonical gate formats, lints, and tests the workspace. The hermetic native
 story proves favorite, rotation, voting, hiding, browsing, restart persistence,
-a bounded local-source reservoir, and canonical remote promotion without
-network access.
+a bounded local-source reservoir, nonblocking durable archive resumption, and
+canonical remote promotion without network access.

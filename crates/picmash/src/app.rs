@@ -334,7 +334,7 @@ impl Picmash {
                     let _caution = ui.label(chrome::muted("DIAGNOSTIC, NOT QUALITY"));
                 }
             }
-            if self.remote_summary.enabled_sources > 0 {
+            if self.remote_summary.enabled_sources > 0 || self.remote_summary.promoting > 0 {
                 ui.add_space(4.0);
                 let _label = ui.label(chrome::eyebrow("REMOTE RESERVOIR"));
                 datum(
@@ -351,6 +351,9 @@ impl Picmash {
                     datum(ui, "BACKOFF", self.remote_summary.backing_off.to_string());
                 }
                 datum(ui, "DISCOVERED", self.remote_summary.discovered.to_string());
+                if self.remote_summary.promoting > 0 {
+                    datum(ui, "ARCHIVING", self.remote_summary.promoting.to_string());
+                }
             }
             ui.add_space(4.0);
             let _status = ui.label(chrome::muted(&self.status));
@@ -483,21 +486,21 @@ impl Picmash {
                             continue;
                         };
                         let card = &self.cards[card_index];
-                        let _retained = retained.insert(card.asset_id.clone());
+                        let _retained = retained.insert(card.presentation.asset_id.clone());
                         let key = ThumbKey {
-                            asset_id: card.asset_id.clone(),
+                            asset_id: card.presentation.asset_id.clone(),
                             bucket,
                         };
                         let texture = self.thumbnails.get(&key).or_else(|| {
                             [2, 1, 0].into_iter().find_map(|resident| {
                                 self.thumbnails.get(&ThumbKey {
-                                    asset_id: card.asset_id.clone(),
+                                    asset_id: card.presentation.asset_id.clone(),
                                     bucket: resident,
                                 })
                             })
                         });
                         if browse_tile(ui, &mut self.water, card, texture, edge, slot == 0) {
-                            opened = Some(card.asset_id.clone());
+                            opened = Some(card.presentation.asset_id.clone());
                         }
                         if texture.is_none() && !self.thumbnails_inflight.contains(&key) {
                             demands.push(key);
@@ -572,7 +575,7 @@ impl Picmash {
                     .as_ref()
                     .is_some_and(|pair| pair.pair.right.remote().is_some())
                 {
-                    "PROMOTING CHALLENGER"
+                    "COMMITTING TO ARCHIVE"
                 } else {
                     "FORGING NEXT PAIR"
                 };
@@ -587,7 +590,7 @@ impl Picmash {
                     Command::Favorite(side),
                     remote,
                     if remote {
-                        "PROMOTING FAVORITE"
+                        "COMMITTING FAVORITE"
                     } else {
                         "MARKING FAVORITE"
                     },
@@ -712,12 +715,17 @@ impl Picmash {
                 self.thumbnails_inflight.clear();
                 self.rebuild_browse_indices();
             }
+            Event::CatalogRefreshed { summary, cards } => {
+                self.summary = Some(summary);
+                self.cards = cards;
+                self.rebuild_browse_indices();
+            }
             Event::Pair(pair) => {
                 let remote = pair.right.remote().is_some();
                 let left_texture = upload(ctx, "picmash-left", &pair.left_blade);
                 let right_texture = upload(ctx, "picmash-right", &pair.right_blade);
                 self.pair = Some(PairView {
-                    pair,
+                    pair: *pair,
                     left_texture,
                     right_texture,
                 });
@@ -736,6 +744,9 @@ impl Picmash {
             Event::RemoteFault(message) => {
                 self.status = format!("REMOTE SUSPENDED · {message}");
             }
+            Event::ArchiveFault(message) => {
+                self.status = format!("ARCHIVE PAUSED · {message}");
+            }
             Event::NoComparison => {
                 self.pair = None;
                 self.busy = false;
@@ -744,14 +755,14 @@ impl Picmash {
             }
             Event::Favorite { asset_id, active } => {
                 for card in &mut self.cards {
-                    if card.asset_id == asset_id {
+                    if card.presentation.asset_id == asset_id {
                         card.favorite = active;
                     }
                 }
                 if let Some(pair) = &mut self.pair {
                     for card in [&mut pair.pair.left, &mut pair.pair.right] {
                         if let Some(card) = card.local_mut()
-                            && card.asset_id == asset_id
+                            && card.presentation.asset_id == asset_id
                         {
                             card.favorite = active;
                         }
@@ -841,7 +852,7 @@ impl Picmash {
         let sequence = self
             .browse_indices
             .iter()
-            .map(|&index| self.cards[index].asset_id.clone())
+            .map(|&index| self.cards[index].presentation.asset_id.clone())
             .collect::<Vec<_>>();
         let Some(slot) = sequence.iter().position(|candidate| candidate == asset_id) else {
             "VIEWER FAULT · IMAGE LEFT THE BROWSER".clone_into(&mut self.status);
@@ -874,7 +885,7 @@ impl Picmash {
         let Some(card) = self
             .cards
             .iter()
-            .find(|card| card.asset_id == asset_id)
+            .find(|card| card.presentation.asset_id == asset_id)
             .cloned()
         else {
             self.viewer = None;
@@ -1105,6 +1116,7 @@ impl Picmash {
                 .as_ref()
                 .is_some_and(|pair| pair.pair.right.remote().is_some()),
             remote_ready: self.remote_summary.prepared + usize::from(self.remote_summary.offered),
+            remote_promoting: self.remote_summary.promoting,
             pair_rotations: self.pair.as_ref().map(|pair| {
                 [
                     pair.pair.left.rotation_quarters(),
@@ -1338,7 +1350,7 @@ fn browse_tile(
     }
     if response.hovered() {
         paint_browse_metadata(ui, rect, card);
-        water.hover(("browse", card.asset_id.as_str()), rect);
+        water.hover(("browse", card.presentation.asset_id.as_str()), rect);
     }
     if response.clicked() {
         water.click(rect);
@@ -1551,6 +1563,7 @@ pub struct Observation {
     pair_ready: bool,
     remote_pair: bool,
     remote_ready: usize,
+    remote_promoting: usize,
     pair_rotations: Option<[u8; 2]>,
     images_per_row: u16,
     viewer_open: bool,

@@ -10,7 +10,7 @@ use std::{
     env,
     io::Cursor,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const WAIT: Duration = Duration::from_secs(8);
@@ -31,6 +31,7 @@ struct Observation {
     pair_ready: bool,
     remote_pair: bool,
     remote_ready: usize,
+    remote_promoting: usize,
     pair_rotations: Option<[u8; 2]>,
     images_per_row: u16,
     viewer_open: bool,
@@ -292,22 +293,34 @@ recurse = true
         let _fresh = probe.wait_fresh(&app, WAIT)?;
     }
     capture(&session, artifacts, "picmash-remote.png")?;
-    let promotion_started = Instant::now();
     click(&session, &app, &mut probe, Target::Choice(Side::Right))?;
+    let _advanced = probe.wait(&app, WAIT, "background archive admission", |frame| {
+        !frame.state.busy && !frame.state.remote_pair && frame.state.remote_promoting == 1
+    })?;
+    drop(probe);
+    drop(session);
+    app.terminate()?;
+
+    let app = launch(testbed, binary, false)?;
+    let session = testbed.x11_session(
+        &app,
+        WindowQuery::title_exact(TITLE),
+        Duration::from_secs(20),
+    )?;
+    session.focus()?;
+    let mut probe: Probe<Observation> = app.witness()?.typed();
+    let _presented = probe.wait_surface_presented(&app, STARTUP)?;
     let promoted = probe.wait(&app, STARTUP, "promoted remote challenger", |frame| {
         !frame.state.busy
             && !frame.state.remote_pair
             && frame.state.visible_assets == 4
             && frame.state.duels == 3
+            && frame.state.remote_promoting == 0
     })?;
     ensure!(
         !promoted.state.status.starts_with("FAULT"),
         "promotion faulted: {}",
         promoted.state.status
-    );
-    ensure!(
-        promotion_started.elapsed() < WAIT,
-        "remote promotion exceeded the interactive latency envelope"
     );
     let imported = testbed.private_path("collection/.picmash-imported")?;
     ensure!(
@@ -371,7 +384,7 @@ fn seed(testbed: &Testbed) -> Result<()> {
         let _copy = testbed.write_private(format!("collection/{index}-copy.png"), &bytes)?;
     }
     let _remote = testbed.create_private_dir("remote")?;
-    let remote = fixture(19, (2_560, 1_920))?;
+    let remote = fixture(19, (940, 1_180))?;
     let _written = testbed.write_private("remote/challenger.png", remote)?;
     Ok(())
 }

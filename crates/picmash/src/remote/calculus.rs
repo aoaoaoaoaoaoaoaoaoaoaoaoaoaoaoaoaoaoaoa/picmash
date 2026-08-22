@@ -15,7 +15,10 @@ use std::{
 
 use anyhow::{Result, ensure};
 
-use super::{Discovery, Epoch, Harvest, Prepared, RemoteItemId, SourceIx, StreamId, Summary};
+use super::{
+    Discovery, Epoch, Harvest, Prepared, RemoteItemId, SourceIx, StreamId, Summary,
+    promotion::ARCHIVE_CAPACITY,
+};
 use crate::configuration::{RemoteConfig, SourceConfig};
 
 const CATALOG_CONCURRENCY: usize = 1;
@@ -270,6 +273,7 @@ pub struct Machine {
     fetching: HashMap<RemoteItemId, Discovery>,
     prepared: VecDeque<Prepared>,
     offered: Option<Prepared>,
+    promoting: HashMap<RemoteItemId, Prepared>,
     blocked_streams: HashSet<(String, StreamId)>,
 }
 
@@ -290,6 +294,7 @@ impl Machine {
             fetching: HashMap::new(),
             prepared: VecDeque::new(),
             offered: None,
+            promoting: HashMap::new(),
             blocked_streams: HashSet::new(),
         };
         machine.reconfigure(config, epoch, now)?;
@@ -445,6 +450,9 @@ impl Machine {
     }
 
     pub fn offer(&mut self) -> Result<Option<&Prepared>> {
+        if self.offered.is_none() && self.promoting.len() == ARCHIVE_CAPACITY {
+            return Ok(None);
+        }
         if self.offered.is_none() {
             let source = self.offer_fairness.choose(&self.sources, |source| {
                 self.prepared
@@ -472,6 +480,73 @@ impl Machine {
         let retired = self.offered.take();
         self.audit()?;
         Ok(retired)
+    }
+
+    pub fn begin_promotion(&mut self) -> Result<Prepared> {
+        ensure!(
+            self.promoting.len() < ARCHIVE_CAPACITY,
+            "remote archive queue is full"
+        );
+        let candidate = self
+            .offered
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("there is no remote offer to promote"))?;
+        ensure!(
+            !self.promoting.contains_key(&candidate.discovery.item_id),
+            "remote candidate is already being promoted"
+        );
+        let _prior = self
+            .promoting
+            .insert(candidate.discovery.item_id.clone(), candidate.clone());
+        self.audit()?;
+        Ok(candidate)
+    }
+
+    pub fn restore_promoting(
+        &mut self,
+        candidates: impl IntoIterator<Item = Prepared>,
+    ) -> Result<()> {
+        for candidate in candidates {
+            if self.promoting.contains_key(&candidate.discovery.item_id) {
+                continue;
+            }
+            ensure!(
+                self.promoting.len() < ARCHIVE_CAPACITY,
+                "persisted promotions exceed the remote archive bound"
+            );
+            let _prior = self
+                .promoting
+                .insert(candidate.discovery.item_id.clone(), candidate);
+        }
+        self.audit()
+    }
+
+    pub fn finish_promotion(&mut self, item: &RemoteItemId) -> Result<Prepared> {
+        let candidate = self
+            .promoting
+            .remove(item)
+            .ok_or_else(|| anyhow::anyhow!("remote promotion {item} is not pending"))?;
+        self.audit()?;
+        Ok(candidate)
+    }
+
+    pub fn promotion(&self, item: &RemoteItemId) -> Result<&Prepared> {
+        self.promoting
+            .get(item)
+            .ok_or_else(|| anyhow::anyhow!("remote promotion {item} is not pending"))
+    }
+
+    pub fn abort_promotion(&mut self, item: &RemoteItemId) -> Result<()> {
+        let candidate = self
+            .promoting
+            .remove(item)
+            .ok_or_else(|| anyhow::anyhow!("remote promotion {item} is not pending"))?;
+        ensure!(
+            self.offered.is_none(),
+            "remote offer was replaced before promotion submission failed"
+        );
+        self.offered = Some(candidate);
+        self.audit()
     }
 
     pub fn restore_discovered(
@@ -564,6 +639,7 @@ impl Machine {
             fetching: self.fetching.len(),
             prepared: self.prepared.len(),
             offered: self.offered.is_some(),
+            promoting: self.promoting.len(),
         }
     }
 
@@ -610,6 +686,7 @@ impl Machine {
                     .iter()
                     .map(|prepared| &prepared.discovery.item_id),
             )
+            .chain(self.promoting.keys())
             .cloned()
             .collect::<HashSet<_>>();
         self.discovered.extend(
@@ -650,6 +727,10 @@ impl Machine {
         ensure!(
             self.fetch_permits.occupied() <= FETCH_CONCURRENCY,
             "fetch permit overflow"
+        );
+        ensure!(
+            self.promoting.len() <= ARCHIVE_CAPACITY,
+            "remote archive queue overflow"
         );
         ensure!(self.sources.len() <= MAX_SOURCES, "remote source overflow");
         Ok(())
@@ -734,13 +815,14 @@ mod tests {
         // unlucky completion order; arbitrary interleavings are the durable oracle.
         #[test]
         fn every_interleaving_preserves_effect_and_reservoir_bounds(
-            actions in prop::collection::vec(0_u8..=8, 1..300),
+            actions in prop::collection::vec(0_u8..=10, 1..300),
             capacity in 1_u8..=8,
         ) {
             let result = (|| -> Result<()> {
                 let mut machine = Machine::new(&config(&[1, 2, 3], capacity)?, Epoch::INITIAL, Moment::ZERO)?;
                 let mut catalogs = VecDeque::new();
                 let mut fetches = VecDeque::new();
+                let mut promotions = VecDeque::new();
                 let mut serial = 0_u64;
                 for action in actions {
                     match action {
@@ -780,6 +862,12 @@ mod tests {
                         },
                         6 => { let _offered = machine.offer()?; },
                         7 => { let _retired = machine.retire_offer()?; },
+                        8 => if let Ok(candidate) = machine.begin_promotion() {
+                            promotions.push_back(candidate.discovery.item_id);
+                        },
+                        9 => if let Some(item) = promotions.pop_front() {
+                            let _candidate = machine.finish_promotion(&item)?;
+                        },
                         _ => {
                             let next = machine.epoch.successor();
                             let _retired = machine.reconfigure(&config(&[3, 1], capacity)?, next, Moment::ZERO)?;
@@ -793,6 +881,10 @@ mod tests {
                         machine.fetching.len() == fetches.len()
                             && machine.fetch_permits.occupied() == fetches.len(),
                         "physical fetch escaped the reservoir"
+                    );
+                    ensure!(
+                        machine.promoting.len() == promotions.len(),
+                        "archive effect escaped its bound"
                     );
                     machine.audit()?;
                 }

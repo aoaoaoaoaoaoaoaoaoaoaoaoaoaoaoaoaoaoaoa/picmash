@@ -21,7 +21,7 @@ pub use calculus::{CatalogIntent, FetchIntent, FetchSettlement, Machine, Moment}
 pub use sources::Harvester;
 pub use store::RemoteStore;
 
-pub use promotion::promote;
+pub use promotion::{ArchiveEffect, ArchiveLane, DuelVictor, PromotionIntent, PromotionJudgment};
 pub use reactor::Effect;
 pub use reactor::Reactor;
 
@@ -166,6 +166,7 @@ pub struct Summary {
     pub fetching: usize,
     pub prepared: usize,
     pub offered: bool,
+    pub promoting: usize,
 }
 
 fn slug(value: &str) -> String {

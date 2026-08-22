@@ -182,6 +182,113 @@ fn catalog_judgment_and_preference_form_one_durable_law() -> Result<()> {
 }
 
 #[test]
+fn remote_archive_reserves_order_and_exact_presentation() -> Result<()> {
+    let temporary = tempdir()?;
+    let corpus = temporary.path().join("corpus");
+    fs::create_dir(&corpus)?;
+    let _a = write_image(&corpus.join("a.png"), [210, 10, 20])?;
+    let _b = write_image(&corpus.join("b.png"), [20, 190, 30])?;
+    let _c = write_image(&corpus.join("c.png"), [30, 40, 180])?;
+
+    let database = temporary.path().join("picmash.db");
+    let engine = Engine::open(&database)?;
+    let collection = engine.scan(&corpus)?.collection_id;
+    let session = engine.start_session(collection, "remote-reservation-v1")?;
+    let view = engine
+        .assets(collection)?
+        .into_iter()
+        .next()
+        .context("anchor")?;
+    let anchor = crate::PresentedAsset {
+        asset_id: view.id,
+        occurrence_id: view.occurrence.id,
+        render: view.occurrence.render,
+        rotation_quarters: view.occurrence.rotation_quarters,
+    };
+    let remote_command = CommandId::parse("remote-duel")?;
+    let reserved = engine.reserve_promoted_comparison(
+        &session.id,
+        "remote-item-1",
+        &anchor,
+        0,
+        crate::DuelVictor::Challenger,
+        &remote_command,
+        125,
+    )?;
+    assert_eq!(
+        Connection::open(&database)?.query_row(
+            "SELECT COUNT(*) FROM pm_asset_duels WHERE observation_id = ?1",
+            [reserved.get()],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+
+    let local_prompt = engine.propose_comparison(&session.id)?;
+    let later = engine.record_comparison(
+        &local_prompt.id,
+        &local_prompt.left.asset_id,
+        &CommandId::parse("later-local-duel")?,
+        Some(80),
+    )?;
+    assert!(reserved < later);
+    let _rotation = engine.rotate_occurrence(anchor.occurrence_id, 1)?;
+    engine.end_session(&session.id)?;
+
+    let challenger_path = corpus.join("remote.png");
+    let _remote = write_image(&challenger_path, [220, 160, 20])?;
+    let challenger = engine.ingest_occurrence(collection, &challenger_path)?;
+    assert_eq!(
+        engine.record_promoted_comparison(
+            &session.id,
+            "remote-item-1",
+            &anchor,
+            &challenger,
+            0,
+            crate::DuelVictor::Challenger,
+            &remote_command,
+            125,
+        )?,
+        reserved
+    );
+    let (left_rotation, winner) = Connection::open(&database)?.query_row(
+        "SELECT d.left_rotation_quarters, d.winner_asset_id
+         FROM pm_asset_duels d WHERE d.observation_id = ?1",
+        [reserved.get()],
+        |row| Ok((row.get::<_, u8>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    assert_eq!(left_rotation, anchor.rotation_quarters);
+    assert_eq!(winner, challenger.as_str());
+
+    let favorite_session = engine.start_session(collection, "remote-favorite-v1")?;
+    let favorite_command = CommandId::parse("remote-favorite")?;
+    let favorite = engine.reserve_promoted_favorite(
+        &favorite_session.id,
+        "remote-item-2",
+        &favorite_command,
+    )?;
+    engine.end_session(&favorite_session.id)?;
+    assert_eq!(
+        engine.set_promoted_favorite(
+            &favorite_session.id,
+            "remote-item-2",
+            &challenger,
+            &favorite_command,
+        )?,
+        favorite
+    );
+    assert!(
+        engine
+            .assets(collection)?
+            .into_iter()
+            .find(|asset| asset.id == challenger)
+            .context("promoted favorite")?
+            .favorite
+    );
+    Ok(())
+}
+
+#[test]
 fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Result<()> {
     let temporary = tempdir()?;
     let corpus = temporary.path().join("legacy-corpus");

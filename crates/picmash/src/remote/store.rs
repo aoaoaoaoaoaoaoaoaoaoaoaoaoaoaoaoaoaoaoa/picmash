@@ -9,10 +9,45 @@ use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, Transaction, params};
 use walkdir::WalkDir;
 
-use super::{Discovery, FileStamp, Harvest, Origin, Prepared, RemoteItemId, SourceIx, StreamId};
-use crate::configuration::{RemoteConfig, SourceConfig};
+use super::{
+    Discovery, DuelVictor, FileStamp, Harvest, Origin, Prepared, PromotionIntent,
+    PromotionJudgment, RemoteItemId, SourceIx, StreamId,
+};
+use crate::configuration::{ImportPolicy, RemoteConfig, SourceConfig, SourceIdentity};
 
-const SCHEMA: i64 = 3;
+const SCHEMA: i64 = 4;
+const PROMOTION_SCHEMA: &str = "CREATE TABLE pr_promotions(
+         item_id TEXT PRIMARY KEY REFERENCES pr_items(item_id) ON DELETE CASCADE,
+         collection_root BLOB NOT NULL,
+         rotation_quarters INTEGER NOT NULL CHECK(rotation_quarters BETWEEN 0 AND 3),
+         judgment_kind TEXT NOT NULL CHECK(judgment_kind IN ('duel', 'favorite')),
+         session_id TEXT NOT NULL,
+         anchor_asset_id TEXT,
+         anchor_occurrence_id INTEGER,
+         anchor_render_digest TEXT,
+         anchor_rotation_quarters INTEGER CHECK(anchor_rotation_quarters BETWEEN 0 AND 3),
+         victor TEXT CHECK(victor IN ('anchor', 'challenger')),
+         command_id TEXT NOT NULL,
+         response_ms INTEGER CHECK(response_ms BETWEEN 0 AND 4294967295),
+         committed_at_ns INTEGER NOT NULL,
+         CHECK(
+             (judgment_kind = 'duel' AND anchor_asset_id IS NOT NULL
+                 AND anchor_occurrence_id IS NOT NULL AND anchor_render_digest IS NOT NULL
+                 AND anchor_rotation_quarters IS NOT NULL
+                 AND victor IS NOT NULL AND response_ms IS NOT NULL)
+             OR
+             (judgment_kind = 'favorite' AND anchor_asset_id IS NULL
+                 AND anchor_occurrence_id IS NULL AND anchor_render_digest IS NULL
+                 AND anchor_rotation_quarters IS NULL
+                 AND victor IS NULL AND response_ms IS NULL)
+         )
+     ) STRICT, WITHOUT ROWID;";
+
+pub struct Restoration {
+    pub harvests: Vec<Harvest>,
+    pub prepared: Vec<Prepared>,
+    pub promotions: Vec<PromotionIntent>,
+}
 
 pub struct RemoteStore {
     connection: Connection,
@@ -145,19 +180,26 @@ impl RemoteStore {
         Ok(())
     }
 
-    pub fn restore(&self, config: &RemoteConfig) -> Result<(Vec<Harvest>, Vec<Prepared>)> {
+    pub fn restore(&self, config: &RemoteConfig) -> Result<Restoration> {
         let sources = source_index(config);
         let mut discovered = HashMap::<SourceIx, Vec<Discovery>>::new();
         let mut prepared = Vec::new();
+        let mut promotions = Vec::new();
         let rows = {
             let mut statement = self.connection.prepare(
                 "SELECT i.item_id, i.source_id, i.stream_id, i.title, s.title,
                         i.origin_kind, i.origin, i.origin_seal, i.expected_md5, i.extension,
                         i.width, i.height, i.byte_len, i.max_pixels,
-                        i.state, i.cache_path, i.payload_digest
+                        i.state, i.cache_path, i.payload_digest,
+                        p.collection_root, p.rotation_quarters, p.judgment_kind,
+                        p.session_id, p.anchor_asset_id, p.anchor_occurrence_id,
+                        p.anchor_render_digest, p.anchor_rotation_quarters,
+                        p.victor, p.command_id, p.response_ms
                  FROM pr_items i
                  JOIN pr_streams s ON s.source_id = i.source_id AND s.stream_id = i.stream_id
-                 WHERE i.state IN ('discovered', 'prepared') AND s.vetoed = 0
+                 LEFT JOIN pr_promotions p ON p.item_id = i.item_id
+                 WHERE i.state IN ('discovered', 'prepared')
+                   AND (s.vetoed = 0 OR p.item_id IS NOT NULL)
                  ORDER BY i.updated_at_ns DESC",
             )?;
             statement
@@ -180,44 +222,79 @@ impl RemoteStore {
                         state: row.get(14)?,
                         cache_path: row.get(15)?,
                         payload_digest: row.get(16)?,
+                        promotion_root: row.get(17)?,
+                        promotion_rotation: row.get(18)?,
+                        promotion_kind: row.get(19)?,
+                        promotion_session: row.get(20)?,
+                        promotion_anchor: row.get(21)?,
+                        promotion_anchor_occurrence: row.get(22)?,
+                        promotion_anchor_render: row.get(23)?,
+                        promotion_anchor_rotation: row.get(24)?,
+                        promotion_victor: row.get(25)?,
+                        promotion_command: row.get(26)?,
+                        promotion_response_ms: row.get(27)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for row in rows {
-            let Some((source, config)) = sources.get(&row.source_id) else {
-                if let Some(path) = row.cache_path {
-                    remove_cache(&path_from_bytes(path))?;
-                }
-                self.connection.execute(
-                    "UPDATE pr_items SET state = 'retired', cache_path = NULL,
-                         payload_digest = NULL, error = 'source is disabled or absent'
-                     WHERE item_id = ?1",
-                    [row.item_id],
-                )?;
+            ensure!(
+                row.promotion_kind.is_none() || row.state == "prepared",
+                "persisted promotion is not prepared"
+            );
+            let configured = sources.get(&row.source_id);
+            let discovery = if let Some((source, source_config)) = configured {
+                row.discovery(
+                    *source,
+                    source_config.identity(),
+                    source_config.identity().to_string(),
+                    source_config.import_policy,
+                )?
+            } else if row.promotion_kind.is_some() {
+                row.discovery(
+                    SourceIx::new(config.sources.len()),
+                    SourceIdentity::new(row.source_id.clone()),
+                    row.source_id.clone(),
+                    ImportPolicy::NotX,
+                )?
+            } else {
+                retire_absent_source(&self.connection, &row)?;
                 continue;
             };
-            let discovery = row.discovery(*source, config)?;
             if row.state == "prepared"
-                && let (Some(path), Some(digest)) = (row.cache_path, row.payload_digest)
+                && let (Some(path), Some(digest)) =
+                    (row.cache_path.clone(), row.payload_digest.clone())
             {
                 let path = path_from_bytes(path);
                 if cache_is_sound(&path, &digest)? {
-                    prepared.push(Prepared {
+                    let candidate = Prepared {
                         discovery,
                         cache_path: path,
                         payload_digest: digest,
-                    });
+                    };
+                    if row.promotion_kind.is_some() {
+                        promotions.push(row.promotion(candidate)?);
+                    } else {
+                        prepared.push(candidate);
+                    }
                     continue;
                 }
+                self.connection.execute(
+                    "DELETE FROM pr_promotions WHERE item_id = ?1",
+                    [&row.item_id],
+                )?;
                 self.connection.execute(
                     "UPDATE pr_items SET state = 'discovered', cache_path = NULL,
                          payload_digest = NULL, error = 'prepared cache was lost or corrupt'
                      WHERE item_id = ?1",
-                    [row.item_id],
+                    [&row.item_id],
                 )?;
             }
-            discovered.entry(*source).or_default().push(discovery);
+            if let Some((source, _)) = configured {
+                discovered.entry(*source).or_default().push(discovery);
+            } else {
+                retire_absent_source(&self.connection, &row)?;
+            }
         }
         prune_retired(&self.connection)?;
         let harvests = discovered
@@ -228,7 +305,125 @@ impl RemoteStore {
                 discoveries,
             })
             .collect();
-        Ok((harvests, prepared))
+        Ok(Restoration {
+            harvests,
+            prepared,
+            promotions,
+        })
+    }
+
+    pub fn begin_promotion(&self, intent: &PromotionIntent) -> Result<()> {
+        ensure!(
+            intent.collection_root.is_absolute(),
+            "promotion root is not absolute"
+        );
+        ensure!(intent.rotation_quarters < 4, "invalid promotion rotation");
+        let (
+            kind,
+            session,
+            anchor_asset,
+            anchor_occurrence,
+            anchor_render,
+            anchor_rotation,
+            victor,
+            command,
+            response_ms,
+        ) = match &intent.judgment {
+            PromotionJudgment::Duel {
+                session_id,
+                anchor,
+                victor,
+                command_id,
+                response_ms,
+            } => (
+                "duel",
+                session_id,
+                Some(anchor.asset_id.as_str()),
+                Some(anchor.occurrence_id.get()),
+                Some(anchor.render.as_str()),
+                Some(anchor.rotation_quarters),
+                Some(match victor {
+                    DuelVictor::Anchor => "anchor",
+                    DuelVictor::Challenger => "challenger",
+                }),
+                command_id,
+                Some(i64::from(*response_ms)),
+            ),
+            PromotionJudgment::Favorite {
+                session_id,
+                command_id,
+            } => (
+                "favorite", session_id, None, None, None, None, None, command_id, None,
+            ),
+        };
+        let now = now_ns()?;
+        let tx = self.connection.unchecked_transaction()?;
+        let state = tx.query_row(
+            "SELECT state FROM pr_items WHERE item_id = ?1",
+            [intent.candidate.discovery.item_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )?;
+        ensure!(state == "prepared", "remote candidate is not prepared");
+        tx.execute(
+            "INSERT INTO pr_promotions(
+                 item_id, collection_root, rotation_quarters, judgment_kind, session_id,
+                 anchor_asset_id, anchor_occurrence_id, anchor_render_digest,
+                 anchor_rotation_quarters, victor, command_id, response_ms, committed_at_ns
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                intent.candidate.discovery.item_id.as_str(),
+                path_bytes(&intent.collection_root),
+                intent.rotation_quarters,
+                kind,
+                session.as_str(),
+                anchor_asset,
+                anchor_occurrence,
+                anchor_render,
+                anchor_rotation,
+                victor,
+                command.as_str(),
+                response_ms,
+                now,
+            ],
+        )?;
+        if let PromotionJudgment::Duel { victor, .. } = &intent.judgment {
+            insert_event(
+                &tx,
+                &intent.candidate.discovery.item_id,
+                if *victor == DuelVictor::Challenger {
+                    "remote_won"
+                } else {
+                    "local_won"
+                },
+                now,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn abort_promotion(&self, item: &RemoteItemId) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM pr_promotions WHERE item_id = ?1",
+            [item.as_str()],
+        )?;
+        ensure!(changed == 1, "remote promotion {item} is not durable");
+        tx.execute(
+            "DELETE FROM pr_events
+             WHERE item_id = ?1 AND kind IN ('remote_won', 'local_won')",
+            [item.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn promotion_failed(&self, item: &RemoteItemId, message: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE pr_items SET error = ?2, updated_at_ns = ?3 WHERE item_id = ?1",
+            params![item.as_str(), message, now_ns()?],
+        )?;
+        Ok(())
     }
 
     pub fn release(&self, candidate: &Prepared) -> Result<()> {
@@ -251,7 +446,10 @@ impl RemoteStore {
         {
             let mut statement = tx.prepare(
                 "SELECT cache_path FROM pr_items
-                 WHERE source_id = ?1 AND stream_id = ?2 AND cache_path IS NOT NULL",
+                 WHERE source_id = ?1 AND stream_id = ?2 AND cache_path IS NOT NULL
+                   AND NOT EXISTS(
+                       SELECT 1 FROM pr_promotions p WHERE p.item_id = pr_items.item_id
+                   )",
             )?;
             let rows = statement.query_map(
                 params![
@@ -276,7 +474,10 @@ impl RemoteStore {
         tx.execute(
             "UPDATE pr_items SET state = 'rejected', cache_path = NULL, payload_digest = NULL,
                  updated_at_ns = ?3
-             WHERE source_id = ?1 AND stream_id = ?2 AND state NOT IN ('promoted', 'rejected')",
+             WHERE source_id = ?1 AND stream_id = ?2 AND state NOT IN ('promoted', 'rejected')
+               AND NOT EXISTS(
+                   SELECT 1 FROM pr_promotions p WHERE p.item_id = pr_items.item_id
+               )",
             params![
                 candidate.discovery.source_identity.as_str(),
                 candidate.discovery.stream_id.as_str(),
@@ -315,13 +516,23 @@ impl RemoteStore {
         let now = now_ns()?;
         let tx = self.connection.unchecked_transaction()?;
         tx.execute(
+            "DELETE FROM pr_promotions WHERE item_id = ?1",
+            [candidate.discovery.item_id.as_str()],
+        )?;
+        tx.execute(
             "UPDATE pr_items SET state = ?2, cache_path = NULL, payload_digest = NULL,
                  updated_at_ns = ?3 WHERE item_id = ?1",
             params![candidate.discovery.item_id.as_str(), state, now],
         )?;
         insert_event(&tx, &candidate.discovery.item_id, event, now)?;
         tx.commit()?;
-        remove_cache(&candidate.cache_path)
+        if let Err(error) = remove_cache(&candidate.cache_path) {
+            eprintln!(
+                "Picmash left retired remote cache {} for startup cleanup: {error:#}",
+                candidate.cache_path.display()
+            );
+        }
+        Ok(())
     }
 
     fn recover_transients(&self) -> Result<()> {
@@ -364,6 +575,19 @@ fn source_index(config: &RemoteConfig) -> HashMap<String, (SourceIx, &SourceConf
             )
         })
         .collect()
+}
+
+fn retire_absent_source(connection: &Connection, row: &PersistedItem) -> Result<()> {
+    if let Some(path) = row.cache_path.clone() {
+        remove_cache(&path_from_bytes(path))?;
+    }
+    connection.execute(
+        "UPDATE pr_items SET state = 'retired', cache_path = NULL,
+             payload_digest = NULL, error = 'source is disabled or absent'
+         WHERE item_id = ?1",
+        [&row.item_id],
+    )?;
+    Ok(())
 }
 
 fn prune_retired(connection: &Connection) -> Result<()> {
@@ -459,10 +683,27 @@ struct PersistedItem {
     state: String,
     cache_path: Option<Vec<u8>>,
     payload_digest: Option<String>,
+    promotion_root: Option<Vec<u8>>,
+    promotion_rotation: Option<u8>,
+    promotion_kind: Option<String>,
+    promotion_session: Option<String>,
+    promotion_anchor: Option<String>,
+    promotion_anchor_occurrence: Option<i64>,
+    promotion_anchor_render: Option<String>,
+    promotion_anchor_rotation: Option<u8>,
+    promotion_victor: Option<String>,
+    promotion_command: Option<String>,
+    promotion_response_ms: Option<u32>,
 }
 
 impl PersistedItem {
-    fn discovery(&self, source: SourceIx, config: &SourceConfig) -> Result<Discovery> {
+    fn discovery(
+        &self,
+        source: SourceIx,
+        source_identity: SourceIdentity,
+        source_name: String,
+        import_policy: ImportPolicy,
+    ) -> Result<Discovery> {
         let origin = match self.origin_kind.as_str() {
             "network" => Origin::Network {
                 url: String::from_utf8(self.origin.clone())
@@ -481,9 +722,9 @@ impl PersistedItem {
         };
         Ok(Discovery {
             source,
-            source_identity: config.identity(),
-            source_name: config.identity().to_string(),
-            import_policy: config.import_policy,
+            source_identity,
+            source_name,
+            import_policy,
             stream_id: StreamId::new(self.stream_id.clone()),
             stream_title: self.stream_title.clone(),
             item_id: RemoteItemId::new(self.item_id.clone()),
@@ -494,6 +735,72 @@ impl PersistedItem {
             height: self.height,
             byte_len: self.byte_len,
             max_pixels: self.max_pixels,
+        })
+    }
+
+    fn promotion(&self, candidate: Prepared) -> Result<PromotionIntent> {
+        let kind = self
+            .promotion_kind
+            .as_deref()
+            .context("persisted promotion lacks a judgment kind")?;
+        let session = picmash_engine::SessionId::parse(
+            self.promotion_session
+                .clone()
+                .context("persisted promotion lacks a session")?,
+        )?;
+        let command = picmash_engine::CommandId::parse(
+            self.promotion_command
+                .clone()
+                .context("persisted promotion lacks a command")?,
+        )?;
+        let judgment = match kind {
+            "duel" => PromotionJudgment::Duel {
+                session_id: session,
+                anchor: picmash_engine::PresentedAsset::from_persisted(
+                    picmash_engine::AssetId::parse(
+                        self.promotion_anchor
+                            .clone()
+                            .context("persisted duel promotion lacks an anchor")?,
+                    )?,
+                    self.promotion_anchor_occurrence
+                        .context("persisted duel promotion lacks an anchor occurrence")?,
+                    self.promotion_anchor_render
+                        .clone()
+                        .context("persisted duel promotion lacks an anchor render")?,
+                    self.promotion_anchor_rotation
+                        .context("persisted duel promotion lacks an anchor rotation")?,
+                )?,
+                victor: match self
+                    .promotion_victor
+                    .as_deref()
+                    .context("persisted duel promotion lacks a victor")?
+                {
+                    "anchor" => DuelVictor::Anchor,
+                    "challenger" => DuelVictor::Challenger,
+                    invalid => anyhow::bail!("invalid persisted promotion victor `{invalid}`"),
+                },
+                command_id: command,
+                response_ms: self
+                    .promotion_response_ms
+                    .context("persisted duel promotion lacks response time")?,
+            },
+            "favorite" => PromotionJudgment::Favorite {
+                session_id: session,
+                command_id: command,
+            },
+            invalid => anyhow::bail!("invalid persisted promotion kind `{invalid}`"),
+        };
+        Ok(PromotionIntent {
+            candidate,
+            collection_root: path_from_bytes(
+                self.promotion_root
+                    .clone()
+                    .context("persisted promotion lacks a collection root")?,
+            ),
+            rotation_quarters: self
+                .promotion_rotation
+                .context("persisted promotion lacks a rotation")?,
+            judgment,
         })
     }
 }
@@ -612,6 +919,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                  recorded_at_ns INTEGER NOT NULL
              ) STRICT;",
         )?;
+        tx.execute_batch(PROMOTION_SCHEMA)?;
         tx.execute(
             "INSERT INTO pr_schema(version, applied_at_ns) VALUES (?1, ?2)",
             params![SCHEMA, now_ns()?],
@@ -638,6 +946,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )?;
         tx.execute(
             "INSERT INTO pr_schema(version, applied_at_ns) VALUES (3, ?1)",
+            [now_ns()?],
+        )?;
+    }
+    if (1..=3).contains(&current) {
+        tx.execute_batch(PROMOTION_SCHEMA)?;
+        tx.execute(
+            "INSERT INTO pr_schema(version, applied_at_ns) VALUES (4, ?1)",
             [now_ns()?],
         )?;
     }

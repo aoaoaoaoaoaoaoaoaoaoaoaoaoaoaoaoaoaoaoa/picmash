@@ -9,10 +9,12 @@ A **prepared candidate** is a validated payload in the XDG cache. An **offer**
 is the sole prepared candidate currently shown against a local asset. Fetching,
 prepared candidates, and the offer constitute the **reservoir**.
 
-A **promotion** is a new collection occurrence produced by decoding the offered
-payload, applying its presentation rotation, losslessly re-encoding the
-canonical raster as JPEG XL, verifying render identity, and atomically writing
-the result beneath `.picmash-imported/`.
+A **promotion commitment** is an accepted offer plus its exact judgment,
+including the anchor's occurrence, render, and rotation, persisted before the
+chamber advances. The bounded **archive queue** turns that commitment into a
+collection occurrence by decoding the payload, applying its presentation
+rotation, losslessly re-encoding the canonical raster as JPEG XL, verifying
+render identity, and atomically writing beneath `.picmash-imported/`.
 
 `not_x` promotes either winner of a remote comparison: choosing the local image
 still means the challenger was not rejected. `hearted` promotes only a remote
@@ -81,13 +83,18 @@ Each candidate occupies one persistent phase:
 Discovered -> Fetching -> Prepared -> Offered
      ^            |          |          |
      +------------+----------+          +-> Rejected
-                                      \----> Promoted
+                                      \----> Promoting -> Promoted
 ```
 
 `Fetching -> Discovered` is the recoverable failure transition. Process startup
 performs the same recovery for interrupted fetches and removes cache files not
-owned by a prepared row. Terminal candidates are never resurrected by a later
-catalog scan.
+owned by a prepared row. `Offered -> Promoting` first commits the judgment and
+archive target in SQLite and reserves the judgment's engine observation, then
+releases the comparison chamber. The reservation fixes global evidence order;
+archive completion fills it rather than recording a later observation. Graceful
+exit cancels the encoder but preserves both durable facts; startup reconciles
+and resubmits them. A stream veto cannot revoke an earlier promotion commitment.
+Terminal candidates are never resurrected by a later catalog scan.
 
 Catalog, fetch, and offer selection use weighted least-service scheduling. For
 source `i`, the scheduler minimizes `servicesᵢ / weightᵢ`, comparing ratios by
@@ -105,13 +112,20 @@ Let:
 - `S ≤ 32` be the positive-weight source count, with configuration requiring
   `S ≤ M`;
 - `B ≤ 512 MiB` be the largest configured payload limit;
-- `P ≤ 64,000,000` be the largest configured pixel limit.
+- `P ≤ 64,000,000` be the largest configured pixel limit;
+- `A = 8` be the fixed archive-queue capacity.
 
 Define `Q = |Fetching| + |Prepared| + |Offered|`. The only transition that adds
 to `Q` is `Discovered -> Fetching`, whose guard is `Q < R`. Fetch completion
 replaces one fetching member with at most one prepared member. Offering replaces
-one prepared member with the offer; retirement removes it. Therefore `Q ≤ R` is
-inductive.
+one prepared member with the offer; rejection removes it, while archival
+commitment transfers it out of `Q`. Therefore `Q ≤ R` is inductive.
+
+Let `J = |Promoting|`. Only `Offered -> Promoting` adds to `J`, guarded by
+`J < A`; completion removes one member. Thus `J ≤ A`. The archive mailbox and
+completion channel each have capacity `A`, and exactly one encoder process may
+run. The combined cache frontier is at most `R + A` payloads plus one atomic
+staging output.
 
 One unique fetch permit exists, so at most one media request and one validating
 decode run concurrently. One unique catalog permit exists. The permits survive
@@ -126,18 +140,19 @@ documents. Each JSON body is capped at 8 MiB. Local scans inspect at most
 100,000 directory entries and retain only a 64-element selection heap.
 Each successful catalog transaction retires and deletes superseded unjudged
 metadata for that source. Persistent frontier size is therefore bounded by 64
-items per configured source plus the reservoir. Rejected, promoted, and duel
-records grow only with user judgments.
+items per configured source plus the reservoir and archive queue. Rejected,
+promoted, and duel records grow only with user judgments.
 
 Payload length and encoded dimensions are checked before full decode. Thus one
-fetch retains at most `B` payload bytes and decodes at most `P` pixels. Cache
-ownership is bounded by the reservoir; atomic replacement may transiently add
-one staging payload. The result channel holds at most the two extant lane
-completions, and the UI event channel holds 64 events.
+fetch retains at most `B` payload bytes and decodes at most `P` pixels. The
+catalog/fetch result channel holds at most the two extant lane completions, and
+the UI event channel holds 64 events.
 
-Promotion invokes the lossless JPEG XL encoder at effort 5 and kills it after
-ten seconds. An overdue or failed encode leaves the offer intact and retryable;
-it cannot hold the engine worker indefinitely.
+Promotion invokes the lossless JPEG XL encoder at maximum effort 10 on its own
+lane. No archival deadline sacrifices compression density. The engine worker
+continues serving comparisons, browsing, persistence, and remote acquisition.
+Application retirement checks cancellation every 250 ms, kills the child, and
+leaves the durable commitment and reserved evidence order for restart.
 
 ## Liveness
 
@@ -160,3 +175,10 @@ The liveness claim excludes a user-held offer, a disabled or zero-weight source,
 an origin that changes after discovery, permanent external failure, and process
 termination. These are explicit environment or user choices, not scheduler
 starvation.
+
+Assume each encoder invocation is total. The archive lane is FIFO and contains
+at most `A` commitments. Every commitment therefore has finitely many finite
+predecessors and eventually reaches verified admission. Later judgments may be
+served while it runs but cannot overtake its reserved observation. Encoder or
+filesystem failure pauses that durable commitment for explicit restart rather
+than losing the user's judgment or blocking the chamber.
