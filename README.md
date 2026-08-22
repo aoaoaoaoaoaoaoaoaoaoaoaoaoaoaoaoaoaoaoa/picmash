@@ -60,8 +60,14 @@ evidence.
 
 `Engine::import_legacy` remains the explicit, read-only migration seam for a
 former web database. It imports exact local evidence and refuses old learned
-scores, embeddings, face state, and external-source contamination. The native
-application does not search the filesystem for legacy databases.
+scores, embeddings, face state, and interactions with assets outside the
+judged collection. The native application does not search the filesystem for
+legacy databases.
+
+Run a known migration explicitly with `picmash --import-legacy DATABASE`. A
+legacy image's provenance does not invalidate judgments after that image has
+become a member of the judged local collection; interactions with assets
+outside the session's collection remain excluded.
 
 ## Verification
 

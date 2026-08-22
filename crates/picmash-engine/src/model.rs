@@ -29,6 +29,7 @@ pub struct AssetOccurrence {
 pub struct AssetView {
     pub id: AssetId,
     pub occurrence: AssetOccurrence,
+    pub occurrence_count: u32,
     pub favorite: bool,
     pub duel_count: u32,
     pub preference_score: Option<f64>,
@@ -45,9 +46,27 @@ pub struct ScanReport {
     pub collection_id: CollectionId,
     pub generation: u64,
     pub discovered_paths: usize,
+    pub reused_paths: usize,
     pub visible_assets: usize,
     pub retired_occurrences: usize,
     pub failures: Vec<ScanFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub inspected_paths: usize,
+    pub total_paths: usize,
+    pub reused_paths: usize,
+}
+
+impl ScanProgress {
+    #[must_use]
+    pub fn percent(self) -> usize {
+        self.inspected_paths
+            .saturating_mul(100)
+            .checked_div(self.total_paths)
+            .unwrap_or(100)
+    }
 }
 
 #[derive(Debug, Clone)]

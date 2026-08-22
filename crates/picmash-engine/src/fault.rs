@@ -31,6 +31,9 @@ pub enum Fault {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("runtime failure: {0}")]
+    Runtime(String),
+
     #[error("durable state is corrupt: {0}")]
     Corrupt(String),
 
