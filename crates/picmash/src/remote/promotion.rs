@@ -5,6 +5,7 @@ use std::{
     io::{Cursor, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, ensure};
@@ -12,8 +13,12 @@ use atomic_write_file::AtomicWriteFile;
 use image::ImageFormat;
 use picmash_engine::{canonical_image, inspect_bytes};
 use tempfile::Builder;
+use wait_timeout::ChildExt as _;
 
 use super::{Prepared, slug, validate_payload_dimensions};
+
+const ENCODER_DEADLINE: Duration = Duration::from_secs(10);
+const ENCODER_EFFORT: &str = "5";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Promotion {
@@ -65,20 +70,42 @@ pub fn promote(
         .context("raise promotion forge")?;
     let input = forge.path().join("canonical.png");
     let output = forge.path().join("canonical.jxl");
+    let diagnostics = forge.path().join("cjxl.stderr");
     fs::write(&input, canonical_png.into_inner())
         .with_context(|| format!("write promotion input at {}", input.display()))?;
-    let result = Command::new("cjxl")
-        .args(["-d", "0", "-e", "10", "--quiet"])
+    let mut encoder = Command::new("cjxl")
+        .args(["-d", "0", "-e", ENCODER_EFFORT, "--quiet"])
         .arg(&input)
         .arg(&output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("execute total JPEG XL promotion encoder")?;
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(&diagnostics).context("create JPEG XL encoder diagnostics")?,
+        ))
+        .spawn()
+        .context("raise total JPEG XL promotion encoder")?;
+    let status = if let Some(status) = encoder
+        .wait_timeout(ENCODER_DEADLINE)
+        .context("await JPEG XL promotion encoder")?
+    {
+        status
+    } else {
+        encoder
+            .kill()
+            .context("kill overdue JPEG XL promotion encoder")?;
+        let _status = encoder
+            .wait()
+            .context("reap overdue JPEG XL promotion encoder")?;
+        anyhow::bail!(
+            "JPEG XL promotion exceeded its {} second deadline",
+            ENCODER_DEADLINE.as_secs()
+        );
+    };
     ensure!(
-        result.status.success(),
+        status.success(),
         "JPEG XL promotion encoder failed: {}",
-        String::from_utf8_lossy(&result.stderr).trim()
+        fs::read_to_string(&diagnostics)
+            .unwrap_or_else(|_| "diagnostics unavailable".to_owned())
+            .trim()
     );
     let encoded = fs::read(&output)
         .with_context(|| format!("read promoted JPEG XL at {}", output.display()))?;

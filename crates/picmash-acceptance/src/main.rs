@@ -10,7 +10,7 @@ use std::{
     env,
     io::Cursor,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WAIT: Duration = Duration::from_secs(8);
@@ -292,6 +292,7 @@ recurse = true
         let _fresh = probe.wait_fresh(&app, WAIT)?;
     }
     capture(&session, artifacts, "picmash-remote.png")?;
+    let promotion_started = Instant::now();
     click(&session, &app, &mut probe, Target::Choice(Side::Right))?;
     let promoted = probe.wait(&app, STARTUP, "promoted remote challenger", |frame| {
         !frame.state.busy
@@ -303,6 +304,10 @@ recurse = true
         !promoted.state.status.starts_with("FAULT"),
         "promotion faulted: {}",
         promoted.state.status
+    );
+    ensure!(
+        promotion_started.elapsed() < WAIT,
+        "remote promotion exceeded the interactive latency envelope"
     );
     let imported = testbed.private_path("collection/.picmash-imported")?;
     ensure!(
@@ -366,7 +371,7 @@ fn seed(testbed: &Testbed) -> Result<()> {
         let _copy = testbed.write_private(format!("collection/{index}-copy.png"), &bytes)?;
     }
     let _remote = testbed.create_private_dir("remote")?;
-    let remote = fixture(19, (940, 1_180))?;
+    let remote = fixture(19, (2_560, 1_920))?;
     let _written = testbed.write_private("remote/challenger.png", remote)?;
     Ok(())
 }

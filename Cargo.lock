@@ -2341,6 +2341,7 @@ dependencies = [
  "tempfile",
  "toml",
  "ureq",
+ "wait-timeout",
  "walkdir",
 ]
 
