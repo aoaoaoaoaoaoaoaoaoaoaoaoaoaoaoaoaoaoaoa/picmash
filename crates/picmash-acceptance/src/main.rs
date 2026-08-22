@@ -30,6 +30,9 @@ struct Observation {
     duels: u64,
     pair_ready: bool,
     pair_rotations: Option<[u8; 2]>,
+    images_per_row: u16,
+    viewer_open: bool,
+    viewer_ready: bool,
     guide_open: bool,
     settings_open: bool,
     text_edit_focused: bool,
@@ -178,6 +181,29 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
         let _fresh = probe.wait_fresh(&app, WAIT)?;
     }
     capture(&session, artifacts, "picmash-browse.png")?;
+    let _opened = session.click(x, y, Button::Primary)?;
+    let viewer = probe.wait(&app, STARTUP, "full-image viewer", |frame| {
+        frame.state.viewer_open && frame.state.viewer_ready
+    })?;
+    ensure!(
+        viewer.state.images_per_row == 5,
+        "browser did not preserve its configured density"
+    );
+    let _surface = probe.wait_anchor(&app, &Target::Viewer.to_string(), WAIT)?;
+    let _copy = probe.wait_anchor(&app, &Target::ViewerCopy.to_string(), WAIT)?;
+    let _close = probe.wait_anchor(&app, &Target::ViewerClose.to_string(), WAIT)?;
+    for _frame in 0..2 {
+        let _fresh = probe.wait_fresh(&app, WAIT)?;
+    }
+    capture(&session, artifacts, "picmash-viewer.png")?;
+    click(&session, &app, &mut probe, Target::ViewerCopy)?;
+    let _copied = probe.wait(&app, WAIT, "image copied", |frame| {
+        frame.state.status == "IMAGE COPIED"
+    })?;
+    click(&session, &app, &mut probe, Target::ViewerClose)?;
+    let _closed = probe.wait(&app, WAIT, "closed full-image viewer", |frame| {
+        !frame.state.viewer_open
+    })?;
     app.terminate()?;
     Ok(())
 }

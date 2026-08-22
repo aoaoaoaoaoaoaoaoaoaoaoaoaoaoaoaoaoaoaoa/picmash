@@ -4,6 +4,7 @@ mod app;
 mod commands;
 mod configuration;
 mod host;
+mod viewer;
 mod witness;
 mod worker;
 mod xdg;
