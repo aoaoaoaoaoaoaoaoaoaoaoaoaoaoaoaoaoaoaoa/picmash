@@ -1,26 +1,47 @@
 [workspace]
-members = ["crates/picmash-engine"]
+members = [
+  "crates/picmash",
+  "crates/picmash-acceptance",
+  "crates/picmash-contract",
+  "crates/picmash-engine",
+]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.94"
+rust-version = "1.96"
 version = "0.1.0"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+warnings = "deny"
+elided_lifetimes_in_paths = "deny"
+unexpected_cfgs = "deny"
+unsafe_code = "deny"
 unused_crate_dependencies = "warn"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -2 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -3 }
 
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+allow_attributes_without_reason = "deny"
+
 enum_glob_use = "allow"
 wildcard_imports = "allow"
 
-expect_used = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
@@ -66,12 +87,12 @@ format_command = ["cargo", "fmt", "--all", "--check"]
 clippy_command = [
   "cargo",
   "clippy",
+  "--locked",
   "--workspace",
   "--all-targets",
   "--all-features",
-  "--message-format=json",
 ]
-test_command = ["cargo", "test", "--workspace", "--all-targets", "--all-features"]
+test_command = ["cargo", "test", "--locked", "--workspace", "--all-targets", "--all-features"]
 
 [workspace.metadata.rust-starter.source_files]
 max_lines = 2500

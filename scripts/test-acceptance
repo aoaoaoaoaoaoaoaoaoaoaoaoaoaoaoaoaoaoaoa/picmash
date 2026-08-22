@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+
+cargo build --locked --release -p picmash --features egui-test -p picmash-acceptance
+target=$(cargo metadata --locked --no-deps --format-version 1 | jq -r .target_directory)
+PICMASH_ACCEPTANCE_BINARY="$target/release/picmash" \
+  "$target/release/picmash-acceptance" "${1:-$root/.artifacts/acceptance}"

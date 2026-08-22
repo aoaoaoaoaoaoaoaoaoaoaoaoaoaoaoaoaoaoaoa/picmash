@@ -170,20 +170,17 @@ mod tests {
     use super::inspect_bytes;
 
     #[test]
-    fn byte_variants_converge_on_exact_render_identity() {
+    fn byte_variants_converge_on_exact_render_identity() -> anyhow::Result<()> {
         let image = RgbImage::from_pixel(96, 64, Rgb([120, 90, 30]));
         let mut png = Vec::new();
-        image
-            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-            .expect("encode png");
+        image.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
         let mut bmp = Vec::new();
-        image
-            .write_to(&mut Cursor::new(&mut bmp), ImageFormat::Bmp)
-            .expect("encode lossless bmp");
+        image.write_to(&mut Cursor::new(&mut bmp), ImageFormat::Bmp)?;
 
-        let png = inspect_bytes(&png).expect("inspect png");
-        let bmp = inspect_bytes(&bmp).expect("inspect bmp");
+        let png = inspect_bytes(&png)?;
+        let bmp = inspect_bytes(&bmp)?;
         assert_ne!(png.blob, bmp.blob);
         assert_eq!(png.render, bmp.render);
+        Ok(())
     }
 }

@@ -1,0 +1,18 @@
+[package]
+name = "picmash-acceptance"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+egui-tester = "0.9.7"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+picmash = { path = "../picmash", features = ["egui-test"] }
+picmash-contract = { path = "../picmash-contract" }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[lints]
+workspace = true

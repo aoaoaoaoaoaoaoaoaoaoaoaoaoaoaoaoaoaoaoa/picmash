@@ -1,59 +1,65 @@
-# Picmash Engine
+# Picmash
 
-Picmash is now a headless Rust library for learning a person's preferences over
-a local image collection. This repository contains the engine to be grafted
-into The Poolrooms; it deliberately contains no server, browser client,
-installer, background service, or model downloader.
+Picmash is a native Poolrooms application for learning one person's preference
+over a local image collection. It presents balanced image pairs, records the
+chosen rendering and its exact presentation context, and projects those duels
+into an explicit Bradley-Terry ordering. The browser shows that learned order
+without calling it universal image quality.
 
-The engine owns four things:
+The product exposes only the evidence-bearing local workflow:
 
-- exact image and occurrence identity;
-- immutable, globally ordered observations with their presentation context;
-- reversible collection state such as favorites and visibility;
-- explicit Bradley-Terry preference snapshots with chronological holdout
-  metrics.
+- compare two images;
+- mark favorites;
+- hide images without deleting their files;
+- correct display rotation;
+- browse the visible collection in preference order.
 
-It does not own a universal image-quality score. Similarity triads remain raw
-observations until a representation and learner earn authority through an
-evaluation. Face detection, attractiveness, external discovery, and the old
-unified-quality models were rejected rather than carried into the graft.
+External discovery, faces, embeddings, and the former unified-quality models
+were rejected rather than transplanted from the web application.
 
-## Boundary
+## Run
 
-`picmash-engine` exposes one synchronous `Engine` handle. The host chooses
-the database location, scans a collection, opens a judgment session, requests a
-comparison, records a command, and rebuilds preferences explicitly:
-
-```rust
-use picmash_engine::{CommandId, Engine};
-
-let engine = Engine::open(state_database)?;
-let scan = engine.scan(image_directory)?;
-let session = engine.start_session(scan.collection_id, "poolrooms-comparison-v1")?;
-let prompt = engine.propose_comparison(&session.id)?;
-engine.record_comparison(
-    &prompt.id,
-    &prompt.left.asset_id,
-    &CommandId::fresh(),
-    None,
-)?;
-let snapshot = engine.rebuild_preferences(scan.collection_id)?;
+```console
+cargo run --release -- /path/to/images
 ```
 
-The future application must place mutable state under the platform state
-directory, not in its source checkout. On Linux that means an XDG state path
-such as `$XDG_STATE_HOME/the-poolrooms/picmash.db`. Corpus scans are read-only.
+The path is optional after the first run. Picmash restores the last successful
+collection, and **Open Collection** invokes the platform directory chooser.
+Press `A` or `D` to choose the left or right image, `1` or `2` to change
+chambers, `F1` for the generated command guide, and `F2` for settings.
 
-## Legacy Data
+The currently proved product coordinate is Linux/X11. Corpus access is
+read-only. Picmash places its database under the platform data directory, the
+active-collection pointer under state, and `picmash.toml` under configuration.
+No mutable product state belongs in the checkout.
 
-`Engine::import_legacy` reads a former web-app database in SQLite read-only
-mode. It imports exact local assets, occurrences, sessions, local pairwise
-comparisons, threshold judgments, reversible favorite events, and raw
-similarity triads. It refuses to promote learned scores, unversioned
-embeddings, face state, or comparisons contaminated by the old external-import
-path. Ambiguous observations are counted in the import report.
+## Architecture
+
+`picmash-engine` is the synchronous authority for exact asset and occurrence
+identity, collection state, immutable observations, and preference snapshots.
+The native `picmash` crate owns presentation and sends bounded commands to one
+engine worker; scanning, SQLite, image decoding, and preference fitting never
+run on the event-loop thread. `picmash-contract` contains the dependency-light
+UI vocabulary shared with the external `picmash-acceptance` executable.
+
+An asset is one exact, EXIF-oriented RGBA rendering. An occurrence is one path
+and byte blob in one collection. Judgments retain both identities, rotation,
+prompt policy, response time, session, and global observation order. Preference
+snapshots are derived projections and may be rebuilt; observations are the
+evidence.
+
+`Engine::import_legacy` remains the explicit, read-only migration seam for a
+former web database. It imports exact local evidence and refuses old learned
+scores, embeddings, face state, and external-source contamination. The native
+application does not search the filesystem for legacy databases.
 
 ## Verification
 
-Run `./check.py`. The canonical gate checks formatting, denies every Clippy
-warning, and runs the sparse engine-law suite.
+```console
+./check.py
+scripts/test-acceptance /tmp/picmash-acceptance
+```
+
+The canonical gate formats, lints, and tests the workspace. The hermetic native
+story seeds a real image corpus, then proves favorite, rotation, voting, hiding,
+browsing, and restart persistence without network access.
