@@ -1,9 +1,7 @@
 /target/
-/apps/web/node_modules/
-/apps/web/dist/
-
 /.claude/
 /.orchd/
+/.worktrees/
 /.ruff_cache/
 
 /images

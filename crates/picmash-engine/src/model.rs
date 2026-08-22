@@ -1,0 +1,129 @@
+use std::path::PathBuf;
+
+use crate::{
+    ids::{AssetId, CollectionId, ObservationId, OccurrenceId, PromptId, SessionId, SnapshotId},
+    media::{BlobDigest, RenderDigest},
+};
+
+#[derive(Debug, Clone)]
+pub struct Collection {
+    pub id: CollectionId,
+    pub root: PathBuf,
+    pub catalog_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetOccurrence {
+    pub id: OccurrenceId,
+    pub asset_id: AssetId,
+    pub path: PathBuf,
+    pub blob: BlobDigest,
+    pub render: RenderDigest,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u64,
+    pub rotation_quarters: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetView {
+    pub id: AssetId,
+    pub occurrence: AssetOccurrence,
+    pub favorite: bool,
+    pub duel_count: u32,
+    pub preference_score: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanFailure {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanReport {
+    pub collection_id: CollectionId,
+    pub generation: u64,
+    pub discovered_paths: usize,
+    pub visible_assets: usize,
+    pub retired_occurrences: usize,
+    pub failures: Vec<ScanFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyImportReport {
+    pub source_fingerprint: String,
+    pub imported_assets: usize,
+    pub imported_observations: usize,
+    pub ambiguous_observations: usize,
+    pub already_imported: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JudgmentSession {
+    pub id: SessionId,
+    pub collection_id: CollectionId,
+    pub context_revision: String,
+    pub started_at_ns: i64,
+    pub ended_at_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PresentedAsset {
+    pub asset_id: AssetId,
+    pub occurrence_id: OccurrenceId,
+    pub render: RenderDigest,
+    pub rotation_quarters: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComparisonPrompt {
+    pub id: PromptId,
+    pub session_id: SessionId,
+    pub left: PresentedAsset,
+    pub right: PresentedAsset,
+    pub policy_revision: String,
+    pub snapshot_id: Option<SnapshotId>,
+    pub issued_at_ns: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThresholdJudgment {
+    Admit,
+    Reject,
+}
+
+impl ThresholdJudgment {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreferenceScore {
+    pub asset_id: AssetId,
+    pub score: f64,
+    pub duel_count: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PreferenceEvaluation {
+    pub training_duels: usize,
+    pub held_out_duels: usize,
+    pub log_loss: f64,
+    pub accuracy: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreferenceSnapshot {
+    pub id: SnapshotId,
+    pub collection_id: CollectionId,
+    pub observation_frontier: ObservationId,
+    pub catalog_revision: u64,
+    pub model_revision: String,
+    pub evaluation: Option<PreferenceEvaluation>,
+    pub scores: Vec<PreferenceScore>,
+}

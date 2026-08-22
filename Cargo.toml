@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/picmash-app"]
+members = ["crates/picmash-engine"]
 resolver = "3"
 
 [workspace.package]
@@ -72,15 +72,6 @@ clippy_command = [
   "--message-format=json",
 ]
 test_command = ["cargo", "test", "--workspace", "--all-targets", "--all-features"]
-install_command = [
-  "cargo",
-  "install",
-  "--path",
-  "crates/picmash-app",
-  "--bin",
-  "picmash",
-  "--locked",
-]
 
 [workspace.metadata.rust-starter.source_files]
 max_lines = 2500
