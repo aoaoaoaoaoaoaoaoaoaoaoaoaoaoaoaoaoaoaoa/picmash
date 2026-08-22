@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::fault::{Fault, Result};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub fn configure(connection: &Connection) -> Result<()> {
     connection.busy_timeout(Duration::from_secs(15))?;
@@ -24,7 +24,7 @@ pub fn migrate(connection: &mut Connection, now_ns: i64) -> Result<()> {
              applied_at_ns INTEGER NOT NULL
          ) STRICT;",
     )?;
-    let current = tx.query_row(
+    let mut current = tx.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM pm_schema_migrations",
         [],
         |row| row.get::<_, i64>(0),
@@ -38,7 +38,15 @@ pub fn migrate(connection: &mut Connection, now_ns: i64) -> Result<()> {
         install_v1(&tx)?;
         tx.execute(
             "INSERT INTO pm_schema_migrations(version, applied_at_ns) VALUES (?1, ?2)",
-            params![SCHEMA_VERSION, now_ns],
+            params![1, now_ns],
+        )?;
+        current = 1;
+    }
+    if current < 2 {
+        install_v2(&tx)?;
+        tx.execute(
+            "INSERT INTO pm_schema_migrations(version, applied_at_ns) VALUES (?1, ?2)",
+            params![2, now_ns],
         )?;
     }
     let violation = tx
@@ -51,6 +59,11 @@ pub fn migrate(connection: &mut Connection, now_ns: i64) -> Result<()> {
         )));
     }
     tx.commit()?;
+    Ok(())
+}
+
+fn install_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch("ALTER TABLE pm_occurrences ADD COLUMN file_seal BLOB;")?;
     Ok(())
 }
 

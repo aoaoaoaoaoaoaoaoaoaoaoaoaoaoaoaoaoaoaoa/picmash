@@ -8,7 +8,7 @@ use exif::{In, Reader, Tag, Value};
 use image::{DynamicImage, GenericImageView, imageops};
 use jxl_oxide::integration::JxlDecoder;
 
-use crate::fault::{Fault, IoResultExt, Result};
+use crate::fault::{Fault, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlobDigest(String);
@@ -66,16 +66,15 @@ impl ImageIdentity {
     }
 }
 
-pub fn inspect_path(path: &Path) -> Result<ImageIdentity> {
-    let bytes = std::fs::read(path).at(path)?;
-    inspect_bytes(&bytes).map_err(|source| Fault::Image {
-        path: path.to_path_buf(),
-        source,
-    })
+pub fn inspect_bytes(bytes: &[u8]) -> anyhow::Result<ImageIdentity> {
+    inspect_bytes_with_blob(bytes, blob_digest(bytes))
 }
 
-pub fn inspect_bytes(bytes: &[u8]) -> anyhow::Result<ImageIdentity> {
-    let blob = BlobDigest(format!("blake3:{}", blake3::hash(bytes).to_hex()));
+pub fn blob_digest(bytes: &[u8]) -> BlobDigest {
+    BlobDigest(format!("blake3:{}", blake3::hash(bytes).to_hex()))
+}
+
+pub fn inspect_bytes_with_blob(bytes: &[u8], blob: BlobDigest) -> anyhow::Result<ImageIdentity> {
     let image = canonical_image(bytes)?;
     let (width, height) = image.dimensions();
     let rgba = image.to_rgba8();

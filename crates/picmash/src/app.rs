@@ -1,7 +1,7 @@
 use anyhow::Result;
 use brass_poolrooms::{
     chrome::{self, Checkbox, MechanismSize, Monoglyph, MonoglyphFinish, Symbol},
-    water::{Floor, Surface, Wetness},
+    water::{Domain, Floor, Surface, Wetness},
 };
 use crossbeam_channel::{Receiver, bounded};
 use egui::{ColorImage, TextureHandle, TextureOptions};
@@ -14,7 +14,7 @@ use eternalist_apps::{
     settings::{SettingSpec, SettingsFile, SettingsSheet},
 };
 use picmash_contract::{Side, Target};
-use picmash_engine::AssetId;
+use picmash_engine::{AssetId, ScanProgress};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -32,9 +32,11 @@ use crate::{
 
 const EVENT_DRAIN: usize = 24;
 const CONFIG_SETTLE: Duration = Duration::from_millis(400);
-const TILE_MIN: f32 = 170.0;
-const TILE_GAP: f32 = 10.0;
-const TILE_CHROME: f32 = 54.0;
+const BROWSE_COLUMNS: usize = 5;
+const MIN_TILE_EDGE: f32 = 72.0;
+const TILE_GAP: f32 = 12.0;
+const PLATE_PAD: f32 = 4.0;
+const TILE_RADIUS: u8 = 2;
 const WATER: SettingSpec = SettingSpec::new(
     "living_water",
     "LIVING WATER",
@@ -83,6 +85,7 @@ pub struct Picmash {
     chooser: Option<Receiver<Option<PathBuf>>>,
     mode: Mode,
     summary: Option<Summary>,
+    pending_collection: Option<PathBuf>,
     cards: Vec<Card>,
     browse_indices: Vec<usize>,
     favorites_only: bool,
@@ -90,6 +93,7 @@ pub struct Picmash {
     thumbnails: HashMap<AssetId, TextureHandle>,
     thumbnails_inflight: HashSet<AssetId>,
     busy: bool,
+    scan_progress: Option<ScanProgress>,
     status: String,
     panels: PanelNavigator,
     guide: CommandGuide,
@@ -119,6 +123,7 @@ impl Picmash {
             chooser: None,
             mode: Mode::Compare,
             summary: None,
+            pending_collection: None,
             cards: Vec::new(),
             browse_indices: Vec::new(),
             favorites_only: false,
@@ -126,6 +131,7 @@ impl Picmash {
             thumbnails: HashMap::new(),
             thumbnails_inflight: HashSet::new(),
             busy: true,
+            scan_progress: None,
             status: "WAKING ENGINE".to_owned(),
             panels: PanelNavigator::default(),
             guide: CommandGuide::default(),
@@ -211,26 +217,16 @@ impl Picmash {
         ui.add_space(6.0);
         let mut panels = navigator.frame(ui.ctx());
 
-        let mode = panels.section(ui, "chamber", "CHAMBER", true, |ui| {
-            let compare = plate(ui, "01  COMPARE", self.mode == Mode::Compare);
-            witness::response(ui, Target::CompareMode, &compare);
-            if compare.clicked() {
-                self.set_mode(Mode::Compare);
-            }
-            let browse = plate(ui, "02  BROWSE", self.mode == Mode::Browse);
-            witness::response(ui, Target::BrowseMode, &browse);
-            if browse.clicked() {
-                self.set_mode(Mode::Browse);
-            }
-        });
-        self.water.fold(mode.wake);
-
         let collection = panels.section(ui, "collection", "COLLECTION", true, |ui| {
-            if let Some(summary) = &self.summary {
-                let _root = ui.label(
-                    chrome::section_title(file_name(&summary.root).to_uppercase()).size(12.0),
-                );
-                let _path = ui.label(chrome::muted(summary.root.display().to_string()).size(11.0));
+            let root = self
+                .summary
+                .as_ref()
+                .map(|summary| &summary.root)
+                .or(self.pending_collection.as_ref());
+            if let Some(root) = root {
+                let _root =
+                    ui.label(chrome::section_title(file_name(root).to_uppercase()).size(12.0));
+                let _path = ui.label(chrome::muted(root.display().to_string()).size(11.0));
                 ui.add_space(5.0);
             } else {
                 let _none = ui.label(chrome::muted("NO COLLECTION CLAIMED"));
@@ -248,6 +244,20 @@ impl Picmash {
             }
         });
         self.water.fold(collection.wake);
+
+        let mode = panels.section(ui, "chamber", "CHAMBER", true, |ui| {
+            let compare = plate(ui, "01  COMPARE", self.mode == Mode::Compare);
+            witness::response(ui, Target::CompareMode, &compare);
+            if compare.clicked() {
+                self.set_mode(Mode::Compare);
+            }
+            let browse = plate(ui, "02  BROWSE", self.mode == Mode::Browse);
+            witness::response(ui, Target::BrowseMode, &browse);
+            if browse.clicked() {
+                self.set_mode(Mode::Browse);
+            }
+        });
+        self.water.fold(mode.wake);
 
         if self.mode == Mode::Browse {
             let view = panels.section(ui, "view", "VIEW", true, |ui| {
@@ -291,11 +301,18 @@ impl Picmash {
 
     fn chamber(&mut self, ui: &mut egui::Ui) {
         let arena = ui.available_rect_before_wrap();
+        self.water.begin(Domain::shelf(arena));
         self.water
             .set_floor(self.busy.then_some(Floor::shallow(arena)));
         match (self.busy, self.summary.is_some(), self.mode) {
             (true, _, _) => {
-                let _rect = self.living_wait.bouncer(ui, arena);
+                let _rect = match self.scan_progress {
+                    Some(progress) => {
+                        self.living_wait
+                            .bouncer_with(ui, arena, format!("{}%", progress.percent()))
+                    }
+                    None => self.living_wait.bouncer(ui, arena),
+                };
             }
             (false, false, _) => self.first_contact(ui),
             (false, true, Mode::Compare) => self.comparison(ui),
@@ -339,14 +356,7 @@ impl Picmash {
         };
         let left = (pair.pair.left.clone(), pair.left_texture.clone());
         let right = (pair.pair.right.clone(), pair.right_texture.clone());
-        let _heading = ui.horizontal(|ui| {
-            let _title = ui.label(chrome::eyebrow("PAIRWISE PREFERENCE"));
-            let _hint = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(chrome::muted("CLICK · A LEFT · D RIGHT"))
-            });
-        });
-        ui.add_space(8.0);
-        let height = (ui.available_height() - 4.0).max(220.0);
+        let height = ui.available_height().max(220.0);
         let mut actions = Vec::new();
         ui.columns(2, |columns| {
             if let Some(action) = comparison_card(
@@ -376,28 +386,17 @@ impl Picmash {
     }
 
     fn browser(&mut self, ui: &mut egui::Ui) {
-        let _heading = ui.horizontal(|ui| {
-            let _title = ui.label(chrome::eyebrow("COLLECTION BROWSER"));
-            let _count = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(chrome::muted(format!(
-                    "{} SHOWN",
-                    self.browse_indices.len()
-                )))
-            });
-        });
-        ui.add_space(8.0);
-        let width = ui.available_width();
-        let columns = ((width + TILE_GAP) / (TILE_MIN + TILE_GAP))
-            .floor()
-            .max(1.0) as usize;
-        let edge =
-            ((width - TILE_GAP * columns.saturating_sub(1) as f32) / columns as f32).max(96.0);
+        let width = ui.available_width().max(MIN_TILE_EDGE);
+        let maximum_columns = (((width + TILE_GAP) / (MIN_TILE_EDGE + TILE_GAP)) as usize).max(1);
+        let columns = BROWSE_COLUMNS.min(maximum_columns);
+        let edge = tile_edge(width, columns);
         let rows = self.browse_indices.len().div_ceil(columns);
         let mut demands = Vec::new();
         let mut retained = HashSet::new();
         let body = egui::ScrollArea::vertical()
             .id_salt("picmash-browser")
-            .show_rows(ui, edge + TILE_CHROME + TILE_GAP, rows, |ui, range| {
+            .show_rows(ui, edge + TILE_GAP, rows, |ui, range| {
+                ui.spacing_mut().item_spacing.x = TILE_GAP;
                 for row in range {
                     let _row = ui.horizontal(|ui| {
                         for column in 0..columns {
@@ -409,7 +408,7 @@ impl Picmash {
                             let card = &self.cards[card_index];
                             let _retained = retained.insert(card.asset_id.clone());
                             let texture = self.thumbnails.get(&card.asset_id);
-                            browse_tile(ui, card, texture, edge);
+                            browse_tile(ui, &mut self.water, card, texture, edge, slot == 0);
                             if texture.is_none()
                                 && !self.thumbnails_inflight.contains(&card.asset_id)
                             {
@@ -417,9 +416,9 @@ impl Picmash {
                             }
                         }
                     });
-                    ui.add_space(TILE_GAP);
                 }
             });
+        self.water.heave(ui.ctx(), body.state.offset.y);
         witness::rect(ui.ctx(), Target::Browser, body.inner_rect);
         self.thumbnails
             .retain(|asset_id, _texture| retained.contains(asset_id));
@@ -553,13 +552,36 @@ impl Picmash {
         match event {
             Event::NeedCollection => {
                 self.busy = false;
+                self.pending_collection = None;
+                self.scan_progress = None;
                 "NO COLLECTION CLAIMED".clone_into(&mut self.status);
             }
             Event::Busy(status) => {
                 self.busy = true;
+                self.scan_progress = None;
                 self.status = status.to_owned();
             }
+            Event::ScanStarted(root) => {
+                self.busy = true;
+                self.pending_collection = Some(root);
+                self.scan_progress = None;
+                "SCANNING COLLECTION".clone_into(&mut self.status);
+            }
+            Event::ScanProgress(progress) => {
+                if self
+                    .scan_progress
+                    .is_none_or(|prior| progress.inspected_paths >= prior.inspected_paths)
+                {
+                    self.status = format!(
+                        "SCANNING {}/{} · {} CACHED",
+                        progress.inspected_paths, progress.total_paths, progress.reused_paths
+                    );
+                    self.scan_progress = Some(progress);
+                }
+            }
             Event::Catalog { summary, cards } => {
+                self.pending_collection = None;
+                self.scan_progress = None;
                 self.summary = Some(summary);
                 self.cards = cards;
                 self.pair = None;
@@ -576,11 +598,13 @@ impl Picmash {
                     right_texture,
                 });
                 self.busy = false;
+                self.scan_progress = None;
                 "CHOOSE THE STRONGER IMAGE".clone_into(&mut self.status);
             }
             Event::NoComparison => {
                 self.pair = None;
                 self.busy = false;
+                self.scan_progress = None;
                 "TWO VISIBLE IMAGES ARE REQUIRED".clone_into(&mut self.status);
             }
             Event::Favorite { asset_id, active } => {
@@ -611,6 +635,8 @@ impl Picmash {
             }
             Event::Fault(message) => {
                 self.busy = false;
+                self.pending_collection = None;
+                self.scan_progress = None;
                 self.status = format!("FAULT · {message}");
             }
         }
@@ -730,140 +756,280 @@ fn comparison_card(
     height: f32,
 ) -> Option<Action> {
     let mut action = None;
-    let _card = egui::Frame::new()
-        .fill(chrome::SURFACE)
-        .stroke(egui::Stroke::new(1.0_f32, chrome::EDGE_STRONG))
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.set_min_height(height - 16.0);
-            let _title = ui.horizontal(|ui| {
-                let label = match side {
-                    Side::Left => "A  LEFT",
-                    Side::Right => "D  RIGHT",
-                };
-                let _label = ui.label(chrome::section_title(label));
-                let _meta =
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(chrome::muted(format!(
-                            "{}×{} · {} DUELS",
-                            card.width, card.height, card.duel_count
-                        )))
-                    });
-            });
-            ui.add_space(6.0);
-            let image_height = (height - 104.0).max(140.0);
-            let arena = egui::vec2(ui.available_width(), image_height);
-            let (rect, response) = ui.allocate_exact_size(arena, egui::Sense::click());
-            let image_rect = contain(rect, texture.size_vec2());
-            ui.painter().rect_filled(rect, 1.0, chrome::CONTROL);
-            ui.painter().image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            chrome::tension(ui, &response);
-            let response = response.on_hover_text("Choose this image");
-            witness::response(ui, Target::Choice(side), &response);
-            if response.clicked() {
-                water.select(image_rect);
-                action = Some(Action::Choose(side));
-            } else if response.hovered() {
-                water.hover(("comparison", side.wire()), image_rect);
-            }
-            ui.add_space(6.0);
-            let _bar = ui.horizontal(|ui| {
-                let favorite = Monoglyph::symbol(Symbol::Heart)
-                    .finish(if card.favorite {
-                        MonoglyphFinish::Love
-                    } else {
-                        MonoglyphFinish::BrightCut
-                    })
-                    .size(MechanismSize::Medium)
-                    .show(ui)
-                    .on_hover_text(if card.favorite {
-                        "Withdraw favorite"
-                    } else {
-                        "Mark favorite"
-                    });
-                water.monoglyph(&favorite);
-                witness::response(ui, Target::Favorite(side), &favorite);
-                if favorite.clicked() {
-                    action = Some(Action::Favorite(side));
-                }
-                let rotate = Monoglyph::new('↻')
-                    .size(MechanismSize::Medium)
-                    .show(ui)
-                    .on_hover_text("Rotate clockwise");
-                water.monoglyph(&rotate);
-                witness::response(ui, Target::Rotate(side), &rotate);
-                if rotate.clicked() {
-                    action = Some(Action::Rotate(side));
-                }
-                let hide = Monoglyph::symbol(Symbol::Visibility)
-                    .finish(MonoglyphFinish::BrightCut)
-                    .size(MechanismSize::Medium)
-                    .show(ui)
-                    .on_hover_text("Hide from this collection");
-                water.monoglyph(&hide);
-                witness::response(ui, Target::Hide(side), &hide);
-                if hide.clicked() {
-                    action = Some(Action::Hide(side));
-                }
-                let _path = ui
-                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(chrome::muted(file_name(&card.path)))
-                    });
-            });
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.image(
+        texture.id(),
+        rect,
+        cover_uv(rect.size(), texture.size_vec2()),
+        egui::Color32::WHITE,
+    );
+
+    let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 34.0));
+    painter.rect_filled(top, 0.0, egui::Color32::from_black_alpha(156));
+    let label = match side {
+        Side::Left => "A  LEFT",
+        Side::Right => "D  RIGHT",
+    };
+    painter.text(
+        top.left_center() + egui::vec2(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        chrome::HOT,
+    );
+    painter.text(
+        top.right_center() - egui::vec2(10.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("{}×{} · {} DUELS", card.width, card.height, card.duel_count),
+        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        chrome::MUTED,
+    );
+
+    let controls_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 48.0), rect.max);
+    painter.rect_filled(controls_rect, 0.0, egui::Color32::from_black_alpha(156));
+    let mut controls = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("comparison-controls", side.wire()))
+            .max_rect(controls_rect.shrink2(egui::vec2(8.0, 6.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    controls.set_clip_rect(controls.clip_rect().intersect(controls_rect));
+    let favorite = Monoglyph::symbol(Symbol::Heart)
+        .finish(if card.favorite {
+            MonoglyphFinish::Love
+        } else {
+            MonoglyphFinish::BrightCut
+        })
+        .size(MechanismSize::Medium)
+        .show(&mut controls)
+        .on_hover_text(if card.favorite {
+            "Withdraw favorite"
+        } else {
+            "Mark favorite"
         });
+    water.monoglyph(&favorite);
+    witness::response(&controls, Target::Favorite(side), &favorite);
+    if favorite.clicked() {
+        action = Some(Action::Favorite(side));
+    }
+    let rotate = Monoglyph::new('↻')
+        .size(MechanismSize::Medium)
+        .show(&mut controls)
+        .on_hover_text("Rotate clockwise");
+    water.monoglyph(&rotate);
+    witness::response(&controls, Target::Rotate(side), &rotate);
+    if rotate.clicked() {
+        action = Some(Action::Rotate(side));
+    }
+    let hide = Monoglyph::symbol(Symbol::Visibility)
+        .finish(MonoglyphFinish::BrightCut)
+        .size(MechanismSize::Medium)
+        .show(&mut controls)
+        .on_hover_text("Hide from this collection");
+    water.monoglyph(&hide);
+    witness::response(&controls, Target::Hide(side), &hide);
+    if hide.clicked() {
+        action = Some(Action::Hide(side));
+    }
+
+    chrome::tension(ui, &response);
+    let response = response.on_hover_text(file_name(&card.path));
+    witness::response(ui, Target::Choice(side), &response);
+    if action.is_none() && response.clicked() {
+        water.select(rect);
+        action = Some(Action::Choose(side));
+    }
+    if ui.rect_contains_pointer(rect) {
+        water.hover(("comparison", side.wire()), rect);
+    }
     action
 }
 
-fn browse_tile(ui: &mut egui::Ui, card: &Card, texture: Option<&TextureHandle>, edge: f32) {
-    let _slot = ui.allocate_ui_with_layout(
-        egui::vec2(edge, edge + TILE_CHROME),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            let _card = egui::Frame::new()
-                .fill(chrome::SURFACE)
-                .stroke(egui::Stroke::new(1.0_f32, chrome::EDGE))
-                .inner_margin(egui::Margin::same(5))
-                .show(ui, |ui| {
-                    ui.set_width(edge - 10.0);
-                    let (rect, _response) = ui.allocate_exact_size(
-                        egui::vec2(edge - 10.0, edge - 10.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect_filled(rect, 1.0, chrome::CONTROL);
-                    if let Some(texture) = texture {
-                        ui.painter().image(
-                            texture.id(),
-                            contain(rect, texture.size_vec2()),
-                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    } else {
-                        let _waiting = ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "DEVELOPING",
-                            egui::FontId::proportional(12.0),
-                            chrome::MUTED,
-                        );
-                    }
-                    let favorite = if card.favorite { "♥  " } else { "" };
-                    let score = card.preference_score.map_or_else(
-                        || "UNRANKED".to_owned(),
-                        |score| format!("PREF {score:+.2}"),
-                    );
-                    let _meta = ui.label(chrome::muted(format!(
-                        "{favorite}{score} · {} DUELS",
-                        card.duel_count
-                    )));
-                    let _name = ui.label(chrome::muted(file_name(&card.path)).size(11.0));
-                });
-        },
+fn browse_tile(
+    ui: &mut egui::Ui,
+    water: &mut Surface,
+    card: &Card,
+    texture: Option<&TextureHandle>,
+    edge: f32,
+    witnessed: bool,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(edge), egui::Sense::hover());
+    if witnessed {
+        witness::response(ui, Target::BrowseTile, &response);
+    }
+    let plate = Plate::new(rect);
+    plate.paint(ui, response.hovered());
+    if let Some(texture) = texture {
+        plate.paint_image(ui, texture);
+    } else {
+        let _waiting = ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "DEVELOPING",
+            egui::FontId::proportional(12.0),
+            chrome::MUTED,
+        );
+    }
+    if card.favorite {
+        paint_tile_badge(ui, rect, "♥".to_owned(), chrome::HOT, BadgeCorner::Left);
+    }
+    if card.occurrence_count > 1 {
+        paint_tile_badge(
+            ui,
+            rect,
+            format!("◇ {}", card.occurrence_count),
+            chrome::TEXT,
+            BadgeCorner::Right,
+        );
+    }
+    if response.hovered() {
+        paint_browse_metadata(ui, rect, card);
+        water.hover(("browse", card.asset_id.as_str()), rect);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Plate {
+    rect: egui::Rect,
+    well: egui::Rect,
+}
+
+impl Plate {
+    fn new(rect: egui::Rect) -> Self {
+        Self {
+            rect,
+            well: rect.shrink(PLATE_PAD),
+        }
+    }
+
+    fn paint(self, ui: &egui::Ui, hovered: bool) {
+        let radius = egui::CornerRadius::same(TILE_RADIUS);
+        ui.painter().rect_filled(self.rect, radius, chrome::SURFACE);
+        let edge = if hovered {
+            chrome::EDGE_STRONG
+        } else {
+            chrome::EDGE.gamma_multiply(0.55)
+        };
+        ui.painter().rect_stroke(
+            self.rect,
+            radius,
+            egui::Stroke::new(1.0, edge),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    fn paint_image(self, ui: &egui::Ui, texture: &TextureHandle) {
+        ui.painter().image(
+            texture.id(),
+            contain(self.well, texture.size_vec2()),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BadgeCorner {
+    Left,
+    Right,
+}
+
+fn paint_tile_badge(
+    ui: &egui::Ui,
+    tile: egui::Rect,
+    text: String,
+    color: egui::Color32,
+    corner: BadgeCorner,
+) {
+    let font = egui::FontId::new(13.0, egui::FontFamily::Monospace);
+    let galley = ui.painter().layout_no_wrap(text, font, color);
+    let size = galley.size() + egui::vec2(12.0, 6.0);
+    let (minimum, radius) = match corner {
+        BadgeCorner::Left => (
+            tile.left_top(),
+            egui::CornerRadius {
+                nw: TILE_RADIUS,
+                ne: 0,
+                sw: 0,
+                se: 0,
+            },
+        ),
+        BadgeCorner::Right => (
+            egui::pos2(tile.right() - size.x, tile.top()),
+            egui::CornerRadius {
+                nw: 0,
+                ne: TILE_RADIUS,
+                sw: 0,
+                se: 0,
+            },
+        ),
+    };
+    let rect = egui::Rect::from_min_size(minimum, size);
+    ui.painter().rect_filled(rect, radius, chrome::RAISED);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, chrome::EDGE_STRONG),
+        egui::StrokeKind::Inside,
     );
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, color);
+}
+
+fn paint_browse_metadata(ui: &egui::Ui, tile: egui::Rect, card: &Card) {
+    let rect = egui::Rect::from_min_max(egui::pos2(tile.min.x, tile.max.y - 48.0), tile.max);
+    let painter = ui.painter_at(tile);
+    painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(184));
+    let score = card.preference_score.map_or_else(
+        || "UNRANKED".to_owned(),
+        |score| format!("PREF {score:+.2}"),
+    );
+    let copies = if card.occurrence_count > 1 {
+        format!(" · {} FILES", card.occurrence_count)
+    } else {
+        String::new()
+    };
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 7.0),
+        egui::Align2::LEFT_TOP,
+        format!("{score} · {} DUELS{copies}", card.duel_count),
+        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+        chrome::TEXT,
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(8.0, -7.0),
+        egui::Align2::LEFT_BOTTOM,
+        file_name(&card.path),
+        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+        chrome::MUTED,
+    );
+}
+
+fn tile_edge(width: f32, columns: usize) -> f32 {
+    let columns = columns.max(1);
+    let gaps = TILE_GAP * columns.saturating_sub(1) as f32;
+    ((width - gaps) / columns as f32).max(MIN_TILE_EDGE)
+}
+
+fn cover_uv(arena: egui::Vec2, image: egui::Vec2) -> egui::Rect {
+    let arena = arena.max(egui::Vec2::splat(1.0));
+    let image = image.max(egui::Vec2::splat(1.0));
+    let arena_aspect = arena.x / arena.y;
+    let image_aspect = image.x / image.y;
+    if image_aspect > arena_aspect {
+        let visible = arena_aspect / image_aspect;
+        let inset = (1.0 - visible) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(inset, 0.0), egui::pos2(1.0 - inset, 1.0))
+    } else {
+        let visible = image_aspect / arena_aspect;
+        let inset = (1.0 - visible) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(0.0, inset), egui::pos2(1.0, 1.0 - inset))
+    }
 }
 
 fn contain(arena: egui::Rect, image: egui::Vec2) -> egui::Rect {

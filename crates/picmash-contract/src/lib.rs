@@ -46,6 +46,8 @@ pub enum Target {
     Rotate(Side),
     /// Collection browser surface.
     Browser,
+    /// One visible browser tile.
+    BrowseTile,
 }
 
 impl Target {
@@ -62,6 +64,7 @@ impl Target {
             Self::Hide(side) => Cow::Owned(format!("comparison.hide/{}", side.wire())),
             Self::Rotate(side) => Cow::Owned(format!("comparison.rotate/{}", side.wire())),
             Self::Browser => Cow::Borrowed("collection.browser"),
+            Self::BrowseTile => Cow::Borrowed("collection.browser/tile"),
         }
     }
 }

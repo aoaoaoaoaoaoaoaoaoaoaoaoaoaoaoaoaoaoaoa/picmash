@@ -1,9 +1,17 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    fs,
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt as _,
+    },
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use anyhow::anyhow;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use rusqlite::{OptionalExtension, Transaction, params};
 use walkdir::WalkDir;
 
@@ -12,29 +20,98 @@ use crate::{
     engine::now_ns,
     fault::{Fault, IoResultExt, Result},
     ids::{AssetId, CollectionId, OccurrenceId},
-    media::{BlobDigest, ImageIdentity, RenderDigest, inspect_path, supported_path},
-    model::{AssetOccurrence, AssetView, Collection, ScanFailure, ScanReport},
+    media::{
+        BlobDigest, ImageIdentity, RenderDigest, blob_digest, inspect_bytes_with_blob,
+        supported_path,
+    },
+    model::{AssetOccurrence, AssetView, Collection, ScanFailure, ScanProgress, ScanReport},
 };
+
+const SCAN_THREADS: usize = 2;
+const PROGRESS_STEPS: usize = 100;
 
 #[derive(Debug)]
 struct Candidate {
     path: PathBuf,
     identity: ImageIdentity,
+    seal: FileSeal,
+}
+
+#[derive(Clone, Debug)]
+struct CachedIdentity {
+    seal: Option<FileSeal>,
+    identity: ImageIdentity,
+}
+
+#[derive(Debug, Default)]
+struct ScanCache {
+    by_path: HashMap<PathBuf, CachedIdentity>,
+    by_blob: HashMap<BlobDigest, ImageIdentity>,
+}
+
+#[derive(Debug)]
+enum Inspection {
+    Candidate { candidate: Candidate, reused: bool },
+    Failure(ScanFailure),
+    Halted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileSeal([u8; 56]);
+
+impl FileSeal {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path).at(path)?;
+        let components = [
+            metadata.dev().to_le_bytes(),
+            metadata.ino().to_le_bytes(),
+            metadata.len().to_le_bytes(),
+            metadata.mtime().to_le_bytes(),
+            metadata.mtime_nsec().to_le_bytes(),
+            metadata.ctime().to_le_bytes(),
+            metadata.ctime_nsec().to_le_bytes(),
+        ];
+        let mut bytes = [0; 56];
+        for (index, component) in components.into_iter().enumerate() {
+            bytes[index * 8..][..8].copy_from_slice(&component);
+        }
+        Ok(Self(bytes))
+    }
+
+    fn parse(bytes: Vec<u8>) -> Result<Self> {
+        bytes.try_into().map(Self).map_err(|bytes: Vec<u8>| {
+            Fault::Corrupt(format!("invalid file seal length {}", bytes.len()))
+        })
+    }
+
+    const fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl Engine {
     pub fn scan(&self, root: impl AsRef<Path>) -> Result<ScanReport> {
-        self.scan_with_halt(root, || false)?
+        self.scan_with_control(root, || false, |_| {})?
             .ok_or_else(|| Fault::Corrupt("an unconditional collection scan halted".to_owned()))
     }
 
     pub fn scan_with_halt(
         &self,
         root: impl AsRef<Path>,
-        mut halt: impl FnMut() -> bool,
+        halt: impl Fn() -> bool + Sync,
+    ) -> Result<Option<ScanReport>> {
+        self.scan_with_control(root, halt, |_| {})
+    }
+
+    pub fn scan_with_control(
+        &self,
+        root: impl AsRef<Path>,
+        halt: impl Fn() -> bool + Sync,
+        progress: impl Fn(ScanProgress) + Sync,
     ) -> Result<Option<ScanReport>> {
         let root = root.as_ref().canonicalize().at(root.as_ref())?;
-        let mut candidates = Vec::new();
+        let cache = self.scan_cache(&root)?;
+        let mut paths = Vec::new();
         let mut failures = Vec::new();
         let mut complete = true;
 
@@ -56,15 +133,70 @@ impl Engine {
             if !entry.file_type().is_file() || !supported_path(entry.path()) {
                 continue;
             }
-            match inspect_path(entry.path()) {
-                Ok(identity) => candidates.push(Candidate {
-                    path: entry.path().to_path_buf(),
-                    identity,
-                }),
-                Err(error) => failures.push(ScanFailure {
-                    path: entry.path().to_path_buf(),
-                    error: error.to_string(),
-                }),
+            paths.push(entry.path().to_path_buf());
+        }
+
+        let total = paths.len();
+        progress(ScanProgress {
+            inspected_paths: 0,
+            total_paths: total,
+            reused_paths: 0,
+        });
+        let completed = AtomicUsize::new(0);
+        let reused = AtomicUsize::new(0);
+        let stride = (total / PROGRESS_STEPS).max(1);
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(SCAN_THREADS)
+            .thread_name(|index| format!("picmash-scan-{index}"))
+            .build()
+            .map_err(|error| Fault::Runtime(format!("raise bounded scan pool: {error}")))?;
+        let inspections = pool.install(|| {
+            paths
+                .par_iter()
+                .map(|path| {
+                    if halt() {
+                        return Inspection::Halted;
+                    }
+                    let inspected = inspect_candidate(path, &cache);
+                    let was_reused = inspected.as_ref().is_ok_and(|(_candidate, reused)| *reused);
+                    let inspected_paths = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if was_reused {
+                        let _prior = reused.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if inspected_paths == total || inspected_paths.is_multiple_of(stride) {
+                        progress(ScanProgress {
+                            inspected_paths,
+                            total_paths: total,
+                            reused_paths: reused.load(Ordering::Relaxed),
+                        });
+                    }
+                    match inspected {
+                        Ok((candidate, reused)) => Inspection::Candidate { candidate, reused },
+                        Err(error) => Inspection::Failure(ScanFailure {
+                            path: path.clone(),
+                            error: error.to_string(),
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        if halt()
+            || inspections
+                .iter()
+                .any(|inspection| matches!(inspection, Inspection::Halted))
+        {
+            return Ok(None);
+        }
+        let mut candidates = Vec::with_capacity(inspections.len());
+        let mut reused_paths = 0;
+        for inspection in inspections {
+            match inspection {
+                Inspection::Candidate { candidate, reused } => {
+                    candidates.push(candidate);
+                    reused_paths += usize::from(reused);
+                }
+                Inspection::Failure(failure) => failures.push(failure),
+                Inspection::Halted => return Ok(None),
             }
         }
 
@@ -73,8 +205,62 @@ impl Engine {
         }
         let now = now_ns()?;
         let collection_id = self.ensure_collection(&root, now)?;
-        self.apply_scan(collection_id, candidates, failures, complete, now)
-            .map(Some)
+        self.apply_scan(
+            collection_id,
+            candidates,
+            failures,
+            complete,
+            reused_paths,
+            now,
+        )
+        .map(Some)
+    }
+
+    fn scan_cache(&self, root: &Path) -> Result<ScanCache> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT o.path, o.file_seal, o.blob_digest, a.render_digest,
+                    o.width, o.height, o.byte_len
+             FROM pm_occurrences o
+             JOIN pm_collections c ON c.id = o.collection_id
+             JOIN pm_assets a ON a.id = o.asset_id
+             WHERE c.root = ?1 AND a.identity_authority = 'exact'",
+        )?;
+        let rows = statement.query_map([encode_path(root)], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut cache = ScanCache::default();
+        for row in rows {
+            let (path, seal, blob, render, width, height, byte_len) = row?;
+            let blob = BlobDigest::parse(blob)?;
+            let identity = ImageIdentity {
+                blob: blob.clone(),
+                render: RenderDigest::parse(render)?,
+                width: u32::try_from(width)
+                    .map_err(|_| Fault::Corrupt("invalid cached width".to_owned()))?,
+                height: u32::try_from(height)
+                    .map_err(|_| Fault::Corrupt("invalid cached height".to_owned()))?,
+                byte_len: u64::try_from(byte_len)
+                    .map_err(|_| Fault::Corrupt("invalid cached byte length".to_owned()))?,
+            };
+            let _prior = cache.by_blob.insert(blob, identity.clone());
+            let _prior = cache.by_path.insert(
+                decode_path(path),
+                CachedIdentity {
+                    seal: seal.map(FileSeal::parse).transpose()?,
+                    identity,
+                },
+            );
+        }
+        Ok(cache)
     }
 
     pub fn collection(&self, id: CollectionId) -> Result<Collection> {
@@ -105,6 +291,7 @@ impl Engine {
             r"
             WITH ranked AS (
                 SELECT o.*,
+                       COUNT(*) OVER (PARTITION BY o.asset_id) AS occurrence_count,
                        ROW_NUMBER() OVER (
                            PARTITION BY o.asset_id
                            ORDER BY o.width * o.height DESC, o.byte_len DESC, o.path ASC
@@ -115,32 +302,15 @@ impl Engine {
                 SELECT id FROM pm_preference_snapshots
                 WHERE collection_id = ?1
                 ORDER BY id DESC LIMIT 1
-            ), duel_counts AS (
-                SELECT asset_id, COUNT(*) AS duel_count
-                FROM (
-                    SELECT d.left_asset_id AS asset_id
-                    FROM pm_asset_duels d
-                    JOIN pm_observations e ON e.id = d.observation_id
-                    JOIN pm_sessions s ON s.id = e.session_id
-                    WHERE s.collection_id = ?1
-                    UNION ALL
-                    SELECT d.right_asset_id AS asset_id
-                    FROM pm_asset_duels d
-                    JOIN pm_observations e ON e.id = d.observation_id
-                    JOIN pm_sessions s ON s.id = e.session_id
-                    WHERE s.collection_id = ?1
-                )
-                GROUP BY asset_id
             )
             SELECT a.id, r.id, r.path, r.blob_digest, a.render_digest,
                    r.width, r.height, r.byte_len, r.rotation_quarters,
-                   ca.favorite, COALESCE(dc.duel_count, 0), ps.score
+                   r.occurrence_count, ca.favorite, COALESCE(ps.duel_count, 0), ps.score
             FROM pm_collection_assets ca
             JOIN pm_assets a ON a.id = ca.asset_id
             JOIN ranked r ON r.asset_id = a.id AND r.rank = 1
             LEFT JOIN latest_snapshot ls
             LEFT JOIN pm_preference_scores ps ON ps.snapshot_id = ls.id AND ps.asset_id = a.id
-            LEFT JOIN duel_counts dc ON dc.asset_id = a.id
             WHERE ca.collection_id = ?1 AND ca.hidden = 0
             ORDER BY ca.favorite DESC, ps.score DESC NULLS LAST, a.id ASC
             ",
@@ -156,9 +326,10 @@ impl Engine {
                 height: row.get(6)?,
                 byte_len: row.get(7)?,
                 rotation_quarters: row.get(8)?,
-                favorite: row.get(9)?,
-                duel_count: row.get(10)?,
-                preference_score: row.get(11)?,
+                occurrence_count: row.get(9)?,
+                favorite: row.get(10)?,
+                duel_count: row.get(11)?,
+                preference_score: row.get(12)?,
             })
         })?;
         rows.map(|row| row.map_err(Fault::from).and_then(AssetRow::finish))
@@ -255,6 +426,7 @@ impl Engine {
         candidates: Vec<Candidate>,
         failures: Vec<ScanFailure>,
         complete: bool,
+        reused_paths: usize,
         now: i64,
     ) -> Result<ScanReport> {
         let discovered_paths = candidates.len() + failures.len();
@@ -326,11 +498,57 @@ impl Engine {
             collection_id,
             generation: nonnegative_u64(generation, "scan generation")?,
             discovered_paths,
+            reused_paths,
             visible_assets,
             retired_occurrences: retired,
             failures,
         })
     }
+}
+
+fn inspect_candidate(path: &Path, cache: &ScanCache) -> Result<(Candidate, bool)> {
+    let seal = FileSeal::read(path)?;
+    if let Some(cached) = cache
+        .by_path
+        .get(path)
+        .filter(|cached| cached.seal == Some(seal))
+    {
+        return Ok((
+            Candidate {
+                path: path.to_path_buf(),
+                identity: cached.identity.clone(),
+                seal,
+            },
+            true,
+        ));
+    }
+
+    let bytes = fs::read(path).at(path)?;
+    if FileSeal::read(path)? != seal {
+        return Err(Fault::Image {
+            path: path.to_path_buf(),
+            source: anyhow!("file changed while it was being inspected"),
+        });
+    }
+    let blob = blob_digest(&bytes);
+    let (identity, reused) = match cache.by_blob.get(&blob) {
+        Some(identity) => (identity.clone(), true),
+        None => (
+            inspect_bytes_with_blob(&bytes, blob).map_err(|source| Fault::Image {
+                path: path.to_path_buf(),
+                source,
+            })?,
+            false,
+        ),
+    };
+    Ok((
+        Candidate {
+            path: path.to_path_buf(),
+            identity,
+            seal,
+        },
+        reused,
+    ))
 }
 
 fn upsert_candidate(
@@ -387,8 +605,8 @@ fn upsert_candidate(
     tx.execute(
         "INSERT INTO pm_occurrences(
              collection_id, path, asset_id, blob_digest, width, height, byte_len,
-             present, last_seen_generation
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)
+             present, last_seen_generation, file_seal
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
          ON CONFLICT(collection_id, path) DO UPDATE SET
              asset_id = excluded.asset_id,
              blob_digest = excluded.blob_digest,
@@ -396,7 +614,8 @@ fn upsert_candidate(
              height = excluded.height,
              byte_len = excluded.byte_len,
              present = 1,
-             last_seen_generation = excluded.last_seen_generation",
+             last_seen_generation = excluded.last_seen_generation,
+             file_seal = excluded.file_seal",
         params![
             collection_id.get(),
             encode_path(&candidate.path),
@@ -406,6 +625,7 @@ fn upsert_candidate(
             candidate.identity.height,
             candidate.identity.byte_len,
             generation,
+            candidate.seal.as_bytes(),
         ],
     )?;
     tx.execute(
@@ -452,6 +672,7 @@ struct AssetRow {
     height: i64,
     byte_len: i64,
     rotation_quarters: i64,
+    occurrence_count: i64,
     favorite: bool,
     duel_count: i64,
     preference_score: Option<f64>,
@@ -477,6 +698,8 @@ impl AssetRow {
                 rotation_quarters: u8::try_from(self.rotation_quarters)
                     .map_err(|_| Fault::Corrupt("invalid occurrence rotation".to_owned()))?,
             },
+            occurrence_count: u32::try_from(self.occurrence_count)
+                .map_err(|_| Fault::Corrupt("invalid occurrence count".to_owned()))?,
             favorite: self.favorite,
             duel_count: u32::try_from(self.duel_count)
                 .map_err(|_| Fault::Corrupt("invalid duel count".to_owned()))?,

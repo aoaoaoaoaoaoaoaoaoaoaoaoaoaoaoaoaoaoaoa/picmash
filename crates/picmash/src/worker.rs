@@ -6,7 +6,7 @@ use image::{DynamicImage, imageops};
 use picmash_contract::Side;
 use picmash_engine::{
     AssetId, AssetView, CollectionId, CommandId, ComparisonPrompt, Engine, PreferenceEvaluation,
-    SessionId, canonical_image,
+    ScanProgress, SessionId, canonical_image,
 };
 use std::{
     fs,
@@ -34,6 +34,7 @@ pub struct Card {
     pub width: u32,
     pub height: u32,
     pub rotation_quarters: u8,
+    pub occurrence_count: u32,
     pub favorite: bool,
     pub duel_count: u32,
     pub preference_score: Option<f64>,
@@ -47,6 +48,7 @@ impl From<&AssetView> for Card {
             width: view.occurrence.width,
             height: view.occurrence.height,
             rotation_quarters: view.occurrence.rotation_quarters,
+            occurrence_count: view.occurrence_count,
             favorite: view.favorite,
             duel_count: view.duel_count,
             preference_score: view.preference_score,
@@ -92,6 +94,8 @@ pub enum Command {
 pub enum Event {
     NeedCollection,
     Busy(&'static str),
+    ScanStarted(PathBuf),
+    ScanProgress(ScanProgress),
     Catalog { summary: Summary, cards: Vec<Card> },
     Pair(Pair),
     NoComparison,
@@ -222,11 +226,13 @@ fn load_collection(
     wake: &NativeWake,
     root: &Path,
 ) -> Result<()> {
-    publish(events, wake, Event::Busy("SCANNING COLLECTION"));
+    publish(events, wake, Event::ScanStarted(root.to_path_buf()));
     let stop = Arc::clone(&state.stop);
-    let Some(scan) = state
-        .engine
-        .scan_with_halt(root, || stop.load(Ordering::Acquire))?
+    let Some(scan) = state.engine.scan_with_control(
+        root,
+        || stop.load(Ordering::Acquire),
+        |progress| publish(events, wake, Event::ScanProgress(progress)),
+    )?
     else {
         return Ok(());
     };

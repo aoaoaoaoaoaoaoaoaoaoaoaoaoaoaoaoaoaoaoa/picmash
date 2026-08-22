@@ -170,6 +170,13 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
     for _frame in 0..4 {
         let _fresh = probe.wait_fresh(&app, WAIT)?;
     }
+    let tile_target = Target::BrowseTile.to_string();
+    let tile = probe.wait_anchor(&app, &tile_target, WAIT)?;
+    let (x, y) = tile.center();
+    let _hovered = session.move_to(x, y)?;
+    for _frame in 0..4 {
+        let _fresh = probe.wait_fresh(&app, WAIT)?;
+    }
     capture(&session, artifacts, "picmash-browse.png")?;
     app.terminate()?;
     Ok(())
@@ -251,6 +258,7 @@ fn seed(testbed: &Testbed) -> Result<()> {
     {
         let bytes = fixture(index as u8, dimensions)?;
         let _written = testbed.write_private(format!("collection/{index}.png"), &bytes)?;
+        let _copy = testbed.write_private(format!("collection/{index}-copy.png"), &bytes)?;
     }
     Ok(())
 }

@@ -17,6 +17,60 @@ fn write_image(path: &Path, color: [u8; 3]) -> Result<Vec<u8>> {
 }
 
 #[test]
+fn catalog_seals_reuse_only_unchanged_exact_images() -> Result<()> {
+    let temporary = tempdir()?;
+    let corpus = temporary.path().join("corpus");
+    fs::create_dir(&corpus)?;
+    let a_path = corpus.join("a.png");
+    let b_path = corpus.join("b.png");
+    let _a = write_image(&a_path, [210, 10, 20])?;
+    let _b = write_image(&b_path, [20, 190, 30])?;
+    let _copied = fs::copy(&a_path, corpus.join("z-copy.png"))?;
+
+    let database = temporary.path().join("picmash.db");
+    let engine = Engine::open(&database)?;
+    let cold = engine.scan(&corpus)?;
+    assert_eq!(cold.reused_paths, 0);
+    let before = engine.assets(cold.collection_id)?;
+    let a_before = before
+        .iter()
+        .find(|asset| asset.occurrence.path == a_path)
+        .context("first a identity")?
+        .clone();
+    assert_eq!(a_before.occurrence_count, 2);
+    let b_before = before
+        .iter()
+        .find(|asset| asset.occurrence.path == b_path)
+        .context("first b identity")?
+        .id
+        .clone();
+
+    Connection::open(&database)?.execute("UPDATE pm_occurrences SET file_seal = NULL", [])?;
+    assert_eq!(engine.scan(&corpus)?.reused_paths, 3);
+    let _changed = write_image(&a_path, [40, 50, 220])?;
+    let changed = engine.scan(&corpus)?;
+    assert_eq!(changed.reused_paths, 2);
+    let after = engine.assets(changed.collection_id)?;
+    assert_ne!(
+        after
+            .iter()
+            .find(|asset| asset.occurrence.path == a_path)
+            .context("changed a identity")?
+            .id,
+        a_before.id
+    );
+    assert_eq!(
+        after
+            .iter()
+            .find(|asset| asset.occurrence.path == b_path)
+            .context("stable b identity")?
+            .id,
+        b_before
+    );
+    Ok(())
+}
+
+#[test]
 fn catalog_judgment_and_preference_form_one_durable_law() -> Result<()> {
     let temporary = tempdir()?;
     let corpus = temporary.path().join("corpus");
@@ -171,6 +225,7 @@ fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Resu
                 asset_a_id TEXT, asset_b_id TEXT, asset_c_id TEXT,
                 chosen_pair TEXT, created_at INTEGER
             );
+            CREATE TABLE asset_external_provenance(asset_id TEXT);
             ",
     )?;
     let legacy_render =
@@ -206,6 +261,7 @@ fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Resu
             INSERT INTO nudge_events VALUES (1, 1, 'a', 1.0, 3);
             INSERT INTO heart_events VALUES (1, 1, 'a', 1, 4);
             INSERT INTO heart_events VALUES (2, 1, 'a', 0, 5);
+            INSERT INTO asset_external_provenance VALUES ('a');
             ",
     )?;
     drop(connection);

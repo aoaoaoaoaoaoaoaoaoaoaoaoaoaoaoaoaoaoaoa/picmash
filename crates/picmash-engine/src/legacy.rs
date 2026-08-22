@@ -22,7 +22,7 @@ struct LegacyDump {
     occurrences: Vec<LegacyOccurrence>,
     sessions: Vec<LegacySession>,
     events: Vec<LegacyEvent>,
-    external_assets: BTreeSet<String>,
+    corpus_assets: BTreeMap<i64, BTreeSet<String>>,
 }
 
 #[derive(Debug)]
@@ -191,7 +191,7 @@ impl LegacyDump {
                 })
             },
         )?;
-        let assets = load_rows(
+        let mut assets = load_rows(
             connection,
             "SELECT id, created_at, render_hash FROM assets ORDER BY id",
             |row| {
@@ -223,6 +223,19 @@ impl LegacyDump {
                 })
             },
         )?;
+        let mut corpus_assets = BTreeMap::<_, BTreeSet<_>>::new();
+        for occurrence in &occurrences {
+            let _inserted = corpus_assets
+                .entry(occurrence.corpus_id)
+                .or_default()
+                .insert(occurrence.asset_id.clone());
+        }
+        let corpus_asset_ids = corpus_assets
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assets.retain(|asset| corpus_asset_ids.contains(&asset.id));
         let sessions = load_rows(
             connection,
             "SELECT id, corpus_id, started_at, ended_at FROM sessions ORDER BY id",
@@ -301,24 +314,13 @@ impl LegacyDump {
             },
         )?);
         events.sort_by_key(|event| (event.created_at, event.payload.rank(), event.local_id));
-        let external_assets = if table_exists(connection, "asset_external_provenance")? {
-            load_rows(
-                connection,
-                "SELECT DISTINCT asset_id FROM asset_external_provenance ORDER BY asset_id",
-                |row| row.get(0),
-            )?
-            .into_iter()
-            .collect()
-        } else {
-            BTreeSet::new()
-        };
         Ok(Self {
             corpora,
             assets,
             occurrences,
             sessions,
             events,
-            external_assets,
+            corpus_assets,
         })
     }
 }
@@ -500,12 +502,11 @@ fn import_events(
                 right,
                 winner,
             } => {
-                if dump.external_assets.contains(left)
-                    || dump.external_assets.contains(right)
-                    || !sessions.contains_key(session_id)
-                {
-                    false
-                } else {
+                let belongs = sessions
+                    .get(session_id)
+                    .and_then(|corpus| dump.corpus_assets.get(corpus))
+                    .is_some_and(|members| members.contains(left) && members.contains(right));
+                if belongs {
                     import_duel(
                         tx,
                         event,
@@ -516,6 +517,8 @@ fn import_events(
                         assets,
                         namespace,
                     )?
+                } else {
+                    false
                 }
             }
             LegacyPayload::Threshold {

@@ -2331,6 +2331,7 @@ dependencies = [
  "jxl-oxide",
  "kamadak-exif",
  "parking_lot",
+ "rayon",
  "rusqlite",
  "tempfile",
  "thiserror 2.0.20",
