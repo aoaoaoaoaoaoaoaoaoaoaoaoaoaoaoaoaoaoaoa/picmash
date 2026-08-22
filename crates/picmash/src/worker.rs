@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use atomic_write_file::AtomicWriteFile;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eternalist_apps::NativeWake;
-use image::{DynamicImage, imageops};
+use image::{RgbaImage, imageops};
 use picmash_contract::Side;
 use picmash_engine::{
     AssetId, AssetView, CollectionId, CommandId, ComparisonPrompt, Engine, PreferenceEvaluation,
@@ -85,9 +85,11 @@ pub enum Command {
     Rescan,
     Choose(Side),
     Favorite(Side),
+    FavoriteAsset(AssetId),
     Hide(Side),
     Rotate(Side),
-    Thumbnail(AssetId),
+    Thumbnail { asset_id: AssetId, bucket: u8 },
+    Full { asset_id: AssetId, bound: [u32; 2] },
 }
 
 #[derive(Debug)]
@@ -96,11 +98,35 @@ pub enum Event {
     Busy(&'static str),
     ScanStarted(PathBuf),
     ScanProgress(ScanProgress),
-    Catalog { summary: Summary, cards: Vec<Card> },
+    Catalog {
+        summary: Summary,
+        cards: Vec<Card>,
+    },
     Pair(Pair),
     NoComparison,
-    Favorite { asset_id: AssetId, active: bool },
-    Thumbnail { asset_id: AssetId, blade: Blade },
+    Favorite {
+        asset_id: AssetId,
+        active: bool,
+    },
+    Thumbnail {
+        asset_id: AssetId,
+        bucket: u8,
+        blade: Blade,
+    },
+    ThumbnailFault {
+        asset_id: AssetId,
+        bucket: u8,
+        message: String,
+    },
+    Full {
+        asset_id: AssetId,
+        source: Blade,
+        display: Option<Blade>,
+    },
+    FullFault {
+        asset_id: AssetId,
+        message: String,
+    },
     Fault(String),
 }
 
@@ -211,9 +237,38 @@ fn conduct(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake, c
         Command::Rescan => rescan(state, events, wake),
         Command::Choose(side) => choose(state, events, wake, side),
         Command::Favorite(side) => favorite(state, events, wake, side),
+        Command::FavoriteAsset(asset_id) => favorite_asset(state, events, wake, &asset_id),
         Command::Hide(side) => hide(state, events, wake, side),
         Command::Rotate(side) => rotate(state, events, wake, side),
-        Command::Thumbnail(asset_id) => thumbnail(state, events, wake, &asset_id),
+        Command::Thumbnail { asset_id, bucket } => {
+            let result = thumbnail(state, events, wake, &asset_id, bucket);
+            if let Err(error) = result {
+                publish(
+                    events,
+                    wake,
+                    Event::ThumbnailFault {
+                        asset_id,
+                        bucket,
+                        message: format!("{error:#}"),
+                    },
+                );
+            }
+            return;
+        }
+        Command::Full { asset_id, bound } => {
+            let result = full(state, events, wake, &asset_id, bound);
+            if let Err(error) = result {
+                publish(
+                    events,
+                    wake,
+                    Event::FullFault {
+                        asset_id,
+                        message: format!("{error:#}"),
+                    },
+                );
+            }
+            return;
+        }
     };
     if let Err(error) = result {
         publish(events, wake, Event::Fault(format!("{error:#}")));
@@ -291,26 +346,42 @@ fn favorite(
         Side::Left => prompt.left.asset_id.clone(),
         Side::Right => prompt.right.asset_id.clone(),
     };
+    favorite_asset(state, events, wake, &asset_id)
+}
+
+fn favorite_asset(
+    state: &mut EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    asset_id: &AssetId,
+) -> Result<()> {
     let active = !state
         .cards
         .iter()
-        .find(|card| card.asset_id == asset_id)
+        .find(|card| &card.asset_id == asset_id)
         .context("comparison asset left the active catalog")?
         .favorite;
     state.engine.set_favorite(
         active_session(state)?,
-        &asset_id,
+        asset_id,
         active,
         &CommandId::fresh(),
     )?;
     if let Some(card) = state
         .cards
         .iter_mut()
-        .find(|card| card.asset_id == asset_id)
+        .find(|card| &card.asset_id == asset_id)
     {
         card.favorite = active;
     }
-    publish(events, wake, Event::Favorite { asset_id, active });
+    publish(
+        events,
+        wake,
+        Event::Favorite {
+            asset_id: asset_id.clone(),
+            active,
+        },
+    );
     Ok(())
 }
 
@@ -353,19 +424,52 @@ fn thumbnail(
     events: &Sender<Event>,
     wake: &NativeWake,
     asset_id: &AssetId,
+    bucket: u8,
 ) -> Result<()> {
     let card = state
         .cards
         .iter()
         .find(|card| &card.asset_id == asset_id)
         .context("thumbnail asset left the active catalog")?;
-    let blade = decode(&card.path, card.rotation_quarters, THUMB_EDGE)?;
+    let blade = decode_thumbnail(
+        &card.path,
+        card.rotation_quarters,
+        THUMB_EDGE.saturating_mul(1_u32 << bucket.min(2)),
+    )?;
     publish(
         events,
         wake,
         Event::Thumbnail {
             asset_id: asset_id.clone(),
+            bucket,
             blade,
+        },
+    );
+    Ok(())
+}
+
+fn full(
+    state: &EngineState,
+    events: &Sender<Event>,
+    wake: &NativeWake,
+    asset_id: &AssetId,
+    bound: [u32; 2],
+) -> Result<()> {
+    let card = state
+        .cards
+        .iter()
+        .find(|card| &card.asset_id == asset_id)
+        .context("viewer asset left the active catalog")?;
+    let image = decode_rgba(&card.path, card.rotation_quarters)?;
+    let display = (image.width() > bound[0] || image.height() > bound[1])
+        .then(|| blade(fitted_thumbnail(&image, bound[0], bound[1])));
+    publish(
+        events,
+        wake,
+        Event::Full {
+            asset_id: asset_id.clone(),
+            source: blade(image),
+            display,
         },
     );
     Ok(())
@@ -402,8 +506,8 @@ fn publish_collection(
     let prompt = state.engine.propose_comparison(active_session(state)?)?;
     let left = card_for(state, &prompt.left.asset_id)?.clone();
     let right = card_for(state, &prompt.right.asset_id)?.clone();
-    let left_blade = decode(&left.path, left.rotation_quarters, PROMPT_EDGE)?;
-    let right_blade = decode(&right.path, right.rotation_quarters, PROMPT_EDGE)?;
+    let left_blade = decode_thumbnail(&left.path, left.rotation_quarters, PROMPT_EDGE)?;
+    let right_blade = decode_thumbnail(&right.path, right.rotation_quarters, PROMPT_EDGE)?;
     state.prompt = Some((prompt, Instant::now()));
     publish(
         events,
@@ -418,23 +522,38 @@ fn publish_collection(
     Ok(())
 }
 
-fn decode(path: &Path, rotation_quarters: u8, edge: u32) -> Result<Blade> {
+fn decode_thumbnail(path: &Path, rotation_quarters: u8, edge: u32) -> Result<Blade> {
+    let image = decode_rgba(path, rotation_quarters)?;
+    Ok(blade(fitted_thumbnail(&image, edge, edge)))
+}
+
+fn fitted_thumbnail(image: &RgbaImage, bound_width: u32, bound_height: u32) -> RgbaImage {
+    let scale = (f64::from(bound_width.max(1)) / f64::from(image.width()))
+        .min(f64::from(bound_height.max(1)) / f64::from(image.height()))
+        .min(1.0);
+    let width = (f64::from(image.width()) * scale).floor().max(1.0) as u32;
+    let height = (f64::from(image.height()) * scale).floor().max(1.0) as u32;
+    imageops::thumbnail(image, width, height)
+}
+
+fn decode_rgba(path: &Path, rotation_quarters: u8) -> Result<RgbaImage> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let image = canonical_image(&bytes).with_context(|| format!("decode {}", path.display()))?;
     let rgba = image.to_rgba8();
-    let rotated = match rotation_quarters % 4 {
+    Ok(match rotation_quarters % 4 {
         1 => imageops::rotate90(&rgba),
         2 => imageops::rotate180(&rgba),
         3 => imageops::rotate270(&rgba),
         _ => rgba,
-    };
-    let image = DynamicImage::ImageRgba8(rotated).thumbnail(edge, edge);
-    let rgba = image.to_rgba8();
-    Ok(Blade {
-        width: rgba.width() as usize,
-        height: rgba.height() as usize,
-        rgba: rgba.into_raw(),
     })
+}
+
+fn blade(image: RgbaImage) -> Blade {
+    Blade {
+        width: image.width() as usize,
+        height: image.height() as usize,
+        rgba: image.into_raw(),
+    }
 }
 
 fn live_prompt(state: &EngineState) -> Result<&ComparisonPrompt> {

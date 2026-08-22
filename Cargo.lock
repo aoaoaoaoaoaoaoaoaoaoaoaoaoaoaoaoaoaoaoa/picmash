@@ -2289,6 +2289,7 @@ name = "picmash"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "atomic-write-file",
  "brass_poolrooms",
  "crossbeam-channel",

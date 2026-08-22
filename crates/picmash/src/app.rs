@@ -25,6 +25,7 @@ use std::{
 use crate::{
     commands::{self, Edict},
     configuration::Config,
+    viewer::{Action as ViewerAction, Viewer},
     witness,
     worker::{Blade, Card, Command, Event, Pair, Summary, Worker},
     xdg::Lair,
@@ -32,11 +33,10 @@ use crate::{
 
 const EVENT_DRAIN: usize = 24;
 const CONFIG_SETTLE: Duration = Duration::from_millis(400);
-const BROWSE_COLUMNS: usize = 5;
+const MIN_IMAGES_PER_ROW: u16 = 1;
+const MAX_IMAGES_PER_ROW: u16 = 12;
 const MIN_TILE_EDGE: f32 = 72.0;
 const TILE_GAP: f32 = 12.0;
-const PLATE_PAD: f32 = 4.0;
-const TILE_RADIUS: u8 = 2;
 const WATER: SettingSpec = SettingSpec::new(
     "living_water",
     "LIVING WATER",
@@ -80,6 +80,12 @@ enum Action {
     Rotate(Side),
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ThumbKey {
+    asset_id: AssetId,
+    bucket: u8,
+}
+
 pub struct Picmash {
     worker: Worker,
     chooser: Option<Receiver<Option<PathBuf>>>,
@@ -88,10 +94,13 @@ pub struct Picmash {
     pending_collection: Option<PathBuf>,
     cards: Vec<Card>,
     browse_indices: Vec<usize>,
+    images_per_row: u16,
+    browse_scroll_offset: f32,
     favorites_only: bool,
     pair: Option<PairView>,
-    thumbnails: HashMap<AssetId, TextureHandle>,
-    thumbnails_inflight: HashSet<AssetId>,
+    thumbnails: HashMap<ThumbKey, TextureHandle>,
+    thumbnails_inflight: HashSet<ThumbKey>,
+    viewer: Option<Viewer>,
     busy: bool,
     scan_progress: Option<ScanProgress>,
     status: String,
@@ -117,6 +126,10 @@ impl Picmash {
         } else {
             Wetness::Dry
         };
+        let images_per_row = configuration
+            .live()
+            .images_per_row
+            .clamp(MIN_IMAGES_PER_ROW, MAX_IMAGES_PER_ROW);
         let worker = Worker::spawn(ctx, lair, initial)?;
         Ok(Self {
             worker,
@@ -126,10 +139,13 @@ impl Picmash {
             pending_collection: None,
             cards: Vec::new(),
             browse_indices: Vec::new(),
+            images_per_row,
+            browse_scroll_offset: 0.0,
             favorites_only: false,
             pair: None,
             thumbnails: HashMap::new(),
             thumbnails_inflight: HashSet::new(),
+            viewer: None,
             busy: true,
             scan_progress: None,
             status: "WAKING ENGINE".to_owned(),
@@ -146,6 +162,7 @@ impl Picmash {
         let ctx = ui.ctx().clone();
         self.absorb_chooser(&ctx);
         self.drain(&ctx);
+        self.poll_viewer_copy(&ctx);
         if self.configuration.absorb() {
             self.adopt_configuration();
         }
@@ -155,11 +172,13 @@ impl Picmash {
         let settings_invoked = !self.guide.is_open() && self.settings.take_shortcut(&ctx);
         let guide_invoked =
             !settings_invoked && !self.settings.is_open() && self.guide.take_shortcuts(&ctx);
+        self.zoom_tiles(&ctx);
         if !settings_invoked
             && !guide_invoked
             && !self.settings.is_open()
             && !self.guide.is_open()
             && self.chooser.is_none()
+            && self.viewer.is_none()
             && let Some(dispatch) = commands::canon().route(&ctx, &[self.mode.context()], |edict| {
                 self.edict_status(edict)
             })
@@ -167,6 +186,7 @@ impl Picmash {
             self.apply_edict(&ctx, dispatch);
         }
         self.paint(ui);
+        self.show_viewer(&ctx);
         self.command_guide(&ctx);
         self.show_settings(&ctx);
     }
@@ -356,30 +376,30 @@ impl Picmash {
         };
         let left = (pair.pair.left.clone(), pair.left_texture.clone());
         let right = (pair.pair.right.clone(), pair.right_texture.clone());
-        let height = ui.available_height().max(220.0);
+        let arena = ui.available_rect_before_wrap();
+        let [left_slot, right_slot] = optimal_pair_partition(
+            arena,
+            left.1.size_vec2(),
+            right.1.size_vec2(),
+            ui.spacing().item_spacing.x,
+        );
+        let _advanced = ui.advance_cursor_after_rect(arena);
         let mut actions = Vec::new();
-        ui.columns(2, |columns| {
-            if let Some(action) = comparison_card(
-                &mut columns[0],
-                &mut self.water,
-                Side::Left,
-                &left.0,
-                &left.1,
-                height,
-            ) {
-                actions.push(action);
-            }
-            if let Some(action) = comparison_card(
-                &mut columns[1],
-                &mut self.water,
-                Side::Right,
-                &right.0,
-                &right.1,
-                height,
-            ) {
-                actions.push(action);
-            }
-        });
+        if let Some(action) =
+            comparison_card(ui, &mut self.water, Side::Left, &left.0, &left.1, left_slot)
+        {
+            actions.push(action);
+        }
+        if let Some(action) = comparison_card(
+            ui,
+            &mut self.water,
+            Side::Right,
+            &right.0,
+            &right.1,
+            right_slot,
+        ) {
+            actions.push(action);
+        }
         for action in actions {
             self.apply_action(action);
         }
@@ -388,47 +408,83 @@ impl Picmash {
     fn browser(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width().max(MIN_TILE_EDGE);
         let maximum_columns = (((width + TILE_GAP) / (MIN_TILE_EDGE + TILE_GAP)) as usize).max(1);
-        let columns = BROWSE_COLUMNS.min(maximum_columns);
+        let columns = usize::from(self.images_per_row.max(1)).min(maximum_columns);
         let edge = tile_edge(width, columns);
+        let row_height = edge + TILE_GAP;
         let rows = self.browse_indices.len().div_ceil(columns);
-        let mut demands = Vec::new();
+        let bucket = thumb_bucket(edge);
+        let motion = (!self.guide.is_open()
+            && !self.settings.is_open()
+            && self.viewer.is_none()
+            && !ui.ctx().text_edit_focused())
+        .then(|| ui.ctx().input(gallery_motion))
+        .flatten();
+        let offset = motion.map(|motion| match motion {
+            GalleryMotion::PreviousRow => (self.browse_scroll_offset - row_height).max(0.0),
+            GalleryMotion::NextRow => self.browse_scroll_offset + row_height,
+            GalleryMotion::First => 0.0,
+        });
+        let mut demands = Vec::<ThumbKey>::new();
         let mut retained = HashSet::new();
-        let body = egui::ScrollArea::vertical()
-            .id_salt("picmash-browser")
-            .show_rows(ui, edge + TILE_GAP, rows, |ui, range| {
-                ui.spacing_mut().item_spacing.x = TILE_GAP;
-                for row in range {
-                    let _row = ui.horizontal(|ui| {
-                        for column in 0..columns {
-                            let slot = row * columns + column;
-                            let Some(&card_index) = self.browse_indices.get(slot) else {
-                                ui.allocate_space(egui::vec2(edge, 1.0));
-                                continue;
-                            };
-                            let card = &self.cards[card_index];
-                            let _retained = retained.insert(card.asset_id.clone());
-                            let texture = self.thumbnails.get(&card.asset_id);
-                            browse_tile(ui, &mut self.water, card, texture, edge, slot == 0);
-                            if texture.is_none()
-                                && !self.thumbnails_inflight.contains(&card.asset_id)
-                            {
-                                demands.push(card.asset_id.clone());
-                            }
+        let mut opened = None;
+        let scroll = egui::ScrollArea::vertical().id_salt("picmash-browser");
+        let scroll = if let Some(offset) = offset {
+            scroll.vertical_scroll_offset(offset)
+        } else {
+            scroll
+        };
+        let body = scroll.show_rows(ui, row_height, rows, |ui, range| {
+            ui.spacing_mut().item_spacing.x = TILE_GAP;
+            for row in range {
+                let _row = ui.horizontal(|ui| {
+                    for column in 0..columns {
+                        let slot = row * columns + column;
+                        let Some(&card_index) = self.browse_indices.get(slot) else {
+                            ui.allocate_space(egui::vec2(edge, 1.0));
+                            continue;
+                        };
+                        let card = &self.cards[card_index];
+                        let _retained = retained.insert(card.asset_id.clone());
+                        let key = ThumbKey {
+                            asset_id: card.asset_id.clone(),
+                            bucket,
+                        };
+                        let texture = self.thumbnails.get(&key).or_else(|| {
+                            [2, 1, 0].into_iter().find_map(|resident| {
+                                self.thumbnails.get(&ThumbKey {
+                                    asset_id: card.asset_id.clone(),
+                                    bucket: resident,
+                                })
+                            })
+                        });
+                        if browse_tile(ui, &mut self.water, card, texture, edge, slot == 0) {
+                            opened = Some(card.asset_id.clone());
                         }
-                    });
-                }
-            });
+                        if texture.is_none() && !self.thumbnails_inflight.contains(&key) {
+                            demands.push(key);
+                        }
+                    }
+                });
+            }
+        });
+        self.browse_scroll_offset = body.state.offset.y;
         self.water.heave(ui.ctx(), body.state.offset.y);
         witness::rect(ui.ctx(), Target::Browser, body.inner_rect);
         self.thumbnails
-            .retain(|asset_id, _texture| retained.contains(asset_id));
-        for asset_id in demands {
+            .retain(|key, _texture| retained.contains(&key.asset_id));
+        if let Some(asset_id) = opened {
+            self.open_viewer(ui.ctx(), &asset_id);
+        }
+        for key in demands {
             if self
                 .worker
-                .send(Command::Thumbnail(asset_id.clone()))
+                .send(Command::Thumbnail {
+                    asset_id: key.asset_id.clone(),
+                    bucket: key.bucket,
+                })
                 .is_ok()
             {
-                let _inserted = self.thumbnails_inflight.insert(asset_id);
+                let _inserted = self.thumbnails_inflight.insert(key);
             }
         }
     }
@@ -582,6 +638,8 @@ impl Picmash {
             Event::Catalog { summary, cards } => {
                 self.pending_collection = None;
                 self.scan_progress = None;
+                self.viewer = None;
+                self.water.close_pond();
                 self.summary = Some(summary);
                 self.cards = cards;
                 self.pair = None;
@@ -628,10 +686,44 @@ impl Picmash {
                 }
                 .clone_into(&mut self.status);
             }
-            Event::Thumbnail { asset_id, blade } => {
-                let _inflight = self.thumbnails_inflight.remove(&asset_id);
-                let texture = upload(ctx, &format!("picmash-thumb-{asset_id}"), &blade);
-                let _old = self.thumbnails.insert(asset_id, texture);
+            Event::Thumbnail {
+                asset_id,
+                bucket,
+                blade,
+            } => {
+                let key = ThumbKey { asset_id, bucket };
+                let _inflight = self.thumbnails_inflight.remove(&key);
+                let texture = upload(
+                    ctx,
+                    &format!("picmash-thumb-{}-{bucket}", key.asset_id),
+                    &blade,
+                );
+                let _old = self.thumbnails.insert(key, texture);
+            }
+            Event::ThumbnailFault {
+                asset_id,
+                bucket,
+                message,
+            } => {
+                let _inflight = self
+                    .thumbnails_inflight
+                    .remove(&ThumbKey { asset_id, bucket });
+                self.status = format!("THUMBNAIL FAULT · {message}");
+            }
+            Event::Full {
+                asset_id,
+                source,
+                display,
+            } => {
+                if let Some(viewer) = &mut self.viewer {
+                    viewer.install(ctx, &asset_id, source, display.as_ref());
+                }
+            }
+            Event::FullFault { asset_id, message } => {
+                if let Some(viewer) = &mut self.viewer {
+                    viewer.fail(&asset_id, message.clone());
+                }
+                self.status = format!("VIEWER FAULT · {message}");
             }
             Event::Fault(message) => {
                 self.busy = false;
@@ -644,6 +736,8 @@ impl Picmash {
 
     fn set_mode(&mut self, mode: Mode) {
         if self.mode != mode {
+            self.viewer = None;
+            self.water.close_pond();
             self.mode = mode;
             match mode {
                 Mode::Compare if self.pair.is_some() => "CHOOSE THE STRONGER IMAGE",
@@ -662,6 +756,160 @@ impl Picmash {
             .enumerate()
             .filter_map(|(index, card)| (!self.favorites_only || card.favorite).then_some(index))
             .collect();
+    }
+
+    fn open_viewer(&mut self, ctx: &egui::Context, asset_id: &AssetId) {
+        let sequence = self
+            .browse_indices
+            .iter()
+            .map(|&index| self.cards[index].asset_id.clone())
+            .collect::<Vec<_>>();
+        let Some(slot) = sequence.iter().position(|candidate| candidate == asset_id) else {
+            "VIEWER FAULT · IMAGE LEFT THE BROWSER".clone_into(&mut self.status);
+            return;
+        };
+        self.viewer = Some(Viewer::open(sequence, slot));
+        self.request_viewer_blade(ctx);
+        ctx.request_repaint();
+    }
+
+    fn request_viewer_blade(&mut self, ctx: &egui::Context) {
+        let demand = self.viewer.as_mut().and_then(|viewer| viewer.arm(ctx));
+        let Some((asset_id, bound)) = demand else {
+            return;
+        };
+        if let Err(error) = self.worker.send(Command::Full {
+            asset_id: asset_id.clone(),
+            bound,
+        }) && let Some(viewer) = &mut self.viewer
+        {
+            viewer.fail(&asset_id, format!("{error:#}"));
+        }
+    }
+
+    fn show_viewer(&mut self, ctx: &egui::Context) {
+        self.request_viewer_blade(ctx);
+        let Some(asset_id) = self.viewer.as_ref().map(|viewer| viewer.asset_id().clone()) else {
+            return;
+        };
+        let Some(card) = self
+            .cards
+            .iter()
+            .find(|card| card.asset_id == asset_id)
+            .cloned()
+        else {
+            self.viewer = None;
+            self.water.close_pond();
+            "VIEWER FAULT · IMAGE LEFT THE COLLECTION".clone_into(&mut self.status);
+            return;
+        };
+        let inputs_enabled =
+            !self.guide.is_open() && !self.settings.is_open() && self.chooser.is_none();
+        let actions = self.viewer.as_mut().map_or_else(Vec::new, |viewer| {
+            viewer.show(ctx, &mut self.water, &card, inputs_enabled)
+        });
+        for action in actions {
+            self.apply_viewer_action(ctx, action);
+        }
+    }
+
+    fn apply_viewer_action(&mut self, ctx: &egui::Context, action: ViewerAction) {
+        match action {
+            ViewerAction::Close => {
+                self.viewer = None;
+                self.water.close_pond();
+            }
+            ViewerAction::Copy => {
+                let result = self.viewer.as_mut().map(Viewer::begin_copy);
+                match result {
+                    Some(Ok(true)) => "COPYING IMAGE".clone_into(&mut self.status),
+                    Some(Ok(false)) => {}
+                    Some(Err(error)) => self.status = format!("COPY FAULT · {error:#}"),
+                    None => {}
+                }
+            }
+            ViewerAction::Favorite => {
+                if let Some(asset_id) = self.viewer.as_ref().map(|viewer| viewer.asset_id().clone())
+                {
+                    self.send(Command::FavoriteAsset(asset_id), false, "MARKING FAVORITE");
+                }
+            }
+            ViewerAction::Previous | ViewerAction::Next => {
+                if self
+                    .viewer
+                    .as_mut()
+                    .is_some_and(|viewer| viewer.navigate(action))
+                {
+                    self.request_viewer_blade(ctx);
+                }
+            }
+        }
+    }
+
+    fn poll_viewer_copy(&mut self, ctx: &egui::Context) {
+        let result = self
+            .viewer
+            .as_mut()
+            .and_then(|viewer| viewer.poll_copy(ctx));
+        match result {
+            Some(Ok(())) => "IMAGE COPIED".clone_into(&mut self.status),
+            Some(Err(error)) => self.status = format!("COPY FAULT · {error:#}"),
+            None => {}
+        }
+    }
+
+    fn zoom_tiles(&mut self, ctx: &egui::Context) {
+        if self.mode != Mode::Browse
+            || self.viewer.is_some()
+            || self.guide.is_open()
+            || self.settings.is_open()
+            || self.chooser.is_some()
+            || ctx.text_edit_focused()
+        {
+            return;
+        }
+        let steps = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl => Some(match unit {
+                        egui::MouseWheelUnit::Point => delta.y / 120.0,
+                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Page => delta.y * 4.0,
+                    }),
+                    _ => None,
+                })
+                .sum::<f32>()
+        });
+        if steps == 0.0 {
+            return;
+        }
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                !matches!(event, egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl)
+            });
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+        });
+        let next = (i32::from(self.images_per_row) - steps.round() as i32)
+            .clamp(i32::from(MIN_IMAGES_PER_ROW), i32::from(MAX_IMAGES_PER_ROW))
+            as u16;
+        if next == self.images_per_row {
+            return;
+        }
+        self.images_per_row = next;
+        if let Err(error) = self
+            .configuration
+            .revise(|config| config.images_per_row = next)
+        {
+            self.status = format!("FAULT · {error:#}");
+        }
+        ctx.request_repaint();
     }
 
     fn command_guide(&mut self, ctx: &egui::Context) {
@@ -717,6 +965,11 @@ impl Picmash {
             } else {
                 Wetness::Dry
             });
+        self.images_per_row = self
+            .configuration
+            .live()
+            .images_per_row
+            .clamp(MIN_IMAGES_PER_ROW, MAX_IMAGES_PER_ROW);
     }
 
     #[cfg(feature = "egui-test")]
@@ -740,6 +993,9 @@ impl Picmash {
                     pair.pair.right.rotation_quarters,
                 ]
             }),
+            images_per_row: self.images_per_row,
+            viewer_open: self.viewer.is_some(),
+            viewer_ready: self.viewer.as_ref().is_some_and(Viewer::ready),
             guide_open: self.guide.is_open(),
             settings_open: self.settings.is_open(),
             text_edit_focused,
@@ -753,18 +1009,20 @@ fn comparison_card(
     side: Side,
     card: &Card,
     texture: &TextureHandle,
-    height: f32,
+    slot: egui::Rect,
 ) -> Option<Action> {
     let mut action = None;
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), height),
+    let rect = contain(slot, texture.size_vec2());
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id(("comparison-choice", side.wire())),
         egui::Sense::click(),
     );
     let painter = ui.painter_at(rect);
     painter.image(
         texture.id(),
         rect,
-        cover_uv(rect.size(), texture.size_vec2()),
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
 
@@ -850,6 +1108,42 @@ fn comparison_card(
     action
 }
 
+fn optimal_pair_partition(
+    arena: egui::Rect,
+    left_image: egui::Vec2,
+    right_image: egui::Vec2,
+    gap: f32,
+) -> [egui::Rect; 2] {
+    let gap = gap.clamp(0.0, arena.width());
+    let width = (arena.width() - gap).max(2.0);
+    let height = arena.height().max(1.0);
+    let left_aspect = positive_aspect(left_image);
+    let right_aspect = positive_aspect(right_image);
+    let full_width = (left_aspect + right_aspect) * height;
+    let left_width = if width >= full_width {
+        left_aspect * height + (width - full_width) * 0.5
+    } else {
+        width * left_aspect / (left_aspect + right_aspect)
+    }
+    .clamp(1.0, width - 1.0);
+    let seam = arena.left() + left_width;
+    [
+        egui::Rect::from_min_max(arena.min, egui::pos2(seam, arena.bottom())),
+        egui::Rect::from_min_max(
+            egui::pos2(seam + gap, arena.top()),
+            egui::pos2(arena.left() + width + gap, arena.bottom()),
+        ),
+    ]
+}
+
+fn positive_aspect(image: egui::Vec2) -> f32 {
+    if image.x > 0.0 && image.y > 0.0 {
+        image.x / image.y
+    } else {
+        1.0
+    }
+}
+
 fn browse_tile(
     ui: &mut egui::Ui,
     water: &mut Surface,
@@ -857,16 +1151,20 @@ fn browse_tile(
     texture: Option<&TextureHandle>,
     edge: f32,
     witnessed: bool,
-) {
-    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(edge), egui::Sense::hover());
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(edge), egui::Sense::click());
     if witnessed {
         witness::response(ui, Target::BrowseTile, &response);
     }
-    let plate = Plate::new(rect);
-    plate.paint(ui, response.hovered());
     if let Some(texture) = texture {
-        plate.paint_image(ui, texture);
+        ui.painter().image(
+            texture.id(),
+            rect,
+            cover_uv(rect.size(), texture.size_vec2()),
+            egui::Color32::WHITE,
+        );
     } else {
+        ui.painter().rect_filled(rect, 0.0, chrome::SURFACE);
         let _waiting = ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -891,45 +1189,11 @@ fn browse_tile(
         paint_browse_metadata(ui, rect, card);
         water.hover(("browse", card.asset_id.as_str()), rect);
     }
-}
-
-#[derive(Clone, Copy)]
-struct Plate {
-    rect: egui::Rect,
-    well: egui::Rect,
-}
-
-impl Plate {
-    fn new(rect: egui::Rect) -> Self {
-        Self {
-            rect,
-            well: rect.shrink(PLATE_PAD),
-        }
-    }
-
-    fn paint(self, ui: &egui::Ui, hovered: bool) {
-        let radius = egui::CornerRadius::same(TILE_RADIUS);
-        ui.painter().rect_filled(self.rect, radius, chrome::SURFACE);
-        let edge = if hovered {
-            chrome::EDGE_STRONG
-        } else {
-            chrome::EDGE.gamma_multiply(0.55)
-        };
-        ui.painter().rect_stroke(
-            self.rect,
-            radius,
-            egui::Stroke::new(1.0, edge),
-            egui::StrokeKind::Inside,
-        );
-    }
-
-    fn paint_image(self, ui: &egui::Ui, texture: &TextureHandle) {
-        ui.painter().image(
-            texture.id(),
-            contain(self.well, texture.size_vec2()),
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+    if response.clicked() {
+        water.click(rect);
+        true
+    } else {
+        false
     }
 }
 
@@ -950,23 +1214,10 @@ fn paint_tile_badge(
     let galley = ui.painter().layout_no_wrap(text, font, color);
     let size = galley.size() + egui::vec2(12.0, 6.0);
     let (minimum, radius) = match corner {
-        BadgeCorner::Left => (
-            tile.left_top(),
-            egui::CornerRadius {
-                nw: TILE_RADIUS,
-                ne: 0,
-                sw: 0,
-                se: 0,
-            },
-        ),
+        BadgeCorner::Left => (tile.left_top(), egui::CornerRadius::ZERO),
         BadgeCorner::Right => (
             egui::pos2(tile.right() - size.x, tile.top()),
-            egui::CornerRadius {
-                nw: 0,
-                ne: TILE_RADIUS,
-                sw: 0,
-                se: 0,
-            },
+            egui::CornerRadius::ZERO,
         ),
     };
     let rect = egui::Rect::from_min_size(minimum, size);
@@ -1014,6 +1265,45 @@ fn tile_edge(width: f32, columns: usize) -> f32 {
     let columns = columns.max(1);
     let gaps = TILE_GAP * columns.saturating_sub(1) as f32;
     ((width - gaps) / columns as f32).max(MIN_TILE_EDGE)
+}
+
+fn thumb_bucket(edge: f32) -> u8 {
+    if edge > 390.0 {
+        2
+    } else {
+        u8::from(edge > 190.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GalleryMotion {
+    PreviousRow,
+    NextRow,
+    First,
+}
+
+fn gallery_motion(input: &egui::InputState) -> Option<GalleryMotion> {
+    [
+        (egui::Key::PageUp, GalleryMotion::PreviousRow),
+        (egui::Key::PageDown, GalleryMotion::NextRow),
+        (egui::Key::Home, GalleryMotion::First),
+    ]
+    .into_iter()
+    .find_map(|(key, motion)| exact_key_pressed(input, key).then_some(motion))
+}
+
+fn exact_key_pressed(input: &egui::InputState, key: egui::Key) -> bool {
+    input.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key: candidate,
+                pressed: true,
+                modifiers,
+                ..
+            } if *candidate == key && modifiers.matches_exact(egui::Modifiers::NONE)
+        )
+    })
 }
 
 fn cover_uv(arena: egui::Vec2, image: egui::Vec2) -> egui::Rect {
@@ -1102,6 +1392,9 @@ pub struct Observation {
     duels: u64,
     pair_ready: bool,
     pair_rotations: Option<[u8; 2]>,
+    images_per_row: u16,
+    viewer_open: bool,
+    viewer_ready: bool,
     guide_open: bool,
     settings_open: bool,
     text_edit_focused: bool,

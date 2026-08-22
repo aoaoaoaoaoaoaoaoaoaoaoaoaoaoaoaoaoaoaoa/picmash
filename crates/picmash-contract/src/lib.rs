@@ -3,7 +3,7 @@
 use std::{borrow::Cow, fmt};
 
 /// Native UI contract revision.
-pub const UI_FINGERPRINT: &str = "picmash.ui/1";
+pub const UI_FINGERPRINT: &str = "picmash.ui/2";
 
 /// One member of the active comparison.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -48,6 +48,12 @@ pub enum Target {
     Browser,
     /// One visible browser tile.
     BrowseTile,
+    /// Full-image viewer surface.
+    Viewer,
+    /// Copy the viewed image to the clipboard.
+    ViewerCopy,
+    /// Close the full-image viewer.
+    ViewerClose,
 }
 
 impl Target {
@@ -65,6 +71,9 @@ impl Target {
             Self::Rotate(side) => Cow::Owned(format!("comparison.rotate/{}", side.wire())),
             Self::Browser => Cow::Borrowed("collection.browser"),
             Self::BrowseTile => Cow::Borrowed("collection.browser/tile"),
+            Self::Viewer => Cow::Borrowed("collection.viewer"),
+            Self::ViewerCopy => Cow::Borrowed("collection.viewer/copy"),
+            Self::ViewerClose => Cow::Borrowed("collection.viewer/close"),
         }
     }
 }

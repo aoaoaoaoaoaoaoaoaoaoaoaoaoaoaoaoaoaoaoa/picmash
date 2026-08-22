@@ -17,6 +17,7 @@ egui-test = ["dep:egui-tester-witness", "eternalist-apps/egui-test"]
 
 [dependencies]
 anyhow = "1.0.104"
+arboard = "3.6.1"
 atomic-write-file = "0.3.1"
 brass_poolrooms = "0.14.0"
 crossbeam-channel = "0.5.16"
