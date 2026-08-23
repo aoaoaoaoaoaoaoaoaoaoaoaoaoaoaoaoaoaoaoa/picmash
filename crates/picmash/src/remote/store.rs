@@ -439,7 +439,7 @@ impl RemoteStore {
         self.finish(candidate, "rejected", "rejected")
     }
 
-    pub fn veto_stream(&self, candidate: &Prepared) -> Result<()> {
+    pub fn reject_stream(&self, candidate: &Prepared) -> Result<()> {
         let now = now_ns()?;
         let tx = self.connection.unchecked_transaction()?;
         let mut cache_paths = Vec::new();

@@ -266,7 +266,7 @@ impl Reactor {
         self.drive()
     }
 
-    pub fn veto_offer_stream(&mut self) -> Result<()> {
+    pub fn reject_offer_stream(&mut self) -> Result<()> {
         let candidate = self
             .machine
             .offer()?
@@ -276,7 +276,7 @@ impl Reactor {
             candidate.discovery.source_identity.as_str(),
             &candidate.discovery.stream_id,
         )?;
-        self.store.veto_stream(&candidate)?;
+        self.store.reject_stream(&candidate)?;
         self.drive()
     }
 

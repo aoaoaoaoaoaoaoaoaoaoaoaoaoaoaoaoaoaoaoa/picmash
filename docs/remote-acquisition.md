@@ -18,7 +18,8 @@ render identity, and atomically writing beneath `.picmash-imported/`.
 
 `not_x` promotes either winner of a remote comparison: choosing the local image
 still means the challenger was not rejected. `hearted` promotes only a remote
-winner or an explicit heart. X rejects one candidate. TX vetoes its stream.
+winner or an explicit favorite. Reject (`X`) retires one candidate. Reject
+Stream (`Alt+J`) retires its thread.
 
 ## Configuration
 

@@ -6,11 +6,13 @@ use brass_poolrooms::{
 };
 use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use egui::{ColorImage, TextureHandle, TextureOptions};
+use eternalist_apps::commands::{CommandDispatch, CommandStatus};
 use picmash_contract::Target;
 use picmash_engine::AssetId;
 use std::{borrow::Cow, thread};
 
 use crate::{
+    commands::{self, Edict},
     witness,
     worker::{Blade, Card},
 };
@@ -193,12 +195,13 @@ impl Viewer {
         inputs_enabled: bool,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
+        let layer = layer();
+        ctx.memory_mut(|memory| memory.set_modal_layer(layer));
         if inputs_enabled && !ctx.text_edit_focused() {
             ctx.input(|input| {
                 for (key, action) in [
                     (egui::Key::ArrowLeft, Action::Previous),
                     (egui::Key::ArrowRight, Action::Next),
-                    (egui::Key::C, Action::Copy),
                     (egui::Key::Escape, Action::Close),
                 ] {
                     if exact_key_pressed(input, key) {
@@ -206,10 +209,18 @@ impl Viewer {
                     }
                 }
             });
+            if commands::canon().route_in_modal(ctx, layer, &[commands::Context::Viewer], |edict| {
+                match edict {
+                    Edict::CopyViewer if self.source.is_some() => CommandStatus::Enabled,
+                    Edict::CopyViewer => CommandStatus::Disabled("full image is not ready"),
+                    _ => CommandStatus::Hidden,
+                }
+            }) == Some(CommandDispatch::Invoke(Edict::CopyViewer))
+            {
+                actions.push(Action::Copy);
+            }
         }
 
-        let layer = layer();
-        ctx.memory_mut(|memory| memory.set_modal_layer(layer));
         water.begin_pond(true);
         let screen = ctx.content_rect();
         let image_box = image_box(card, screen.size());
@@ -328,28 +339,25 @@ fn viewer_bar(
                         if favorite.clicked() {
                             actions.push(Action::Favorite);
                         }
-                        let copy = command_plate(ui, viewer.source.is_some(), "COPY [C]")
+                        let copy = ui
+                            .add_enabled_ui(viewer.source.is_some(), |ui| {
+                                commands::canon().button_with(Edict::CopyViewer, ui, |button| {
+                                    button.min_size(egui::vec2(24.0, 20.0))
+                                })
+                            })
+                            .inner;
+                        let activated = copy.clicked();
+                        let copy = copy
+                            .into_response()
                             .on_hover_text("Copy the full-resolution image");
+                        chrome::tension(ui, &copy);
                         witness::response(ui, Target::ViewerCopy, &copy);
-                        if copy.clicked() {
+                        if activated {
                             actions.push(Action::Copy);
                         }
                     });
             });
         });
-}
-
-fn command_plate(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
-    let text = egui::RichText::new(text)
-        .size(13.0)
-        .strong()
-        .color(chrome::TEXT);
-    let response = ui.add_enabled(
-        enabled,
-        egui::Button::new(text).min_size(egui::vec2(24.0, 20.0)),
-    );
-    chrome::tension(ui, &response);
-    response
 }
 
 fn image_box(card: &Card, screen: egui::Vec2) -> egui::Vec2 {

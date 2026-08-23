@@ -177,8 +177,9 @@ pub enum Command {
     Favorite(Side),
     FavoriteAsset(AssetId),
     Hide(Side),
+    RejectRemote,
+    RejectStream,
     Rotate(Side),
-    VetoStream(Side),
     ConfigureRemote(RemoteConfig),
     Thumbnail { asset_id: AssetId, bucket: u8 },
     Full { asset_id: AssetId, bound: [u32; 2] },
@@ -424,8 +425,9 @@ fn conduct(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake, c
         Command::Favorite(side) => favorite(state, events, wake, side),
         Command::FavoriteAsset(asset_id) => favorite_asset(state, events, wake, &asset_id),
         Command::Hide(side) => hide(state, events, wake, side),
+        Command::RejectRemote => reject_remote(state, events, wake),
+        Command::RejectStream => reject_stream(state, events, wake),
         Command::Rotate(side) => rotate(state, events, wake, side),
-        Command::VetoStream(side) => veto_stream(state, events, wake, side),
         Command::ConfigureRemote(config) => configure_remote(state, events, wake, &config),
         Command::Thumbnail { asset_id, bucket } => {
             let result = thumbnail(state, events, wake, &asset_id, bucket);
@@ -674,40 +676,30 @@ fn hide(
     wake: &NativeWake,
     side: Side,
 ) -> Result<()> {
-    match state
+    let LivePrompt::Local { prompt, .. } = state
         .prompt
         .as_ref()
         .context("there is no live comparison")?
-    {
-        LivePrompt::Local { prompt, .. } => {
-            let asset = match side {
-                Side::Left => prompt.left.asset_id.clone(),
-                Side::Right => prompt.right.asset_id.clone(),
-            };
-            publish(events, wake, Event::Busy("WITHDRAWING IMAGE"));
-            state
-                .engine
-                .set_hidden(active_collection(state)?, &asset, true)?;
-            state.prompt = None;
-            publish_collection(state, events, wake)
-        }
-        LivePrompt::Remote { anchor, .. } => match side {
-            Side::Left => {
-                let anchor = anchor.clone();
-                publish(events, wake, Event::Busy("WITHDRAWING IMAGE"));
-                state
-                    .engine
-                    .set_hidden(active_collection(state)?, &anchor.asset_id, true)?;
-                state.prompt = None;
-                publish_collection(state, events, wake)
-            }
-            Side::Right => {
-                state.remote.reject_offer()?;
-                state.prompt = None;
-                forge_pair(state, events, wake)
-            }
-        },
-    }
+    else {
+        bail!("a remote challenger must be rejected, not hidden");
+    };
+    let asset = match side {
+        Side::Left => prompt.left.asset_id.clone(),
+        Side::Right => prompt.right.asset_id.clone(),
+    };
+    publish(events, wake, Event::Busy("WITHDRAWING IMAGE"));
+    state
+        .engine
+        .set_hidden(active_collection(state)?, &asset, true)?;
+    state.prompt = None;
+    publish_collection(state, events, wake)
+}
+
+fn reject_remote(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake) -> Result<()> {
+    ensure_remote_prompt(state)?;
+    state.remote.reject_offer()?;
+    state.prompt = None;
+    forge_pair(state, events, wake)
 }
 
 fn rotate(
@@ -1050,14 +1042,9 @@ fn commit_promotion(
     Ok(collection)
 }
 
-fn veto_stream(
-    state: &mut EngineState,
-    events: &Sender<Event>,
-    wake: &NativeWake,
-    side: Side,
-) -> Result<()> {
-    ensure_remote_side(state, side)?;
-    state.remote.veto_offer_stream()?;
+fn reject_stream(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake) -> Result<()> {
+    ensure_remote_prompt(state)?;
+    state.remote.reject_offer_stream()?;
     state.prompt = None;
     forge_pair(state, events, wake)
 }
@@ -1153,11 +1140,11 @@ fn service_archive(
     }
 }
 
-fn ensure_remote_side(state: &EngineState, side: Side) -> Result<()> {
-    if side == Side::Right && matches!(state.prompt.as_ref(), Some(LivePrompt::Remote { .. })) {
+fn ensure_remote_prompt(state: &EngineState) -> Result<()> {
+    if matches!(state.prompt.as_ref(), Some(LivePrompt::Remote { .. })) {
         Ok(())
     } else {
-        bail!("only a remote challenger stream can be vetoed")
+        bail!("remote rejection requires the displayed remote challenger")
     }
 }
 
