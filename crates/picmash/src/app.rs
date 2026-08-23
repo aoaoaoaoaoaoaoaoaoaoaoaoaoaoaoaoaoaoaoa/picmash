@@ -38,7 +38,8 @@ const MIN_IMAGES_PER_ROW: u16 = 1;
 const MAX_IMAGES_PER_ROW: u16 = 12;
 const MIN_TILE_EDGE: f32 = 72.0;
 const TILE_GAP: f32 = 12.0;
-const DUEL_PANEL_HEIGHT: f32 = 64.0;
+const DUEL_CONTROL_HEIGHT: f32 = MechanismSize::Small.side();
+const DUEL_PANEL_HEIGHT: f32 = DUEL_CONTROL_HEIGHT + 8.0;
 const BRONZE_RIM: f32 = 4.0;
 const WATER: SettingSpec = SettingSpec::new(
     "living_water",
@@ -1235,99 +1236,88 @@ fn comparison_panel(
     card: &PairCard,
     rect: egui::Rect,
 ) -> Vec<Action> {
-    let inner = paint_bronze_frame(ui, rect, chrome::CONTROL);
     let mut actions = Vec::new();
-    comparison_panel_contents(ui, side, card, inner, &mut actions);
+    let mut panel = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("comparison-panel", side.wire()))
+            .max_rect(rect),
+    );
+    panel.set_clip_rect(panel.clip_rect().intersect(rect));
+    let _rail = egui::Frame::new()
+        .fill(chrome::RAISED)
+        .stroke(egui::Stroke::new(1.0, chrome::EDGE))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(&mut panel, |ui| {
+            ui.set_min_width(ui.available_width());
+            let _sides = egui::containers::Sides::new()
+                .height(DUEL_CONTROL_HEIGHT)
+                .spacing(6.0)
+                .shrink_left()
+                .truncate()
+                .show(
+                    ui,
+                    |ui| comparison_identity(ui, side, card),
+                    |ui| comparison_actions(ui, side, card, &mut actions),
+                );
+        });
     actions
 }
 
-fn comparison_panel_contents(
-    ui: &mut egui::Ui,
-    side: Side,
-    card: &PairCard,
-    rect: egui::Rect,
-    actions: &mut Vec<Action>,
-) {
-    let rect = rect.shrink2(egui::vec2(4.0, 3.0));
-    let info_rect = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(rect.right(), (rect.top() + 16.0).min(rect.bottom())),
-    );
-    let controls_width: f32 = if card.remote().is_some() {
-        345.0_f32
-    } else {
-        215.0_f32
-    }
-    .min(rect.width());
-    let controls_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            rect.right() - controls_width,
-            (rect.bottom() - 30.0).max(info_rect.bottom()),
-        ),
-        rect.max,
-    );
-    let mut info = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt(("comparison-info", side.wire()))
-            .max_rect(info_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    info.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+fn comparison_identity(ui: &mut egui::Ui, side: Side, card: &PairCard) {
     let side_label = match side {
-        Side::Left => "A  LEFT",
-        Side::Right => "D  RIGHT",
+        Side::Left => "A LEFT",
+        Side::Right => "D RIGHT",
     };
-    let _side = info.label(chrome::section_title(side_label));
-    let _meta = info.label(chrome::muted(comparison_metadata(card)));
-
-    let mut controls = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt(("comparison-controls", side.wire()))
-            .max_rect(controls_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    let _side = ui.label(chrome::section_title(side_label));
+    let _meta = ui.label(
+        egui::RichText::new(comparison_metadata(card))
+            .size(13.0)
+            .strong()
+            .color(chrome::MUTED),
     );
-    controls.set_clip_rect(controls.clip_rect().intersect(controls_rect));
+}
+
+fn comparison_actions(ui: &mut egui::Ui, side: Side, card: &PairCard, actions: &mut Vec<Action>) {
+    if card.remote().is_some() {
+        let (stream, stream_activated) = command_plate(ui, Edict::RejectStream);
+        let stream = stream.on_hover_text("Reject this entire thread");
+        witness::response(ui, Target::RejectStream(side), &stream);
+        if stream_activated {
+            actions.push(Action::RejectStream);
+        }
+        let (reject, reject_activated) = command_plate(ui, Edict::RejectRemote);
+        let reject = reject.on_hover_text("Reject this remote image");
+        witness::response(ui, Target::Reject(side), &reject);
+        if reject_activated {
+            actions.push(Action::RejectRemote);
+        }
+    } else {
+        let hide = duel_plate(ui, "Hide").on_hover_text("Hide from this collection");
+        witness::response(ui, Target::Hide(side), &hide);
+        if hide.clicked() {
+            actions.push(Action::Hide(side));
+        }
+    }
+    let rotate = duel_plate(ui, "Rotate").on_hover_text("Rotate clockwise");
+    witness::response(ui, Target::Rotate(side), &rotate);
+    if rotate.clicked() {
+        actions.push(Action::Rotate(side));
+    }
     let favorite_label = if card.favorite() {
         "Unfavorite"
     } else {
         "Favorite"
     };
-    let favorite =
-        compact_plate(&mut controls, favorite_label).on_hover_text(if card.remote().is_some() {
-            "Promote and mark favorite"
-        } else if card.favorite() {
-            "Withdraw favorite"
-        } else {
-            "Mark favorite"
-        });
-    witness::response(&controls, Target::Favorite(side), &favorite);
+    let favorite = duel_plate(ui, favorite_label).on_hover_text(if card.remote().is_some() {
+        "Promote and mark favorite"
+    } else if card.favorite() {
+        "Withdraw favorite"
+    } else {
+        "Mark favorite"
+    });
+    witness::response(ui, Target::Favorite(side), &favorite);
     if favorite.clicked() {
         actions.push(Action::Favorite(side));
-    }
-    let rotate = compact_plate(&mut controls, "Rotate").on_hover_text("Rotate clockwise");
-    witness::response(&controls, Target::Rotate(side), &rotate);
-    if rotate.clicked() {
-        actions.push(Action::Rotate(side));
-    }
-    if card.remote().is_some() {
-        let (reject, reject_activated) = command_plate(&mut controls, Edict::RejectRemote);
-        let reject = reject.on_hover_text("Reject this remote image");
-        witness::response(&controls, Target::Reject(side), &reject);
-        if reject_activated {
-            actions.push(Action::RejectRemote);
-        }
-        let (stream, stream_activated) = command_plate(&mut controls, Edict::RejectStream);
-        let stream = stream.on_hover_text("Reject this entire thread");
-        witness::response(&controls, Target::RejectStream(side), &stream);
-        if stream_activated {
-            actions.push(Action::RejectStream);
-        }
-    } else {
-        let hide = compact_plate(&mut controls, "Hide").on_hover_text("Hide from this collection");
-        witness::response(&controls, Target::Hide(side), &hide);
-        if hide.clicked() {
-            actions.push(Action::Hide(side));
-        }
     }
 }
 
@@ -1373,8 +1363,9 @@ fn paint_bronze_frame(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32) -> e
 }
 
 fn command_plate(ui: &mut egui::Ui, edict: Edict) -> (egui::Response, bool) {
-    let command =
-        commands::canon().button_with(edict, ui, |button| button.min_size(egui::vec2(38.0, 28.0)));
+    let command = commands::canon().button_with(edict, ui, |button| {
+        button.min_size(egui::vec2(24.0, DUEL_CONTROL_HEIGHT))
+    });
     let activated = command.clicked();
     let response = command.into_response();
     chrome::tension(ui, &response);
@@ -1610,8 +1601,12 @@ fn plate(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     response
 }
 
-fn compact_plate(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let button = egui::Button::new(chrome::section_title(label)).min_size(egui::vec2(38.0, 28.0));
+fn duel_plate(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let text = egui::RichText::new(label)
+        .size(13.0)
+        .strong()
+        .color(chrome::TEXT);
+    let button = egui::Button::new(text).min_size(egui::vec2(24.0, DUEL_CONTROL_HEIGHT));
     let response = ui.add(button);
     chrome::tension(ui, &response);
     response
