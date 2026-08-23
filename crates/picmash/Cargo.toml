@@ -27,7 +27,7 @@ directories = "6.0.0"
 egui = "=0.36.1"
 egui-wgpu = { version = "=0.36.1", default-features = false }
 egui-tester-witness = { version = "0.9.7", optional = true, features = ["egui"] }
-eternalist-apps = "0.9.2"
+eternalist-apps = "0.9.3"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 jxl-oxide = { version = "0.12.5", features = ["image"] }
 md5 = "0.8.0"
