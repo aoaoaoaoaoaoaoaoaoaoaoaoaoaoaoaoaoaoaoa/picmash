@@ -38,8 +38,7 @@ const MIN_IMAGES_PER_ROW: u16 = 1;
 const MAX_IMAGES_PER_ROW: u16 = 12;
 const MIN_TILE_EDGE: f32 = 72.0;
 const TILE_GAP: f32 = 12.0;
-const DUEL_RAIL_HEIGHT: f32 = 48.0;
-const DUEL_RAIL_GAP: f32 = 8.0;
+const DUEL_PANEL_HEIGHT: f32 = 64.0;
 const BRONZE_RIM: f32 = 4.0;
 const WATER: SettingSpec = SettingSpec::new(
     "living_water",
@@ -423,16 +422,12 @@ impl Picmash {
         let left = (pair.pair.left.clone(), pair.left_texture.clone());
         let right = (pair.pair.right.clone(), pair.right_texture.clone());
         let arena = ui.available_rect_before_wrap();
-        let rail = egui::Rect::from_min_max(
-            egui::pos2(
-                arena.left(),
-                (arena.bottom() - DUEL_RAIL_HEIGHT).max(arena.top()),
-            ),
-            arena.max,
-        );
         let image_arena = egui::Rect::from_min_max(
             arena.min,
-            egui::pos2(arena.right(), (rail.top() - DUEL_RAIL_GAP).max(arena.top())),
+            egui::pos2(
+                arena.right(),
+                (arena.bottom() - DUEL_PANEL_HEIGHT).max(arena.top()),
+            ),
         );
         let [left_slot, right_slot] = optimal_pair_partition(
             image_arena,
@@ -440,11 +435,18 @@ impl Picmash {
             right.1.size_vec2(),
             ui.spacing().item_spacing.x,
         );
+        let left_layout = comparison_layout(left_slot, left.1.size_vec2());
+        let right_layout = comparison_layout(right_slot, right.1.size_vec2());
         let _advanced = ui.advance_cursor_after_rect(arena);
         let mut actions = Vec::new();
-        if let Some(action) =
-            comparison_image(ui, &mut self.water, Side::Left, &left.0, &left.1, left_slot)
-        {
+        if let Some(action) = comparison_image(
+            ui,
+            &mut self.water,
+            Side::Left,
+            &left.0,
+            &left.1,
+            left_layout,
+        ) {
             actions.push(action);
         }
         if let Some(action) = comparison_image(
@@ -453,11 +455,17 @@ impl Picmash {
             Side::Right,
             &right.0,
             &right.1,
-            right_slot,
+            right_layout,
         ) {
             actions.push(action);
         }
-        actions.extend(comparison_rail(ui, &left.0, &right.0, rail));
+        actions.extend(comparison_panel(ui, Side::Left, &left.0, left_layout.panel));
+        actions.extend(comparison_panel(
+            ui,
+            Side::Right,
+            &right.0,
+            right_layout.panel,
+        ));
         for action in actions {
             self.apply_action(action);
         }
@@ -1167,25 +1175,44 @@ impl Picmash {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ComparisonLayout {
+    image: egui::Rect,
+    frame: egui::Rect,
+    panel: egui::Rect,
+}
+
+fn comparison_layout(slot: egui::Rect, image_size: egui::Vec2) -> ComparisonLayout {
+    let image = contain(slot.shrink(BRONZE_RIM), image_size);
+    let frame = image.expand(BRONZE_RIM);
+    let panel = egui::Rect::from_min_size(
+        frame.left_bottom(),
+        egui::vec2(frame.width(), DUEL_PANEL_HEIGHT),
+    );
+    ComparisonLayout {
+        image,
+        frame,
+        panel,
+    }
+}
+
 fn comparison_image(
     ui: &egui::Ui,
     water: &mut Surface,
     side: Side,
     card: &PairCard,
     texture: &TextureHandle,
-    slot: egui::Rect,
+    layout: ComparisonLayout,
 ) -> Option<Action> {
-    let image = contain(slot.shrink(BRONZE_RIM), texture.size_vec2());
-    let frame = image.expand(BRONZE_RIM).intersect(slot);
-    paint_bronze_frame(ui, frame, chrome::PAGE);
+    paint_bronze_frame(ui, layout.frame, chrome::PAGE);
     let response = ui.interact(
-        frame,
+        layout.frame,
         ui.make_persistent_id(("comparison-choice", side.wire())),
         egui::Sense::click(),
     );
     ui.painter().image(
         texture.id(),
-        image,
+        layout.image,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
@@ -1195,57 +1222,49 @@ fn comparison_image(
     ));
     witness::response(ui, Target::Choice(side), &response);
     if response.clicked() {
-        water.select(frame);
+        water.select(layout.frame);
         Some(Action::Choose(side))
     } else {
         None
     }
 }
 
-fn comparison_rail(
+fn comparison_panel(
     ui: &mut egui::Ui,
-    left: &PairCard,
-    right: &PairCard,
+    side: Side,
+    card: &PairCard,
     rect: egui::Rect,
 ) -> Vec<Action> {
     let inner = paint_bronze_frame(ui, rect, chrome::CONTROL);
-    let seam = inner.center().x;
-    let left_rect = egui::Rect::from_min_max(inner.min, egui::pos2(seam, inner.bottom()));
-    let right_rect = egui::Rect::from_min_max(egui::pos2(seam, inner.top()), inner.max);
-    let _divider = ui.painter().line_segment(
-        [
-            egui::pos2(seam, inner.top()),
-            egui::pos2(seam, inner.bottom()),
-        ],
-        egui::Stroke::new(1.0, chrome::EDGE),
-    );
     let mut actions = Vec::new();
-    comparison_rail_section(ui, Side::Left, left, left_rect, &mut actions);
-    comparison_rail_section(ui, Side::Right, right, right_rect, &mut actions);
+    comparison_panel_contents(ui, side, card, inner, &mut actions);
     actions
 }
 
-fn comparison_rail_section(
+fn comparison_panel_contents(
     ui: &mut egui::Ui,
     side: Side,
     card: &PairCard,
     rect: egui::Rect,
     actions: &mut Vec<Action>,
 ) {
-    let rect = rect.shrink2(egui::vec2(7.0, 5.0));
+    let rect = rect.shrink2(egui::vec2(4.0, 3.0));
+    let info_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), (rect.top() + 16.0).min(rect.bottom())),
+    );
     let controls_width: f32 = if card.remote().is_some() {
         345.0_f32
     } else {
         215.0_f32
     }
-    .min((rect.width() - 72.0).max(0.0));
+    .min(rect.width());
     let controls_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - controls_width, rect.top()),
+        egui::pos2(
+            rect.right() - controls_width,
+            (rect.bottom() - 30.0).max(info_rect.bottom()),
+        ),
         rect.max,
-    );
-    let info_rect = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2((controls_rect.left() - 6.0).max(rect.left()), rect.bottom()),
     );
     let mut info = ui.new_child(
         egui::UiBuilder::new()
