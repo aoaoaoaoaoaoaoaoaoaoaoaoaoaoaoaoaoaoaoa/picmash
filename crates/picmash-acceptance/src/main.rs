@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, ensure};
 use egui_tester::{
-    AppCommand, Application, Button, Graphics, Key, Network, Probe, Testbed, WindowQuery,
+    AppCommand, Application, Button, Graphics, Key, Modifiers, Network, Probe, Testbed, WindowQuery,
 };
 use image::{ImageFormat, Rgba, RgbaImage};
 use picmash as _;
@@ -200,7 +200,7 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
         let _fresh = probe.wait_fresh(&app, WAIT)?;
     }
     capture(&session, artifacts, "picmash-viewer.png")?;
-    click(&session, &app, &mut probe, Target::ViewerCopy)?;
+    let _copy_key = session.key(Key::Character('c'))?;
     let _copied = probe.wait(&app, WAIT, "image copied", |frame| {
         frame.state.status == "IMAGE COPIED"
     })?;
@@ -288,14 +288,43 @@ recurse = true
         challenger.state.remote_ready == 1,
         "displayed challenger escaped the reservoir bound"
     );
-    let _veto = probe.wait_anchor(&app, &Target::VetoStream(Side::Right).to_string(), WAIT)?;
+    let _stream = probe.wait_anchor(&app, &Target::RejectStream(Side::Right).to_string(), WAIT)?;
+    let _rejected = session.key(Key::Character('x'))?;
+    let _retired = probe.wait(&app, WAIT, "image rejection", |frame| {
+        !frame.state.busy && frame.state.pair_ready && !frame.state.remote_pair
+    })?;
+    let next_ready = probe.wait(&app, STARTUP, "candidate after image rejection", |frame| {
+        !frame.state.busy && frame.state.pair_ready && frame.state.remote_ready == 1
+    })?;
+    if !next_ready.state.remote_pair {
+        click(&session, &app, &mut probe, Target::Choice(Side::Left))?;
+    }
+    let _next = probe.wait(&app, STARTUP, "challenger after image rejection", |frame| {
+        !frame.state.busy && frame.state.remote_pair
+    })?;
+    let _rejected_stream = session.chord(Modifiers::ALT, Key::Character('j'))?;
+    let _stream_retired = probe.wait(&app, WAIT, "stream rejection", |frame| {
+        !frame.state.busy && frame.state.pair_ready && !frame.state.remote_pair
+    })?;
+    let final_ready = probe.wait(&app, STARTUP, "candidate after stream rejection", |frame| {
+        !frame.state.busy && frame.state.pair_ready && frame.state.remote_ready == 1
+    })?;
+    if !final_ready.state.remote_pair {
+        click(&session, &app, &mut probe, Target::Choice(Side::Left))?;
+    }
+    let _final = probe.wait(
+        &app,
+        STARTUP,
+        "challenger after stream rejection",
+        |frame| !frame.state.busy && frame.state.remote_pair,
+    )?;
     for _frame in 0..4 {
         let _fresh = probe.wait_fresh(&app, WAIT)?;
     }
     capture(&session, artifacts, "picmash-remote.png")?;
     click(&session, &app, &mut probe, Target::Choice(Side::Right))?;
     let _advanced = probe.wait(&app, WAIT, "background archive admission", |frame| {
-        !frame.state.busy && !frame.state.remote_pair && frame.state.remote_promoting == 1
+        !frame.state.busy && frame.state.pair_ready && frame.state.remote_promoting == 1
     })?;
     drop(probe);
     drop(session);
@@ -314,7 +343,7 @@ recurse = true
         !frame.state.busy
             && !frame.state.remote_pair
             && frame.state.visible_assets == 4
-            && frame.state.duels == 3
+            && frame.state.duels == 5
             && frame.state.remote_promoting == 0
     })?;
     ensure!(
@@ -383,9 +412,11 @@ fn seed(testbed: &Testbed) -> Result<()> {
         let _written = testbed.write_private(format!("collection/{index}.png"), &bytes)?;
         let _copy = testbed.write_private(format!("collection/{index}-copy.png"), &bytes)?;
     }
-    let _remote = testbed.create_private_dir("remote")?;
-    let remote = fixture(19, (940, 1_180))?;
-    let _written = testbed.write_private("remote/challenger.png", remote)?;
+    for (thread, seed) in [("thread-a", 19), ("thread-b", 23), ("thread-c", 29)] {
+        let _thread = testbed.create_private_dir(format!("remote/{thread}"))?;
+        let remote = fixture(seed, (940, 1_180))?;
+        let _written = testbed.write_private(format!("remote/{thread}/challenger.png"), remote)?;
+    }
     Ok(())
 }
 

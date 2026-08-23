@@ -9,6 +9,9 @@ use eternalist_apps::{
 pub enum Edict {
     ChooseLeft,
     ChooseRight,
+    RejectRemote,
+    RejectStream,
+    CopyViewer,
     OpenCollection,
     Rescan,
     Compare,
@@ -19,6 +22,7 @@ pub enum Edict {
 pub enum Context {
     Compare,
     Browse,
+    Viewer,
 }
 
 const CHOOSE_LEFT: [Shortcut; 1] = [Shortcut::new(
@@ -28,6 +32,14 @@ const CHOOSE_LEFT: [Shortcut; 1] = [Shortcut::new(
 const CHOOSE_RIGHT: [Shortcut; 1] = [Shortcut::new(
     ShortcutModifiers::NONE,
     ShortcutKey::Character('D'),
+)];
+const REJECT_REMOTE: [Shortcut; 1] = [Shortcut::new(
+    ShortcutModifiers::NONE,
+    ShortcutKey::Character('X'),
+)];
+const COPY_VIEWER: [Shortcut; 1] = [Shortcut::new(
+    ShortcutModifiers::NONE,
+    ShortcutKey::Character('C'),
 )];
 const OPEN_COLLECTION: [Shortcut; 1] = [Shortcut::primary('O')];
 const RESCAN: [Shortcut; 1] = [Shortcut::primary('R')];
@@ -40,7 +52,7 @@ const BROWSE: [Shortcut; 1] = [Shortcut::new(
     ShortcutKey::Character('2'),
 )];
 
-const EDICTS: [CommandSpec<Edict, Context>; 6] = [
+const EDICTS: [CommandSpec<Edict, Context>; 9] = [
     CommandSpec::new(
         Edict::ChooseLeft,
         "comparison.choose_left",
@@ -57,6 +69,30 @@ const EDICTS: [CommandSpec<Edict, Context>; 6] = [
     )
     .with_detail("Records the right rendering as preferred and advances the comparison.")
     .with_default_shortcuts(&CHOOSE_RIGHT),
+    CommandSpec::new(
+        Edict::RejectRemote,
+        "comparison.reject_remote",
+        "Reject",
+        CommandScope::Context(Context::Compare),
+    )
+    .with_detail("Rejects the displayed remote image and advances the comparison.")
+    .with_default_shortcuts(&REJECT_REMOTE),
+    CommandSpec::new(
+        Edict::RejectStream,
+        "comparison.reject_stream",
+        "Reject Stream",
+        CommandScope::Context(Context::Compare),
+    )
+    .with_detail("Rejects this remote thread and every candidate it contains.")
+    .with_mnemonic('J'),
+    CommandSpec::new(
+        Edict::CopyViewer,
+        "viewer.copy",
+        "Copy",
+        CommandScope::Context(Context::Viewer),
+    )
+    .with_detail("Copies the full-resolution image to the clipboard.")
+    .with_default_shortcuts(&COPY_VIEWER),
     CommandSpec::new(
         Edict::OpenCollection,
         "collection.open",
@@ -104,12 +140,12 @@ const COMPARISON_GESTURES: [GuideGesture; 4] = [
     ),
     GuideGesture::new(
         "Rotate an image",
-        "Use its clockwise actuator; the corrected presentation persists.",
+        "Use Rotate beneath either image; the corrected presentation persists.",
         &[],
     ),
     GuideGesture::new(
         "Hide an image",
-        "Use its eye actuator to withdraw it from comparisons without deleting its file.",
+        "Use Hide beneath a local image to withdraw it without deleting its file.",
         &[],
     ),
 ];

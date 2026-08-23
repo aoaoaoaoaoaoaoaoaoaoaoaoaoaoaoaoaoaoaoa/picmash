@@ -1,6 +1,6 @@
 use anyhow::Result;
 use brass_poolrooms::{
-    chrome::{self, Checkbox, MechanismSize, Monoglyph, MonoglyphFinish, Symbol},
+    chrome::{self, Checkbox, MechanismSize},
     water::{Domain, Floor, Surface, Wetness},
 };
 use crossbeam_channel::{Receiver, bounded};
@@ -38,6 +38,9 @@ const MIN_IMAGES_PER_ROW: u16 = 1;
 const MAX_IMAGES_PER_ROW: u16 = 12;
 const MIN_TILE_EDGE: f32 = 72.0;
 const TILE_GAP: f32 = 12.0;
+const DUEL_RAIL_HEIGHT: f32 = 48.0;
+const DUEL_RAIL_GAP: f32 = 8.0;
+const BRONZE_RIM: f32 = 4.0;
 const WATER: SettingSpec = SettingSpec::new(
     "living_water",
     "LIVING WATER",
@@ -93,8 +96,9 @@ enum Action {
     Choose(Side),
     Favorite(Side),
     Hide(Side),
+    RejectRemote,
+    RejectStream,
     Rotate(Side),
-    VetoStream(Side),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -419,8 +423,19 @@ impl Picmash {
         let left = (pair.pair.left.clone(), pair.left_texture.clone());
         let right = (pair.pair.right.clone(), pair.right_texture.clone());
         let arena = ui.available_rect_before_wrap();
+        let rail = egui::Rect::from_min_max(
+            egui::pos2(
+                arena.left(),
+                (arena.bottom() - DUEL_RAIL_HEIGHT).max(arena.top()),
+            ),
+            arena.max,
+        );
+        let image_arena = egui::Rect::from_min_max(
+            arena.min,
+            egui::pos2(arena.right(), (rail.top() - DUEL_RAIL_GAP).max(arena.top())),
+        );
         let [left_slot, right_slot] = optimal_pair_partition(
-            arena,
+            image_arena,
             left.1.size_vec2(),
             right.1.size_vec2(),
             ui.spacing().item_spacing.x,
@@ -428,11 +443,11 @@ impl Picmash {
         let _advanced = ui.advance_cursor_after_rect(arena);
         let mut actions = Vec::new();
         if let Some(action) =
-            comparison_card(ui, &mut self.water, Side::Left, &left.0, &left.1, left_slot)
+            comparison_image(ui, &mut self.water, Side::Left, &left.0, &left.1, left_slot)
         {
             actions.push(action);
         }
-        if let Some(action) = comparison_card(
+        if let Some(action) = comparison_image(
             ui,
             &mut self.water,
             Side::Right,
@@ -442,6 +457,7 @@ impl Picmash {
         ) {
             actions.push(action);
         }
+        actions.extend(comparison_rail(ui, &left.0, &right.0, rail));
         for action in actions {
             self.apply_action(action);
         }
@@ -532,6 +548,10 @@ impl Picmash {
     }
 
     fn edict_status(&self, edict: Edict) -> CommandStatus<'static> {
+        let remote = self
+            .pair
+            .as_ref()
+            .is_some_and(|pair| pair.pair.right.remote().is_some());
         match edict {
             Edict::ChooseLeft | Edict::ChooseRight if self.busy || self.pair.is_none() => {
                 CommandStatus::Disabled("no comparison is ready")
@@ -540,8 +560,15 @@ impl Picmash {
                 CommandStatus::Disabled("no collection is ready")
             }
             Edict::OpenCollection if self.busy => CommandStatus::Disabled("Picmash is busy"),
+            Edict::RejectRemote | Edict::RejectStream if !remote => CommandStatus::Hidden,
+            Edict::RejectRemote | Edict::RejectStream if self.busy => {
+                CommandStatus::Disabled("no remote challenger is ready")
+            }
+            Edict::CopyViewer => CommandStatus::Hidden,
             Edict::ChooseLeft
             | Edict::ChooseRight
+            | Edict::RejectRemote
+            | Edict::RejectStream
             | Edict::OpenCollection
             | Edict::Rescan
             | Edict::Compare
@@ -560,6 +587,9 @@ impl Picmash {
         match edict {
             Edict::ChooseLeft => self.apply_action(Action::Choose(Side::Left)),
             Edict::ChooseRight => self.apply_action(Action::Choose(Side::Right)),
+            Edict::RejectRemote => self.apply_action(Action::RejectRemote),
+            Edict::RejectStream => self.apply_action(Action::RejectStream),
+            Edict::CopyViewer => unreachable!("viewer commands are routed by the viewer"),
             Edict::OpenCollection => self.open_collection(ctx),
             Edict::Rescan => self.send(Command::Rescan, true, "SCANNING COLLECTION"),
             Edict::Compare => self.set_mode(Mode::Compare),
@@ -597,10 +627,13 @@ impl Picmash {
                 );
             }
             Action::Hide(side) => self.send(Command::Hide(side), true, "WITHDRAWING IMAGE"),
-            Action::Rotate(side) => self.send(Command::Rotate(side), true, "TURNING IMAGE"),
-            Action::VetoStream(side) => {
-                self.send(Command::VetoStream(side), true, "VETOING REMOTE STREAM");
+            Action::RejectRemote => {
+                self.send(Command::RejectRemote, true, "REJECTING REMOTE IMAGE");
             }
+            Action::RejectStream => {
+                self.send(Command::RejectStream, true, "REJECTING REMOTE STREAM");
+            }
+            Action::Rotate(side) => self.send(Command::Rotate(side), true, "TURNING IMAGE"),
         }
     }
 
@@ -732,7 +765,7 @@ impl Picmash {
                 self.busy = false;
                 self.scan_progress = None;
                 if remote {
-                    "REMOTE CHALLENGER · CHOOSE, HEART, X, OR TX"
+                    "REMOTE CHALLENGER · CHOOSE, FAVORITE, REJECT, OR REJECT STREAM"
                 } else {
                     "CHOOSE THE STRONGER IMAGE"
                 }
@@ -1016,6 +1049,7 @@ impl Picmash {
             |scope| match scope {
                 commands::Context::Compare => "COMPARISON CHAMBER",
                 commands::Context::Browse => "COLLECTION BROWSER",
+                commands::Context::Viewer => "IMAGE VIEWER",
             },
             |edict| self.edict_status(edict),
             idioms,
@@ -1133,142 +1167,199 @@ impl Picmash {
     }
 }
 
-fn comparison_card(
-    ui: &mut egui::Ui,
+fn comparison_image(
+    ui: &egui::Ui,
     water: &mut Surface,
     side: Side,
     card: &PairCard,
     texture: &TextureHandle,
     slot: egui::Rect,
 ) -> Option<Action> {
-    let mut action = None;
-    let rect = contain(slot, texture.size_vec2());
+    let image = contain(slot.shrink(BRONZE_RIM), texture.size_vec2());
+    let frame = image.expand(BRONZE_RIM).intersect(slot);
+    paint_bronze_frame(ui, frame, chrome::PAGE);
     let response = ui.interact(
-        rect,
+        frame,
         ui.make_persistent_id(("comparison-choice", side.wire())),
         egui::Sense::click(),
     );
-    let painter = ui.painter_at(rect);
-    painter.image(
+    ui.painter().image(
         texture.id(),
-        rect,
+        image,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+    let response = response.on_hover_text(card.remote().map_or_else(
+        || file_name(card.path()),
+        |remote| format!("{}\n{}\n{}", remote.title, remote.source, remote.stream),
+    ));
+    witness::response(ui, Target::Choice(side), &response);
+    if response.clicked() {
+        water.select(frame);
+        Some(Action::Choose(side))
+    } else {
+        None
+    }
+}
 
-    let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 34.0));
-    painter.rect_filled(top, 0.0, egui::Color32::from_black_alpha(156));
-    let label = match side {
+fn comparison_rail(
+    ui: &mut egui::Ui,
+    left: &PairCard,
+    right: &PairCard,
+    rect: egui::Rect,
+) -> Vec<Action> {
+    let inner = paint_bronze_frame(ui, rect, chrome::CONTROL);
+    let seam = inner.center().x;
+    let left_rect = egui::Rect::from_min_max(inner.min, egui::pos2(seam, inner.bottom()));
+    let right_rect = egui::Rect::from_min_max(egui::pos2(seam, inner.top()), inner.max);
+    let _divider = ui.painter().line_segment(
+        [
+            egui::pos2(seam, inner.top()),
+            egui::pos2(seam, inner.bottom()),
+        ],
+        egui::Stroke::new(1.0, chrome::EDGE),
+    );
+    let mut actions = Vec::new();
+    comparison_rail_section(ui, Side::Left, left, left_rect, &mut actions);
+    comparison_rail_section(ui, Side::Right, right, right_rect, &mut actions);
+    actions
+}
+
+fn comparison_rail_section(
+    ui: &mut egui::Ui,
+    side: Side,
+    card: &PairCard,
+    rect: egui::Rect,
+    actions: &mut Vec<Action>,
+) {
+    let rect = rect.shrink2(egui::vec2(7.0, 5.0));
+    let controls_width: f32 = if card.remote().is_some() {
+        345.0_f32
+    } else {
+        215.0_f32
+    }
+    .min((rect.width() - 72.0).max(0.0));
+    let controls_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - controls_width, rect.top()),
+        rect.max,
+    );
+    let info_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2((controls_rect.left() - 6.0).max(rect.left()), rect.bottom()),
+    );
+    let mut info = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("comparison-info", side.wire()))
+            .max_rect(info_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    info.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    let side_label = match side {
         Side::Left => "A  LEFT",
         Side::Right => "D  RIGHT",
     };
-    painter.text(
-        top.left_center() + egui::vec2(10.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::new(13.0, egui::FontFamily::Proportional),
-        chrome::HOT,
-    );
-    painter.text(
-        top.right_center() - egui::vec2(10.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        card.remote().map_or_else(
-            || {
-                format!(
-                    "{}×{} · {} DUELS",
-                    card.width(),
-                    card.height(),
-                    card.duel_count().unwrap_or(0)
-                )
-            },
-            |remote| {
-                format!(
-                    "{}×{} · {}",
-                    card.width(),
-                    card.height(),
-                    remote.source.to_uppercase()
-                )
-            },
-        ),
-        egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        chrome::MUTED,
-    );
+    let _side = info.label(chrome::section_title(side_label));
+    let _meta = info.label(chrome::muted(comparison_metadata(card)));
 
-    let controls_rect =
-        egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 48.0), rect.max);
-    painter.rect_filled(controls_rect, 0.0, egui::Color32::from_black_alpha(156));
     let mut controls = ui.new_child(
         egui::UiBuilder::new()
             .id_salt(("comparison-controls", side.wire()))
-            .max_rect(controls_rect.shrink2(egui::vec2(8.0, 6.0)))
+            .max_rect(controls_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     controls.set_clip_rect(controls.clip_rect().intersect(controls_rect));
-    let favorite = Monoglyph::symbol(Symbol::Heart)
-        .finish(if card.favorite() {
-            MonoglyphFinish::Love
-        } else {
-            MonoglyphFinish::BrightCut
-        })
-        .size(MechanismSize::Medium)
-        .show(&mut controls)
-        .on_hover_text(if card.remote().is_some() {
+    let favorite_label = if card.favorite() {
+        "Unfavorite"
+    } else {
+        "Favorite"
+    };
+    let favorite =
+        compact_plate(&mut controls, favorite_label).on_hover_text(if card.remote().is_some() {
             "Promote and mark favorite"
         } else if card.favorite() {
             "Withdraw favorite"
         } else {
             "Mark favorite"
         });
-    water.monoglyph(&favorite);
     witness::response(&controls, Target::Favorite(side), &favorite);
     if favorite.clicked() {
-        action = Some(Action::Favorite(side));
+        actions.push(Action::Favorite(side));
     }
-    let rotate = Monoglyph::new('↻')
-        .size(MechanismSize::Medium)
-        .show(&mut controls)
-        .on_hover_text("Rotate clockwise");
-    water.monoglyph(&rotate);
+    let rotate = compact_plate(&mut controls, "Rotate").on_hover_text("Rotate clockwise");
     witness::response(&controls, Target::Rotate(side), &rotate);
     if rotate.clicked() {
-        action = Some(Action::Rotate(side));
-    }
-    let hide = Monoglyph::symbol(Symbol::Visibility)
-        .finish(MonoglyphFinish::BrightCut)
-        .size(MechanismSize::Medium)
-        .show(&mut controls)
-        .on_hover_text(if card.remote().is_some() {
-            "Reject this remote candidate"
-        } else {
-            "Hide from this collection"
-        });
-    water.monoglyph(&hide);
-    witness::response(&controls, Target::Hide(side), &hide);
-    if hide.clicked() {
-        action = Some(Action::Hide(side));
+        actions.push(Action::Rotate(side));
     }
     if card.remote().is_some() {
-        let veto = compact_plate(&mut controls, "TX").on_hover_text("Reject this entire stream");
-        witness::response(&controls, Target::VetoStream(side), &veto);
-        if veto.clicked() {
-            action = Some(Action::VetoStream(side));
+        let (reject, reject_activated) = command_plate(&mut controls, Edict::RejectRemote);
+        let reject = reject.on_hover_text("Reject this remote image");
+        witness::response(&controls, Target::Reject(side), &reject);
+        if reject_activated {
+            actions.push(Action::RejectRemote);
+        }
+        let (stream, stream_activated) = command_plate(&mut controls, Edict::RejectStream);
+        let stream = stream.on_hover_text("Reject this entire thread");
+        witness::response(&controls, Target::RejectStream(side), &stream);
+        if stream_activated {
+            actions.push(Action::RejectStream);
+        }
+    } else {
+        let hide = compact_plate(&mut controls, "Hide").on_hover_text("Hide from this collection");
+        witness::response(&controls, Target::Hide(side), &hide);
+        if hide.clicked() {
+            actions.push(Action::Hide(side));
         }
     }
+}
 
+fn comparison_metadata(card: &PairCard) -> String {
+    card.remote().map_or_else(
+        || {
+            format!(
+                "{}×{} · {} DUELS",
+                card.width(),
+                card.height(),
+                card.duel_count().unwrap_or(0)
+            )
+        },
+        |remote| {
+            format!(
+                "{} · {} · {}×{}",
+                remote.source,
+                remote.stream,
+                card.width(),
+                card.height()
+            )
+        },
+    )
+}
+
+fn paint_bronze_frame(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32) -> egui::Rect {
+    let inner = rect.shrink(BRONZE_RIM);
+    let _bronze = ui.painter().rect_filled(rect, 1.0, chrome::RAISED);
+    let _outer = ui.painter().rect_stroke(
+        rect,
+        1.0,
+        egui::Stroke::new(1.0, chrome::EDGE_STRONG),
+        egui::StrokeKind::Inside,
+    );
+    let _well = ui.painter().rect_filled(inner, 0.0, fill);
+    let _inner = ui.painter().rect_stroke(
+        inner,
+        0.0,
+        egui::Stroke::new(1.0, chrome::EDGE),
+        egui::StrokeKind::Inside,
+    );
+    inner
+}
+
+fn command_plate(ui: &mut egui::Ui, edict: Edict) -> (egui::Response, bool) {
+    let command =
+        commands::canon().button_with(edict, ui, |button| button.min_size(egui::vec2(38.0, 28.0)));
+    let activated = command.clicked();
+    let response = command.into_response();
     chrome::tension(ui, &response);
-    let response = response.on_hover_text(card.remote().map_or_else(
-        || file_name(card.path()),
-        |remote| format!("{}\n{}\n{}", remote.title, remote.source, remote.stream),
-    ));
-    witness::response(ui, Target::Choice(side), &response);
-    if action.is_none() && response.clicked() {
-        water.select(rect);
-        action = Some(Action::Choose(side));
-    }
-    if ui.rect_contains_pointer(rect) {
-        water.hover(("comparison", side.wire()), rect);
-    }
-    action
+    (response, activated)
 }
 
 fn optimal_pair_partition(
