@@ -21,12 +21,12 @@ use std::{
 };
 
 use crate::{
+    application_paths::ApplicationPaths,
     configuration::{ImportPolicy, Probability, RemoteConfig},
     remote::{
         ArchiveEffect, ArchiveLane, DuelVictor, Effect as RemoteEffect, Prepared, PromotionIntent,
         PromotionJudgment, Reactor, Summary as RemoteSummary,
     },
-    xdg::Lair,
 };
 
 const COMMAND_CAPACITY: usize = 32;
@@ -240,7 +240,7 @@ pub struct Worker {
 impl Worker {
     pub fn spawn(
         ctx: &egui::Context,
-        lair: Lair,
+        paths: ApplicationPaths,
         initial: Option<PathBuf>,
         remote: RemoteConfig,
     ) -> Result<Self> {
@@ -256,7 +256,7 @@ impl Worker {
                     command_rx,
                     event_tx,
                     wake,
-                    lair,
+                    paths,
                     initial,
                     remote,
                     worker_stop,
@@ -300,7 +300,7 @@ impl Drop for Worker {
 
 struct EngineState {
     engine: Engine,
-    lair: Lair,
+    paths: ApplicationPaths,
     stop: Arc<AtomicBool>,
     collection: Option<CollectionId>,
     session: Option<SessionId>,
@@ -352,15 +352,15 @@ fn run(
     commands: Receiver<Command>,
     events: Sender<Event>,
     wake: NativeWake,
-    lair: Lair,
+    paths: ApplicationPaths,
     initial: Option<PathBuf>,
     remote_config: RemoteConfig,
     stop: Arc<AtomicBool>,
 ) {
-    let result = Engine::open(lair.database())
+    let result = Engine::open(paths.database_path())
         .map_err(anyhow::Error::from)
         .and_then(|engine| {
-            let mut remote = Reactor::open(&lair, &remote_config)?;
+            let mut remote = Reactor::open(&paths, &remote_config)?;
             let archive = ArchiveLane::raise()?;
             for intent in remote.take_restored_promotions() {
                 reserve_promotion(&engine, &intent)?;
@@ -368,7 +368,7 @@ fn run(
             }
             Ok(EngineState {
                 engine,
-                lair,
+                paths,
                 stop: Arc::clone(&stop),
                 collection: None,
                 session: None,
@@ -389,7 +389,7 @@ fn run(
             return;
         }
     };
-    let restored = initial.or_else(|| restore_collection(&state.lair.active_collection()));
+    let restored = initial.or_else(|| restore_collection(&state.paths.active_collection_path()));
     match restored {
         Some(root) => conduct(&mut state, &events, &wake, Command::Load(root)),
         None => publish(&events, &wake, Event::NeedCollection),
@@ -486,7 +486,7 @@ fn load_collection(
     let session = state
         .engine
         .start_session(scan.collection_id, CONTEXT_REVISION)?;
-    persist_collection(&state.lair.active_collection(), root)?;
+    persist_collection(&state.paths.active_collection_path(), root)?;
     state.collection = Some(scan.collection_id);
     state.session = Some(session.id);
     state.prompt = None;

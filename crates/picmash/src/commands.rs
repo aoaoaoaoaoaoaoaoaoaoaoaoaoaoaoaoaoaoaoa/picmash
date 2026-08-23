@@ -170,8 +170,8 @@ const COLLECTION_GESTURES: [GuideGesture; 3] = [
 const COMPARISON: GuideSection = GuideSection::new("COMPARISON", &COMPARISON_GESTURES);
 const COLLECTION: GuideSection = GuideSection::new("COLLECTION", &COLLECTION_GESTURES);
 
-pub const COMPARE_GUIDE: [GuideSection; 2] = [COMPARISON, COLLECTION];
-pub const BROWSE_GUIDE: [GuideSection; 1] = [COLLECTION];
+pub const COMPARE_GUIDE_GROUPS: [GuideSection; 2] = [COMPARISON, COLLECTION];
+pub const BROWSE_GUIDE_GROUPS: [GuideSection; 1] = [COLLECTION];
 
 pub fn canon() -> &'static CommandCanon<Edict, Context> {
     static CANON: OnceLock<CommandCanon<Edict, Context>> = OnceLock::new();

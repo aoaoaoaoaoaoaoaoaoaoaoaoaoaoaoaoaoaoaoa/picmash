@@ -1,6 +1,7 @@
 //! Picmash's native Poolrooms graft.
 
 mod app;
+mod application_paths;
 mod commands;
 mod configuration;
 mod host;
@@ -8,7 +9,6 @@ mod remote;
 mod viewer;
 mod witness;
 mod worker;
-mod xdg;
 
 /// Run the native application.
 pub fn run() -> anyhow::Result<()> {
@@ -31,8 +31,8 @@ pub fn run() -> anyhow::Result<()> {
             if arguments.next().is_some() {
                 anyhow::bail!("usage: picmash --import-legacy DATABASE");
             }
-            let lair = xdg::Lair::claim()?;
-            let engine = picmash_engine::Engine::open(lair.database())?;
+            let paths = application_paths::ApplicationPaths::claim()?;
+            let engine = picmash_engine::Engine::open(paths.database_path())?;
             let report = engine.import_legacy(source)?;
             println!(
                 "imported {} assets and {} observations ({} ambiguous){}",

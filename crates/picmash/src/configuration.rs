@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use eternalist_apps::configuration::Configuration;
+use eternalist_apps::configuration::Configuration as ConfigurationContract;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CATALOG_THREADS: u16 = 24;
@@ -12,13 +12,13 @@ const DEFAULT_THREAD_FETCHES: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Config {
+pub struct Configuration {
     pub living_water: bool,
     pub images_per_row: u16,
     pub remote: RemoteConfig,
 }
 
-impl Config {
+impl Configuration {
     pub fn legacy_fallback(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Ok(Self::default());
@@ -44,7 +44,7 @@ impl Config {
     }
 }
 
-impl Default for Config {
+impl Default for Configuration {
     fn default() -> Self {
         Self {
             living_water: true,
@@ -54,7 +54,7 @@ impl Default for Config {
     }
 }
 
-impl Configuration for Config {
+impl ConfigurationContract for Configuration {
     fn validate(&self) -> std::result::Result<(), String> {
         if !(1..=12).contains(&self.images_per_row) {
             return Err("images_per_row must lie between 1 and 12".to_owned());
@@ -596,7 +596,7 @@ recurse = true
 "#,
         )?;
 
-        let migrated = Config::legacy_fallback(legacy.path())?;
+        let migrated = Configuration::legacy_fallback(legacy.path())?;
 
         assert!(migrated.remote.enabled);
         assert_eq!(migrated.remote.sample_probability, Probability::new(1_000));
