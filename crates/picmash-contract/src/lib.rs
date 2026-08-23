@@ -3,7 +3,7 @@
 use std::{borrow::Cow, fmt};
 
 /// Native UI contract revision.
-pub const UI_FINGERPRINT: &str = "picmash.ui/4";
+pub const UI_FINGERPRINT: &str = "picmash.ui/5";
 
 /// One member of the active comparison.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -65,23 +65,25 @@ impl Target {
     #[must_use]
     pub fn wire(&self) -> Cow<'static, str> {
         match self {
-            Self::OpenCollection => Cow::Borrowed("collection.open"),
-            Self::Rescan => Cow::Borrowed("collection.rescan"),
-            Self::CompareMode => Cow::Borrowed("mode.compare"),
-            Self::BrowseMode => Cow::Borrowed("mode.browse"),
-            Self::Choice(side) => Cow::Owned(format!("comparison.choice/{}", side.wire())),
-            Self::Favorite(side) => Cow::Owned(format!("comparison.favorite/{}", side.wire())),
-            Self::Hide(side) => Cow::Owned(format!("comparison.hide/{}", side.wire())),
-            Self::Reject(side) => Cow::Owned(format!("comparison.reject/{}", side.wire())),
-            Self::Rotate(side) => Cow::Owned(format!("comparison.rotate/{}", side.wire())),
-            Self::RejectStream(side) => {
-                Cow::Owned(format!("comparison.reject_stream/{}", side.wire()))
+            Self::OpenCollection => Cow::Borrowed("picmash.collection.open"),
+            Self::Rescan => Cow::Borrowed("picmash.collection.rescan"),
+            Self::CompareMode => Cow::Borrowed("picmash.mode.compare"),
+            Self::BrowseMode => Cow::Borrowed("picmash.mode.browse"),
+            Self::Choice(side) => Cow::Owned(format!("picmash.comparison.choice/{}", side.wire())),
+            Self::Favorite(side) => {
+                Cow::Owned(format!("picmash.comparison.favorite/{}", side.wire()))
             }
-            Self::Browser => Cow::Borrowed("collection.browser"),
-            Self::BrowseTile => Cow::Borrowed("collection.browser/tile"),
-            Self::Viewer => Cow::Borrowed("collection.viewer"),
-            Self::ViewerCopy => Cow::Borrowed("collection.viewer/copy"),
-            Self::ViewerClose => Cow::Borrowed("collection.viewer/close"),
+            Self::Hide(side) => Cow::Owned(format!("picmash.comparison.hide/{}", side.wire())),
+            Self::Reject(side) => Cow::Owned(format!("picmash.comparison.reject/{}", side.wire())),
+            Self::Rotate(side) => Cow::Owned(format!("picmash.comparison.rotate/{}", side.wire())),
+            Self::RejectStream(side) => {
+                Cow::Owned(format!("picmash.comparison.reject-stream/{}", side.wire()))
+            }
+            Self::Browser => Cow::Borrowed("picmash.collection.browser"),
+            Self::BrowseTile => Cow::Borrowed("picmash.collection.browser.tile"),
+            Self::Viewer => Cow::Borrowed("picmash.collection.viewer"),
+            Self::ViewerCopy => Cow::Borrowed("picmash.collection.viewer.copy"),
+            Self::ViewerClose => Cow::Borrowed("picmash.collection.viewer.close"),
         }
     }
 }

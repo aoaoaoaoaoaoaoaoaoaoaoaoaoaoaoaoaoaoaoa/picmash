@@ -2,7 +2,7 @@ use picmash_contract::Target;
 
 #[cfg(feature = "egui-test")]
 pub fn response(ui: &egui::Ui, target: Target, response: &egui::Response) {
-    egui_tester_witness::egui::record(ui, target.to_string(), response.rect);
+    egui_tester_witness::egui::record_response(ui, target.to_string(), response);
 }
 
 #[cfg(not(feature = "egui-test"))]

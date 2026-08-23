@@ -23,13 +23,13 @@ use std::{
 };
 
 use crate::{
+    application_paths::ApplicationPaths,
     commands::{self, Edict},
-    configuration::{Config, Probability, ReservoirCapacity},
+    configuration::{Configuration, Probability, ReservoirCapacity},
     remote::Summary as RemoteSummary,
     viewer::{Action as ViewerAction, Viewer},
     witness,
     worker::{Blade, Card, Command, Event, Pair, PairCard, Summary, Worker},
-    xdg::Lair,
 };
 
 const EVENT_DRAIN: usize = 24;
@@ -130,22 +130,23 @@ pub struct Picmash {
     panels: PanelNavigator,
     guide: CommandGuide,
     settings: SettingsSheet,
-    configuration: ConfigurationLedger<Config>,
+    configuration: ConfigurationLedger<Configuration>,
     living_wait: LivingWait,
     water: Surface,
 }
 
 impl Picmash {
     pub fn open(ctx: &egui::Context, initial: Option<PathBuf>) -> Result<Self> {
-        let lair = Lair::claim()?;
-        let fallback = Config::legacy_fallback(&lair.legacy_configuration())?;
-        let configuration: ConfigurationLedger<Config> = ConfigurationLedger::raise_with_fallback(
-            "picmash-configuration",
-            ctx,
-            lair.configuration(),
-            CONFIG_SETTLE,
-            fallback,
-        )?;
+        let paths = ApplicationPaths::claim()?;
+        let fallback = Configuration::legacy_fallback(&paths.legacy_configuration_path())?;
+        let configuration: ConfigurationLedger<Configuration> =
+            ConfigurationLedger::raise_with_fallback(
+                "picmash-configuration",
+                ctx,
+                paths.configuration_path(),
+                CONFIG_SETTLE,
+                fallback,
+            )?;
         let wetness = if configuration.live().living_water {
             Wetness::Wet
         } else {
@@ -155,7 +156,7 @@ impl Picmash {
             .live()
             .images_per_row
             .clamp(MIN_IMAGES_PER_ROW, MAX_IMAGES_PER_ROW);
-        let worker = Worker::spawn(ctx, lair, initial, configuration.live().remote.clone())?;
+        let worker = Worker::spawn(ctx, paths, initial, configuration.live().remote.clone())?;
         Ok(Self {
             worker,
             chooser: None,
@@ -1047,9 +1048,9 @@ impl Picmash {
 
     fn command_guide(&mut self, ctx: &egui::Context) {
         let context = self.mode.context();
-        let idioms = match self.mode {
-            Mode::Compare => &commands::COMPARE_GUIDE[..],
-            Mode::Browse => &commands::BROWSE_GUIDE[..],
+        let guide_groups = match self.mode {
+            Mode::Compare => &commands::COMPARE_GUIDE_GROUPS[..],
+            Mode::Browse => &commands::BROWSE_GUIDE_GROUPS[..],
         };
         let mut guide = std::mem::take(&mut self.guide);
         guide.show(
@@ -1062,7 +1063,7 @@ impl Picmash {
                 commands::Context::Viewer => "IMAGE VIEWER",
             },
             |edict| self.edict_status(edict),
-            idioms,
+            guide_groups,
         );
         self.guide = guide;
     }
@@ -1074,10 +1075,14 @@ impl Picmash {
         let mut remote_reservoir =
             f64::from(self.configuration.live().remote.reservoir_capacity.get());
         let fault = self.configuration.fault().map(ToString::to_string);
-        let file = fault.as_deref().map_or_else(
-            || SettingsFile::ready(self.configuration.path()),
-            |fault| SettingsFile::fault(self.configuration.path(), fault),
-        );
+        let file = fault
+            .as_deref()
+            .map_or_else(
+                || SettingsFile::ready(self.configuration.path()),
+                |fault| SettingsFile::fault(self.configuration.path(), fault),
+            )
+            .reloading(self.configuration.reload_pending())
+            .reloadable(self.configuration.fault().is_some() || self.configuration.settled());
         let response = self.settings.show(ctx, &mut self.water, file, |settings| {
             settings.section("PRESENTATION");
             let _water = settings.boolean(WATER, &mut living_water);

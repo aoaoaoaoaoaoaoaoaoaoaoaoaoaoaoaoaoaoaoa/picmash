@@ -16,7 +16,7 @@ use super::{
     CatalogIntent, Epoch, FetchIntent, FetchSettlement, Harvest, Harvester, Machine, Moment,
     Prepared, PromotionIntent, PromotionJudgment, RemoteItemId, RemoteStore, Summary,
 };
-use crate::{configuration::RemoteConfig, xdg::Lair};
+use crate::{application_paths::ApplicationPaths, configuration::RemoteConfig};
 
 const EFFECT_CAPACITY: usize = 2;
 const DORMANT_WAIT: Duration = Duration::from_hours(24);
@@ -49,11 +49,11 @@ pub struct Reactor {
 }
 
 impl Reactor {
-    pub fn open(lair: &Lair, config: &RemoteConfig) -> Result<Self> {
+    pub fn open(paths: &ApplicationPaths, config: &RemoteConfig) -> Result<Self> {
         let born = Instant::now();
-        let cache = lair.remote_cache();
+        let cache = paths.remote_cache_dir();
         let harvester = Arc::new(Harvester::new(cache.clone())?);
-        let store = RemoteStore::open(&lair.remote_database(), cache)?;
+        let store = RemoteStore::open(&paths.remote_database_path(), cache)?;
         let mut machine = Machine::new(config, Epoch::INITIAL, Moment::ZERO)?;
         let restored_promotions = restore(&mut machine, &store, config)?;
         let (completion_tx, completions) = bounded(EFFECT_CAPACITY);
