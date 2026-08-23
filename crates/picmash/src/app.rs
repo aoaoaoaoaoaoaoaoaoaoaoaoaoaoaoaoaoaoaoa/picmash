@@ -40,6 +40,7 @@ const MIN_TILE_EDGE: f32 = 72.0;
 const TILE_GAP: f32 = 12.0;
 const DUEL_CONTROL_HEIGHT: f32 = MechanismSize::Small.side();
 const DUEL_PANEL_HEIGHT: f32 = DUEL_CONTROL_HEIGHT + 8.0;
+const DUEL_PANEL_BLEED: f32 = 2.0;
 const BRONZE_RIM: f32 = 4.0;
 const WATER: SettingSpec = SettingSpec::new(
     "living_water",
@@ -427,7 +428,7 @@ impl Picmash {
             arena.min,
             egui::pos2(
                 arena.right(),
-                (arena.bottom() - DUEL_PANEL_HEIGHT).max(arena.top()),
+                (arena.bottom() - DUEL_PANEL_HEIGHT - DUEL_PANEL_BLEED).max(arena.top()),
             ),
         );
         let [left_slot, right_slot] = optimal_pair_partition(
@@ -1184,7 +1185,7 @@ struct ComparisonLayout {
 }
 
 fn comparison_layout(slot: egui::Rect, image_size: egui::Vec2) -> ComparisonLayout {
-    let image = contain(slot.shrink(BRONZE_RIM), image_size);
+    let image = contain_top_centered(slot.shrink(BRONZE_RIM), image_size);
     let frame = image.expand(BRONZE_RIM);
     let panel = egui::Rect::from_min_size(
         frame.left_bottom(),
@@ -1242,7 +1243,6 @@ fn comparison_panel(
             .id_salt(("comparison-panel", side.wire()))
             .max_rect(rect),
     );
-    panel.set_clip_rect(panel.clip_rect().intersect(rect));
     let _rail = egui::Frame::new()
         .fill(chrome::RAISED)
         .stroke(egui::Stroke::new(1.0, chrome::EDGE))
@@ -1586,10 +1586,14 @@ fn cover_uv(arena: egui::Vec2, image: egui::Vec2) -> egui::Rect {
     }
 }
 
-fn contain(arena: egui::Rect, image: egui::Vec2) -> egui::Rect {
+fn contain_top_centered(arena: egui::Rect, image: egui::Vec2) -> egui::Rect {
     let image = image.max(egui::Vec2::splat(1.0));
     let scale = (arena.width() / image.x).min(arena.height() / image.y);
-    egui::Rect::from_center_size(arena.center(), image * scale)
+    let size = image * scale;
+    egui::Rect::from_min_size(
+        egui::pos2(arena.center().x - size.x * 0.5, arena.top()),
+        size,
+    )
 }
 
 fn plate(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
