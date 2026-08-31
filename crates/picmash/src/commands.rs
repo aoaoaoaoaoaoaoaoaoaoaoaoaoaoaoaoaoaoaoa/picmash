@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use eternalist_apps::{
-    command_guide::{GuideGesture, GuideSection},
+    command_guide::{GuideGesture, GuideGroup},
     commands::{CommandCanon, CommandScope, CommandSpec, Shortcut, ShortcutKey, ShortcutModifiers},
 };
 
@@ -167,11 +167,11 @@ const COLLECTION_GESTURES: [GuideGesture; 3] = [
     ),
 ];
 
-const COMPARISON: GuideSection = GuideSection::new("COMPARISON", &COMPARISON_GESTURES);
-const COLLECTION: GuideSection = GuideSection::new("COLLECTION", &COLLECTION_GESTURES);
+const COMPARISON: GuideGroup = GuideGroup::new("COMPARISON", &COMPARISON_GESTURES);
+const COLLECTION: GuideGroup = GuideGroup::new("COLLECTION", &COLLECTION_GESTURES);
 
-pub const COMPARE_GUIDE_GROUPS: [GuideSection; 2] = [COMPARISON, COLLECTION];
-pub const BROWSE_GUIDE_GROUPS: [GuideSection; 1] = [COLLECTION];
+pub const COMPARE_GUIDE_GROUPS: [GuideGroup; 2] = [COMPARISON, COLLECTION];
+pub const BROWSE_GUIDE_GROUPS: [GuideGroup; 1] = [COLLECTION];
 
 pub fn canon() -> &'static CommandCanon<Edict, Context> {
     static CANON: OnceLock<CommandCanon<Edict, Context>> = OnceLock::new();

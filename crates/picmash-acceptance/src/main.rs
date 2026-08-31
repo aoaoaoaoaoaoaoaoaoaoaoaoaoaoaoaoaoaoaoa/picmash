@@ -133,6 +133,12 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
     let _settings = probe.wait(&app, WAIT, "application settings", |frame| {
         frame.state.settings_open
     })?;
+    let font_scale = probe.wait_anchor(&app, "eternalist.settings.entry/font_scale", WAIT)?;
+    let (x, y) = font_scale.center();
+    let _large = session.click(x, y, Button::Primary)?;
+    let _large_frame = probe.wait_fresh(&app, WAIT)?;
+    let _extra_large = session.key(Key::End)?;
+    let _extra_large_frame = probe.wait_fresh(&app, WAIT)?;
     let _escape = session.key(Key::Escape)?;
     let _settings_closed = probe.wait(&app, WAIT, "closed settings", |frame| {
         !frame.state.settings_open

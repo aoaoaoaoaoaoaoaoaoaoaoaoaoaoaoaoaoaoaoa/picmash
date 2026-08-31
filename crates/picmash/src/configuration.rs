@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use brass_poolrooms::chrome::FontScale;
 use eternalist_apps::configuration::Configuration as ConfigurationContract;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,7 @@ const DEFAULT_THREAD_FETCHES: u8 = 2;
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Configuration {
+    pub font_scale: FontScale,
     pub living_water: bool,
     pub images_per_row: u16,
     pub remote: RemoteConfig,
@@ -47,6 +49,7 @@ impl Configuration {
 impl Default for Configuration {
     fn default() -> Self {
         Self {
+            font_scale: FontScale::Standard,
             living_water: true,
             images_per_row: 5,
             remote: RemoteConfig::default(),

@@ -1,0 +1,7 @@
+disallowed-methods = [
+  { path = "egui::FontId::monospace", reason = "use a Poolrooms TypeRole or chrome::spatial_font so accessibility scaling precedes layout" },
+  { path = "egui::FontId::new", reason = "use a Poolrooms TypeRole or chrome::spatial_font so accessibility scaling precedes layout" },
+  { path = "egui::FontId::proportional", reason = "use a Poolrooms TypeRole or chrome::spatial_font so accessibility scaling precedes layout" },
+  { path = "egui::RichText::size", reason = "use a Poolrooms TypeRole so accessibility scaling precedes layout" },
+  { path = "egui::RichText::small", reason = "use a Poolrooms TypeRole so accessibility scaling precedes layout" },
+]
