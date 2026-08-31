@@ -258,7 +258,7 @@ impl Viewer {
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         text,
-                        egui::FontId::new(13.0, egui::FontFamily::Monospace),
+                        chrome::spatial_font(ui.ctx(), 13.0, egui::FontFamily::Monospace),
                         if self.fault.is_some() {
                             chrome::HOT
                         } else {
@@ -301,7 +301,12 @@ fn viewer_bar(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let _row = ui.horizontal(|ui| {
-                let _name = ui.label(chrome::section_title(file_name(card)).size(13.0));
+                let _name = ui.label(
+                    chrome::TypeRole::Label
+                        .text(file_name(card))
+                        .strong()
+                        .color(chrome::HOT),
+                );
                 let score = card.preference_score.map_or_else(
                     || "UNRANKED".to_owned(),
                     |score| format!("PREF {score:+.2}"),

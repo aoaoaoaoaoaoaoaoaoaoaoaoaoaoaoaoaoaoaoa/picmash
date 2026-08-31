@@ -147,6 +147,7 @@ impl Picmash {
                 CONFIG_SETTLE,
                 fallback,
             )?;
+        chrome::set_font_scale(ctx, configuration.live().font_scale);
         let wetness = if configuration.live().living_water {
             Wetness::Wet
         } else {
@@ -187,6 +188,7 @@ impl Picmash {
 
     pub fn pulse(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        chrome::set_font_scale(&ctx, self.configuration.live().font_scale);
         self.absorb_chooser(&ctx);
         self.drain(&ctx);
         self.poll_viewer_copy(&ctx);
@@ -264,16 +266,24 @@ impl Picmash {
         ui.add_space(6.0);
         let mut panels = navigator.frame(ui.ctx());
 
-        let collection = panels.section(ui, "collection", "COLLECTION", true, |ui| {
+        let collection = panels.panel(ui, "collection", "COLLECTION", true, |ui| {
             let root = self
                 .summary
                 .as_ref()
                 .map(|summary| &summary.root)
                 .or(self.pending_collection.as_ref());
             if let Some(root) = root {
-                let _root =
-                    ui.label(chrome::section_title(file_name(root).to_uppercase()).size(12.0));
-                let _path = ui.label(chrome::muted(root.display().to_string()).size(11.0));
+                let _root = ui.label(
+                    chrome::TypeRole::Label
+                        .text(file_name(root).to_uppercase())
+                        .strong()
+                        .color(chrome::HOT),
+                );
+                let _path = ui.label(
+                    chrome::TypeRole::Label
+                        .text(root.display().to_string())
+                        .color(chrome::MUTED),
+                );
                 ui.add_space(5.0);
             } else {
                 let _none = ui.label(chrome::muted("NO COLLECTION CLAIMED"));
@@ -292,7 +302,7 @@ impl Picmash {
         });
         self.water.fold(collection.wake);
 
-        let mode = panels.section(ui, "chamber", "CHAMBER", true, |ui| {
+        let mode = panels.panel(ui, "chamber", "CHAMBER", true, |ui| {
             let compare = plate(ui, "01  COMPARE", self.mode == Mode::Compare);
             witness::response(ui, Target::CompareMode, &compare);
             if compare.clicked() {
@@ -307,7 +317,7 @@ impl Picmash {
         self.water.fold(mode.wake);
 
         if self.mode == Mode::Browse {
-            let view = panels.section(ui, "view", "VIEW", true, |ui| {
+            let view = panels.panel(ui, "view", "VIEW", true, |ui| {
                 let before = self.favorites_only;
                 let filter = Checkbox::new(&mut self.favorites_only, "FAVORITES ONLY")
                     .size(MechanismSize::Small)
@@ -320,7 +330,7 @@ impl Picmash {
             self.water.fold(view.wake);
         }
 
-        let status = panels.section(ui, "status", "STATUS", true, |ui| {
+        let status = panels.panel(ui, "status", "STATUS", true, |ui| {
             if let Some(summary) = &self.summary {
                 datum(ui, "VISIBLE", summary.visible_assets.to_string());
                 datum(ui, "DUELS", duel_total(&self.cards).to_string());
@@ -1070,6 +1080,7 @@ impl Picmash {
 
     fn show_settings(&mut self, ctx: &egui::Context) {
         let mut living_water = self.configuration.live().living_water;
+        let mut font_scale = self.configuration.live().font_scale;
         let mut remote_enabled = self.configuration.live().remote.enabled;
         let mut remote_chance = self.configuration.live().remote.sample_probability.ratio();
         let mut remote_reservoir =
@@ -1084,9 +1095,11 @@ impl Picmash {
             .reloading(self.configuration.reload_pending())
             .reloadable(self.configuration.fault().is_some() || self.configuration.settled());
         let response = self.settings.show(ctx, &mut self.water, file, |settings| {
-            settings.section("PRESENTATION");
+            settings.group("APPEARANCE");
+            let _font_scale = settings.font_scale(&mut font_scale);
+            settings.group("PRESENTATION");
             let _water = settings.boolean(WATER, &mut living_water);
-            settings.section("ACQUISITION");
+            settings.group("ACQUISITION");
             let _enabled = settings.boolean(REMOTE, &mut remote_enabled);
             let _chance = settings.number(REMOTE_CHANCE, &mut remote_chance, 0.0..=1.0, 0.05, 2);
             let _reservoir =
@@ -1096,7 +1109,11 @@ impl Picmash {
             || remote_chance != self.configuration.live().remote.sample_probability.ratio()
             || remote_reservoir
                 != f64::from(self.configuration.live().remote.reservoir_capacity.get());
-        if living_water != self.configuration.live().living_water || remote_changed {
+        let font_scale_changed = font_scale != self.configuration.live().font_scale;
+        if font_scale_changed
+            || living_water != self.configuration.live().living_water
+            || remote_changed
+        {
             let remote = Probability::try_from(remote_chance).and_then(|probability| {
                 Ok((
                     probability,
@@ -1106,12 +1123,18 @@ impl Picmash {
             match remote {
                 Ok((probability, reservoir)) => {
                     match self.configuration.revise(|config| {
+                        config.font_scale = font_scale;
                         config.living_water = living_water;
                         config.remote.enabled = remote_enabled;
                         config.remote.sample_probability = probability;
                         config.remote.reservoir_capacity = reservoir;
                     }) {
-                        Ok(true) => self.adopt_configuration(),
+                        Ok(true) => {
+                            if font_scale_changed {
+                                chrome::set_font_scale(ctx, font_scale);
+                            }
+                            self.adopt_configuration();
+                        }
                         Ok(false) => {}
                         Err(error) => self.status = format!("FAULT · {error:#}"),
                     }
@@ -1275,8 +1298,8 @@ fn comparison_identity(ui: &mut egui::Ui, side: Side, card: &PairCard) {
     };
     let _side = ui.label(chrome::section_title(side_label));
     let _meta = ui.label(
-        egui::RichText::new(comparison_metadata(card))
-            .size(13.0)
+        chrome::TypeRole::Label
+            .text(comparison_metadata(card))
             .strong()
             .color(chrome::MUTED),
     );
@@ -1438,7 +1461,7 @@ fn browse_tile(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "DEVELOPING",
-            egui::FontId::proportional(12.0),
+            chrome::spatial_font(ui.ctx(), 12.0, egui::FontFamily::Proportional),
             chrome::MUTED,
         );
     }
@@ -1479,7 +1502,7 @@ fn paint_tile_badge(
     color: egui::Color32,
     corner: BadgeCorner,
 ) {
-    let font = egui::FontId::new(13.0, egui::FontFamily::Monospace);
+    let font = chrome::spatial_font(ui.ctx(), 13.0, egui::FontFamily::Monospace);
     let galley = ui.painter().layout_no_wrap(text, font, color);
     let size = galley.size() + egui::vec2(12.0, 6.0);
     let (minimum, radius) = match corner {
@@ -1518,14 +1541,14 @@ fn paint_browse_metadata(ui: &egui::Ui, tile: egui::Rect, card: &Card) {
         rect.left_top() + egui::vec2(8.0, 7.0),
         egui::Align2::LEFT_TOP,
         format!("{score} · {} DUELS{copies}", card.duel_count),
-        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+        chrome::spatial_font(ui.ctx(), 11.0, egui::FontFamily::Monospace),
         chrome::TEXT,
     );
     painter.text(
         rect.left_bottom() + egui::vec2(8.0, -7.0),
         egui::Align2::LEFT_BOTTOM,
         file_name(&card.path),
-        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+        chrome::spatial_font(ui.ctx(), 11.0, egui::FontFamily::Monospace),
         chrome::MUTED,
     );
 }
@@ -1611,8 +1634,8 @@ fn plate(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
 }
 
 fn duel_plate(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let text = egui::RichText::new(label)
-        .size(13.0)
+    let text = chrome::TypeRole::Label
+        .text(label)
         .strong()
         .color(chrome::TEXT);
     let button = egui::Button::new(text).min_size(egui::vec2(24.0, DUEL_CONTROL_HEIGHT));
