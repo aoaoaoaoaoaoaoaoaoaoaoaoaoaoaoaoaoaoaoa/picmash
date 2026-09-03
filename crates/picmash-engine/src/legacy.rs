@@ -137,6 +137,15 @@ impl Engine {
         let (imported_observations, ambiguous_observations) =
             import_events(&tx, &dump, &collections, &assets, &fingerprint, now)?;
         let imported_assets = assets.values().collect::<BTreeSet<_>>().len();
+        let imported_assets_sql = i64::try_from(imported_assets).map_err(|_| {
+            Fault::Corrupt("legacy asset count exceeds the database range".to_owned())
+        })?;
+        let imported_observations_sql = i64::try_from(imported_observations).map_err(|_| {
+            Fault::Corrupt("legacy observation count exceeds the database range".to_owned())
+        })?;
+        let ambiguous_observations_sql = i64::try_from(ambiguous_observations).map_err(|_| {
+            Fault::Corrupt("ambiguous observation count exceeds the database range".to_owned())
+        })?;
         tx.execute(
             "INSERT INTO pm_legacy_imports(
                  source_fingerprint, source_path, imported_at_ns,
@@ -146,9 +155,9 @@ impl Engine {
                 fingerprint,
                 encode_path(&source),
                 now,
-                imported_assets,
-                imported_observations,
-                ambiguous_observations,
+                imported_assets_sql,
+                imported_observations_sql,
+                ambiguous_observations_sql,
             ],
         )?;
         tx.commit()?;

@@ -537,8 +537,10 @@ impl Engine {
                      AND o.present = 1
                )",
             [collection_id.get()],
-            |row| row.get::<_, usize>(0),
+            |row| row.get::<_, i64>(0),
         )?;
+        let visible_assets = usize::try_from(visible_assets)
+            .map_err(|_| Fault::Corrupt("invalid visible asset count".to_owned()))?;
         tx.commit()?;
         Ok(ScanReport {
             collection_id,
@@ -604,6 +606,8 @@ fn upsert_candidate(
     candidate: &Candidate,
     now: i64,
 ) -> Result<(bool, AssetId)> {
+    let byte_len = i64::try_from(candidate.identity.byte_len)
+        .map_err(|_| Fault::Corrupt("asset byte length exceeds the database range".to_owned()))?;
     let existing = tx
         .query_row(
             "SELECT asset_id, blob_digest, width, height, byte_len, present
@@ -645,7 +649,7 @@ fn upsert_candidate(
             || old.1 != candidate.identity.blob.as_str()
             || old.2 != i64::from(candidate.identity.width)
             || old.3 != i64::from(candidate.identity.height)
-            || old.4 != i64::try_from(candidate.identity.byte_len).unwrap_or(i64::MAX)
+            || old.4 != byte_len
             || !old.5
     });
     tx.execute(
@@ -669,7 +673,7 @@ fn upsert_candidate(
             candidate.identity.blob.as_str(),
             candidate.identity.width,
             candidate.identity.height,
-            candidate.identity.byte_len,
+            byte_len,
             generation,
             candidate.seal.as_bytes(),
         ],

@@ -17,7 +17,7 @@ macro_rules! text_id {
         impl $name {
             #[must_use]
             pub fn fresh() -> Self {
-                Self(Ulid::new().to_string())
+                Self(Ulid::generate().to_string())
             }
 
             pub fn parse(value: impl Into<String>) -> Result<Self, InvalidId> {
