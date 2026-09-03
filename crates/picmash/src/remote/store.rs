@@ -610,6 +610,10 @@ fn prune_retired(connection: &Connection) -> Result<()> {
 }
 
 fn upsert_discovery(tx: &Transaction<'_>, discovery: &Discovery, now: i64) -> Result<()> {
+    let byte_len = i64::try_from(discovery.byte_len)
+        .context("remote byte length exceeds the database range")?;
+    let max_pixels = i64::try_from(discovery.max_pixels)
+        .context("remote pixel limit exceeds the database range")?;
     let (origin_kind, origin, origin_seal, expected_md5) = match &discovery.origin {
         Origin::Network { url, expected_md5 } => (
             "network",
@@ -645,8 +649,8 @@ fn upsert_discovery(tx: &Transaction<'_>, discovery: &Discovery, now: i64) -> Re
             discovery.extension,
             discovery.width,
             discovery.height,
-            discovery.byte_len,
-            discovery.max_pixels,
+            byte_len,
+            max_pixels,
             now,
         ],
     )?;
@@ -678,8 +682,8 @@ struct PersistedItem {
     extension: String,
     width: u32,
     height: u32,
-    byte_len: u64,
-    max_pixels: u64,
+    byte_len: i64,
+    max_pixels: i64,
     state: String,
     cache_path: Option<Vec<u8>>,
     payload_digest: Option<String>,
@@ -733,8 +737,10 @@ impl PersistedItem {
             extension: self.extension.clone(),
             width: self.width,
             height: self.height,
-            byte_len: self.byte_len,
-            max_pixels: self.max_pixels,
+            byte_len: u64::try_from(self.byte_len)
+                .context("persisted remote byte length is negative")?,
+            max_pixels: u64::try_from(self.max_pixels)
+                .context("persisted remote pixel limit is negative")?,
         })
     }
 

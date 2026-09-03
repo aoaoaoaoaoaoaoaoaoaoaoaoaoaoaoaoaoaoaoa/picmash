@@ -436,7 +436,7 @@ fn contains_jxl(root: &Path) -> Result<bool> {
             continue;
         }
         if std::fs::read_dir(source)?.any(|entry| {
-            entry.ok().is_some_and(|entry| {
+            entry.is_ok_and(|entry| {
                 entry
                     .path()
                     .extension()

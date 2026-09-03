@@ -355,10 +355,10 @@ fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Resu
         params![
             a_path.to_string_lossy().as_ref(),
             a_identity.blob.as_str().trim_start_matches("blake3:"),
-            a_identity.byte_len,
+            i64::try_from(a_identity.byte_len)?,
             b_path.to_string_lossy().as_ref(),
             b_identity.blob.as_str().trim_start_matches("blake3:"),
-            b_identity.byte_len,
+            i64::try_from(b_identity.byte_len)?,
         ],
     )?;
     connection.execute_batch(
