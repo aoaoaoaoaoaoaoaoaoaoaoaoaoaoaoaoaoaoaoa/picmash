@@ -15,7 +15,8 @@ rayon = "1"
 rusqlite = { version = "0.40", features = ["bundled", "time"] }
 thiserror = "2"
 time = "0.3"
-turbojpeg = { version = "1", features = ["image", "pkg-config"] }
+# SIMD wherever an assembler exists; hosted runners build the portable path.
+turbojpeg = { version = "1", default-features = false, features = ["image", "cmake", "pkg-config"] }
 ulid = "3"
 walkdir = "2"
 
