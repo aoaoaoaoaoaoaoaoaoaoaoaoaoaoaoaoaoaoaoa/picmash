@@ -1,0 +1,67 @@
+schema = 1
+
+[product]
+name = "Picmash"
+package = "picmash"
+binary = "picmash"
+identifier = "moe.eternalist.picmash"
+profile = "platform-bound"
+
+[coordinates]
+release-tested = ["linux-x86_64"]
+
+[delivery]
+linux = "github-archive"
+
+[[exclusions]]
+coordinate = "macos-aarch64"
+reason = "Picmash is proved only on Linux/X11; other coordinates carry no claim yet."
+
+[[exclusions]]
+coordinate = "macos-x86_64"
+reason = "Picmash is proved only on Linux/X11; other coordinates carry no claim yet."
+
+[[exclusions]]
+coordinate = "windows-x86_64"
+reason = "Picmash is proved only on Linux/X11; other coordinates carry no claim yet."
+
+[[proofs]]
+name = "source"
+laws = ["source"]
+run = ["./check.py"]
+timeout-minutes = 45
+
+[[proofs]]
+name = "security"
+laws = ["security"]
+run = ["scripts/audit"]
+timeout-minutes = 15
+
+[[proofs]]
+name = "host"
+laws = ["host"]
+run = ["cargo", "test", "--locked", "--workspace", "--all-targets", "--all-features"]
+coordinates = ["linux-x86_64"]
+timeout-minutes = 45
+
+[[proofs]]
+name = "runtime"
+laws = ["lifecycle"]
+run = ["scripts/prove-runtime"]
+coordinates = ["linux-x86_64"]
+timeout-minutes = 45
+
+[[proofs]]
+name = "native-acceptance"
+laws = ["native-acceptance"]
+run = ["scripts/test-acceptance"]
+coordinates = ["linux-x86_64"]
+setup = "x11"
+timeout-minutes = 60
+
+[[proofs]]
+name = "artifact-linux"
+laws = ["artifact"]
+run = ["scripts/package-archive"]
+coordinates = ["linux-x86_64"]
+timeout-minutes = 15

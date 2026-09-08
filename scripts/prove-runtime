@@ -1,0 +1,17 @@
+#!/bin/sh
+# Install lifecycle: an ordinary consumer install into a private prefix, a
+# version smoke, and a removal that leaves nothing behind.
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cell=$(mktemp -d "${TMPDIR:-/tmp}/picmash-lifecycle.XXXXXX")
+trap 'rm -rf -- "$cell"' EXIT HUP INT TERM
+cd "$root"
+
+cargo install --force --locked --path crates/picmash --root "$cell/prefix"
+binary=$cell/prefix/bin/picmash
+test -x "$binary"
+"$binary" --version >/dev/null
+cargo uninstall --root "$cell/prefix" picmash
+test ! -e "$binary"
+printf 'Picmash lifecycle passed\n'
