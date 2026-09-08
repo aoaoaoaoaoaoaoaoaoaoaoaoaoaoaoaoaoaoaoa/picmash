@@ -1,14 +1,16 @@
 use anyhow::Result;
-use eternalist_apps::{NativeApp, WindowSpec};
+use eternalist_apps::{NativeApp, ProductIdentity, WindowSpec};
 use std::{path::PathBuf, time::Instant};
 
-use crate::app::Picmash;
+use crate::{app::Picmash, application_paths::PRODUCT};
 
 pub fn run(ctx: egui::Context, collection: Option<PathBuf>) -> Result<()> {
     eternalist_apps::run_with(ctx, move |ctx| Picmash::open(ctx, collection))
 }
 
 impl NativeApp for Picmash {
+    const PRODUCT: ProductIdentity = PRODUCT;
+    const RELEASE: &'static str = env!("CARGO_PKG_VERSION");
     const WINDOW: WindowSpec = WindowSpec::new("picmash", [1_420.0, 900.0]);
 
     fn draw(&mut self, ui: &mut egui::Ui) {
@@ -23,10 +25,6 @@ impl NativeApp for Picmash {
         self.service_configuration(now)
     }
 
-    fn after_present(&mut self) -> bool {
-        false
-    }
-
     fn water(
         &mut self,
         ctx: &egui::Context,
@@ -34,13 +32,6 @@ impl NativeApp for Picmash {
         tooltip_rects: &[egui::Rect],
     ) -> brass_poolrooms::water::Frame {
         self.water_frame(ctx, pixels_per_point, tooltip_rects)
-    }
-
-    fn register_gpu(
-        _renderer: &mut egui_wgpu::Renderer,
-        _device: &egui_wgpu::wgpu::Device,
-        _format: egui_wgpu::wgpu::TextureFormat,
-    ) {
     }
 
     #[cfg(feature = "egui-test")]

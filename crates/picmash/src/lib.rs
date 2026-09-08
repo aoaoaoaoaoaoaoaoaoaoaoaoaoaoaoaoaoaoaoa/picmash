@@ -2,6 +2,7 @@
 
 mod app;
 mod application_paths;
+use application_paths::PicmashPaths as _;
 mod commands;
 mod configuration;
 mod host;
@@ -31,7 +32,7 @@ pub fn run() -> anyhow::Result<()> {
             if arguments.next().is_some() {
                 anyhow::bail!("usage: picmash --import-legacy DATABASE");
             }
-            let paths = application_paths::ApplicationPaths::claim()?;
+            let paths = application_paths::claim()?;
             let engine = picmash_engine::Engine::open(paths.database_path())?;
             let report = engine.import_legacy(source)?;
             println!(

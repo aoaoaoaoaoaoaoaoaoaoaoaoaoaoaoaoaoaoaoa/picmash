@@ -23,7 +23,7 @@ use std::{
 };
 
 use crate::{
-    application_paths::ApplicationPaths,
+    application_paths::{self, PicmashPaths as _},
     commands::{self, Edict},
     configuration::{Configuration, Probability, ReservoirCapacity},
     remote::Summary as RemoteSummary,
@@ -137,7 +137,7 @@ pub struct Picmash {
 
 impl Picmash {
     pub fn open(ctx: &egui::Context, initial: Option<PathBuf>) -> Result<Self> {
-        let paths = ApplicationPaths::claim()?;
+        let paths = application_paths::claim()?;
         let fallback = Configuration::legacy_fallback(&paths.legacy_configuration_path())?;
         let configuration: ConfigurationLedger<Configuration> =
             ConfigurationLedger::raise_with_fallback(
@@ -1096,7 +1096,7 @@ impl Picmash {
             .reloadable(self.configuration.fault().is_some() || self.configuration.settled());
         let response = self.settings.show(ctx, &mut self.water, file, |settings| {
             settings.group("APPEARANCE");
-            let _font_scale = settings.font_scale(&mut font_scale);
+            let _font_scale = settings.font_size(&mut font_scale);
             settings.group("PRESENTATION");
             let _water = settings.boolean(WATER, &mut living_water);
             settings.group("ACQUISITION");

@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SOURCE_LINE_LIMIT = 2_500
 COMMANDS = (
+    ("scripts/cells",),
     ("cargo", "fmt", "--all", "--check"),
     (
         "cargo",
