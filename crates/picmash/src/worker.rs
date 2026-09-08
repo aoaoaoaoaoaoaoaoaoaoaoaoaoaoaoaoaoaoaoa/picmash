@@ -21,7 +21,7 @@ use std::{
 };
 
 use crate::{
-    application_paths::ApplicationPaths,
+    application_paths::{ApplicationPaths, PicmashPaths as _},
     configuration::{ImportPolicy, Probability, RemoteConfig},
     remote::{
         ArchiveEffect, ArchiveLane, DuelVictor, Effect as RemoteEffect, Prepared, PromotionIntent,

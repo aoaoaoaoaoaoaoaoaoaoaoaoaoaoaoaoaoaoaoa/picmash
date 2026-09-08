@@ -16,7 +16,10 @@ use super::{
     CatalogIntent, Epoch, FetchIntent, FetchSettlement, Harvest, Harvester, Machine, Moment,
     Prepared, PromotionIntent, PromotionJudgment, RemoteItemId, RemoteStore, Summary,
 };
-use crate::{application_paths::ApplicationPaths, configuration::RemoteConfig};
+use crate::{
+    application_paths::{ApplicationPaths, PicmashPaths as _},
+    configuration::RemoteConfig,
+};
 
 const EFFECT_CAPACITY: usize = 2;
 const DORMANT_WAIT: Duration = Duration::from_hours(24);

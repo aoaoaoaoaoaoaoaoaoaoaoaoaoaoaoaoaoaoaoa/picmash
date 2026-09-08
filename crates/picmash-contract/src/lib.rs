@@ -2,6 +2,10 @@
 
 use std::{borrow::Cow, fmt};
 
+/// Reverse-DNS product identifier; the sole source of Picmash's platform identity.
+pub const PRODUCT_IDENTIFIER: &str = "moe.eternalist.picmash";
+/// Product display name.
+pub const PRODUCT_NAME: &str = "Picmash";
 /// Native UI contract revision.
 pub const UI_FINGERPRINT: &str = "picmash.ui/5";
 
