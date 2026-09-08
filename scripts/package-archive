@@ -1,0 +1,12 @@
+#!/bin/sh
+# Source archive of the exact release commit, the Linux delivery form.
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+out=${FOUNDRY_ARTIFACT_DIR:-$root/dist}
+version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+test -n "$version"
+mkdir -p "$out"
+git archive --format=tar.gz --prefix="picmash-$version/" -o "$out/picmash-$version.tar.gz" HEAD
+printf 'archived picmash-%s\n' "$version"
