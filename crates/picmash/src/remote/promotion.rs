@@ -27,7 +27,9 @@ use super::{Prepared, slug, validate_payload_dimensions};
 
 pub(super) const ARCHIVE_CAPACITY: usize = 8;
 const CANCELLATION_POLL: Duration = Duration::from_millis(250);
-const ENCODER_EFFORT: &str = "10";
+/// Tortoise: the highest effort every `cjxl` accepts. Glacier (10) needs
+/// libjxl 0.10 and buys about a percent of lossless size over it.
+const ENCODER_EFFORT: &str = "9";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PromotionJudgment {
