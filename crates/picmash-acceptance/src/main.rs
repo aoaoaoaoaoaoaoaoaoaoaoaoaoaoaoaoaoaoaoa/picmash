@@ -329,9 +329,15 @@ recurse = true
     }
     capture(&session, artifacts, "picmash-remote.png")?;
     click(&session, &app, &mut probe, Target::Choice(Side::Right))?;
-    let _advanced = probe.wait(&app, WAIT, "background archive admission", |frame| {
-        !frame.state.busy && frame.state.pair_ready && frame.state.remote_promoting == 1
+    let advanced = probe.wait(&app, WAIT, "background archive admission", |frame| {
+        frame.state.status.starts_with("FAULT")
+            || (!frame.state.busy && frame.state.pair_ready && frame.state.remote_promoting == 1)
     })?;
+    ensure!(
+        !advanced.state.status.starts_with("FAULT"),
+        "admission faulted: {}",
+        advanced.state.status
+    );
     drop(probe);
     drop(session);
     app.terminate()?;
@@ -346,11 +352,12 @@ recurse = true
     let mut probe: Probe<Observation> = app.witness()?.typed();
     let _presented = probe.wait_surface_presented(&app, STARTUP)?;
     let promoted = probe.wait(&app, STARTUP, "promoted remote challenger", |frame| {
-        !frame.state.busy
-            && !frame.state.remote_pair
-            && frame.state.visible_assets == 4
-            && frame.state.duels == 5
-            && frame.state.remote_promoting == 0
+        frame.state.status.starts_with("FAULT")
+            || (!frame.state.busy
+                && !frame.state.remote_pair
+                && frame.state.visible_assets == 4
+                && frame.state.duels == 5
+                && frame.state.remote_promoting == 0)
     })?;
     ensure!(
         !promoted.state.status.starts_with("FAULT"),

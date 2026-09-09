@@ -57,6 +57,7 @@ laws = ["native-acceptance"]
 run = ["scripts/test-acceptance"]
 coordinates = ["linux-x86_64"]
 setup = "x11"
+packages = ["libjxl-tools"]
 timeout-minutes = 60
 
 [[proofs]]
