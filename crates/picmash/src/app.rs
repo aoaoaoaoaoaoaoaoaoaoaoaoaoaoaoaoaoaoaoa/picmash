@@ -1094,17 +1094,20 @@ impl Picmash {
             )
             .reloading(self.configuration.reload_pending())
             .reloadable(self.configuration.fault().is_some() || self.configuration.settled());
-        let response = self.settings.show(ctx, &mut self.water, Some(file), |settings| {
-            settings.group("APPEARANCE");
-            let _font_scale = settings.font_size(&mut font_scale);
-            settings.group("PRESENTATION");
-            let _water = settings.boolean(WATER, &mut living_water);
-            settings.group("ACQUISITION");
-            let _enabled = settings.boolean(REMOTE, &mut remote_enabled);
-            let _chance = settings.number(REMOTE_CHANCE, &mut remote_chance, 0.0..=1.0, 0.05, 2);
-            let _reservoir =
-                settings.number(REMOTE_RESERVOIR, &mut remote_reservoir, 1.0..=8.0, 1.0, 0);
-        });
+        let response = self
+            .settings
+            .show(ctx, &mut self.water, Some(file), |settings| {
+                settings.group("APPEARANCE");
+                let _font_scale = settings.font_size(&mut font_scale);
+                settings.group("PRESENTATION");
+                let _water = settings.boolean(WATER, &mut living_water);
+                settings.group("ACQUISITION");
+                let _enabled = settings.boolean(REMOTE, &mut remote_enabled);
+                let _chance =
+                    settings.number(REMOTE_CHANCE, &mut remote_chance, 0.0..=1.0, 0.05, 2);
+                let _reservoir =
+                    settings.number(REMOTE_RESERVOIR, &mut remote_reservoir, 1.0..=8.0, 1.0, 0);
+            });
         let remote_changed = remote_enabled != self.configuration.live().remote.enabled
             || remote_chance != self.configuration.live().remote.sample_probability.ratio()
             || remote_reservoir
