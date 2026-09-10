@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 autobins = false
 description = "Native local-image preference chamber"
+publish = false
 
 [[bin]]
 name = "picmash"
