@@ -1,11 +1,11 @@
 use anyhow::Result;
-use eternalist_apps::{NativeApp, ProductIdentity, WindowSpec};
+use eternalist_apps::{Ingress, NativeApp, ProductIdentity, WindowSpec};
 use std::{path::PathBuf, time::Instant};
 
 use crate::{app::Picmash, application_paths::PRODUCT};
 
-pub fn run(ctx: egui::Context, collection: Option<PathBuf>) -> Result<()> {
-    eternalist_apps::run_with(ctx, move |ctx| Picmash::open(ctx, collection))
+pub fn run(ingress: Ingress, ctx: egui::Context, collection: Option<PathBuf>) -> Result<()> {
+    eternalist_apps::run_with(ingress, ctx, move |ctx, _ingress| Picmash::open(ctx, collection))
 }
 
 impl NativeApp for Picmash {

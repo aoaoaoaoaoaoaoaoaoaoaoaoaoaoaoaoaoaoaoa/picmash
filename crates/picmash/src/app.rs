@@ -1094,7 +1094,7 @@ impl Picmash {
             )
             .reloading(self.configuration.reload_pending())
             .reloadable(self.configuration.fault().is_some() || self.configuration.settled());
-        let response = self.settings.show(ctx, &mut self.water, file, |settings| {
+        let response = self.settings.show(ctx, &mut self.water, Some(file), |settings| {
             settings.group("APPEARANCE");
             let _font_scale = settings.font_size(&mut font_scale);
             settings.group("PRESENTATION");
