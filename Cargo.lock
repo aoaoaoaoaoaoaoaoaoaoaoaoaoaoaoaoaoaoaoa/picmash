@@ -250,15 +250,15 @@ dependencies = [
 
 [[package]]
 name = "brass_foundry"
-version = "0.15.1"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9b6368bcd1e053590563a6ade45222765fd27f161924b86f995a8df0c69782f"
+checksum = "3be978aa990e317d084c0bac9d8e5a15fa49e5e9c607d9d34055cda4db168e06"
 
 [[package]]
 name = "brass_poolrooms"
-version = "0.15.1"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9d79bf5dddf07c9cea6532cb0ca6444e5b370d839c01aa3dab5fbf77edd6081"
+checksum = "e90e29a8819b64378ef4d4e4ff7cca9229eb44acea6167fc916011a27855e12e"
 dependencies = [
  "anyhow",
  "brass_foundry",
@@ -731,9 +731,9 @@ dependencies = [
 
 [[package]]
 name = "egui-tester"
-version = "0.9.11"
+version = "0.9.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "121dbe905b31f1c700d1d01180c4cf8575a6a9a60e616c2a4ba79636b340db82"
+checksum = "555f7e7d0e1010a0b7f36d4e87e65bc887d90f46a567e44124d9a915798074eb"
 dependencies = [
  "bitflags 2.13.1",
  "egui-tester-witness",
@@ -751,9 +751,9 @@ dependencies = [
 
 [[package]]
 name = "egui-tester-witness"
-version = "0.9.11"
+version = "0.9.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0e743fa619cf681083deae183d3635c3f2535bb498e86bc691239f069806cf2"
+checksum = "b84f04deb42f1941dcbd0e47138318a4fa7937176b696169159fda61765159f2"
 dependencies = [
  "egui",
  "rustix 1.1.4",
@@ -872,9 +872,9 @@ checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 
 [[package]]
 name = "eternalist-apps"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e415a2cf55984a4fb500ad3fb9a693bab3b1545437b71d1b437f0d589e59f7e4"
+checksum = "b574b279d1835a0bb4f2ac66a656c29d8509b04d754e86c08bba878d25e0308c"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -885,6 +885,8 @@ dependencies = [
  "egui-tester-witness",
  "egui-wgpu",
  "egui-winit",
+ "jni",
+ "ndk",
  "pollster 1.0.1",
  "serde",
  "serde_ignored",
@@ -2895,6 +2897,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ring"
+version = "0.17.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "getrandom 0.2.17",
+ "libc",
+ "untrusted",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2968,12 +2984,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls"
+version = "0.23.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
+dependencies = [
+ "log",
+ "once_cell",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted",
 ]
 
 [[package]]
@@ -3304,6 +3346,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
@@ -3659,6 +3707,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "untrusted"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
 name = "ureq"
 version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3669,10 +3723,12 @@ dependencies = [
  "log",
  "native-tls",
  "percent-encoding",
+ "rustls",
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
  "webpki-root-certs",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4027,6 +4083,15 @@ name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

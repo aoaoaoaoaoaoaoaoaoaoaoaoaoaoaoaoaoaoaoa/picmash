@@ -56,5 +56,5 @@ pub fn run() -> anyhow::Result<()> {
     }
     let ctx = egui::Context::default();
     brass_poolrooms::chrome::install(&ctx);
-    host::run(ctx, collection)
+    host::run(eternalist_apps::Ingress::Desktop, ctx, collection)
 }
