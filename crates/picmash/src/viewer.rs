@@ -147,7 +147,7 @@ impl Viewer {
     }
 
     pub fn begin_copy(&mut self, ctx: &egui::Context) -> Result<bool> {
-        let Some(blade) = self.source.as_ref().filter(|_| self.copy.is_none()) else {
+        let Some(blade) = self.source.as_ref() else {
             return Ok(false);
         };
         let image = RgbaImage::new(blade.width, blade.height, blade.rgba.clone())?;
