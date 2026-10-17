@@ -18,14 +18,13 @@ egui-test = ["eternalist-apps/egui-test"]
 
 [dependencies]
 anyhow = "1.0.104"
-arboard = "3.6.1"
 atomic-write-file = "0.3.1"
 base64 = "0.23.1"
 blake3 = "1.8.7"
-brass_poolrooms = "0.16.1"
+brass_poolrooms = "0.16.2"
 crossbeam-channel = "0.5.16"
 egui = { version = "=0.36.1", default-features = false }
-eternalist-apps = "0.13.0"
+eternalist-apps = "0.13.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 jxl-oxide = { version = "0.12.6", features = ["image"] }
 md5 = "0.8.1"
@@ -46,5 +45,5 @@ wait-timeout = "0.2.1"
 workspace = true
 
 [dev-dependencies]
-brass_poolrooms = { version = "0.16.1", features = ["glyph-audit"] }
+brass_poolrooms = { version = "0.16.2", features = ["glyph-audit"] }
 proptest = "1.11.0"

@@ -244,7 +244,7 @@ impl Picmash {
         chrome::set_font_scale(&ctx, self.configuration.live().font_scale);
         self.absorb_chooser(&ctx);
         self.drain(&ctx);
-        self.poll_viewer_copy(&ctx);
+        self.poll_viewer_copy();
         if self.configuration.absorb() {
             self.adopt_configuration();
         }
@@ -1246,7 +1246,7 @@ impl Picmash {
                 self.water.close_pond();
             }
             ViewerAction::Copy => {
-                let result = self.viewer.as_mut().map(Viewer::begin_copy);
+                let result = self.viewer.as_mut().map(|viewer| viewer.begin_copy(ctx));
                 match result {
                     Some(Ok(true)) => "COPYING IMAGE".clone_into(&mut self.status),
                     Some(Ok(false)) => {}
@@ -1277,11 +1277,8 @@ impl Picmash {
         }
     }
 
-    fn poll_viewer_copy(&mut self, ctx: &egui::Context) {
-        let result = self
-            .viewer
-            .as_mut()
-            .and_then(|viewer| viewer.poll_copy(ctx));
+    fn poll_viewer_copy(&mut self) {
+        let result = self.viewer.as_mut().and_then(Viewer::poll_copy);
         match result {
             Some(Ok(())) => "IMAGE COPIED".clone_into(&mut self.status),
             Some(Err(error)) => self.status = format!("COPY FAULT · {error:#}"),

@@ -1,15 +1,16 @@
-use anyhow::{Context as _, Result, anyhow};
-use arboard::{Clipboard, ImageData};
+use anyhow::Result;
 use brass_poolrooms::{
     chrome::{self, MechanismSize, Monoglyph, MonoglyphFinish, Symbol},
     water::Surface,
 };
-use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use egui::{ColorImage, TextureHandle, TextureOptions};
-use eternalist_apps::commands::{CommandDispatch, CommandStatus};
+use eternalist_apps::{
+    NativeWake,
+    clipboard::{RgbaImage, Seizure},
+    commands::{CommandDispatch, CommandStatus},
+};
 use picmash_contract::Target;
 use picmash_engine::{AssetId, SourceId, StreamId};
-use std::{borrow::Cow, thread};
 
 use crate::{
     commands::{self, Edict},
@@ -49,7 +50,7 @@ pub struct Viewer {
     loading: bool,
     fault: Option<String>,
     gate: Gate,
-    copy: Option<Receiver<Result<()>>>,
+    copy: Option<Seizure>,
 }
 
 impl Viewer {
@@ -145,47 +146,21 @@ impl Viewer {
         true
     }
 
-    pub fn begin_copy(&mut self) -> Result<bool> {
-        let Some(blade) = self.source.clone().filter(|_| self.copy.is_none()) else {
+    pub fn begin_copy(&mut self, ctx: &egui::Context) -> Result<bool> {
+        let Some(blade) = self.source.as_ref().filter(|_| self.copy.is_none()) else {
             return Ok(false);
         };
-        let (send, receive) = bounded(1);
-        thread::Builder::new()
-            .name("picmash-clipboard".to_owned())
-            .spawn(move || {
-                let result =
-                    Clipboard::new()
-                        .context("open clipboard")
-                        .and_then(|mut clipboard| {
-                            clipboard
-                                .set_image(ImageData {
-                                    width: blade.width,
-                                    height: blade.height,
-                                    bytes: Cow::Owned(blade.rgba),
-                                })
-                                .context("copy image")
-                        });
-                let _sent = send.send(result);
-            })
-            .context("spawn clipboard worker")?;
-        self.copy = Some(receive);
+        let image = RgbaImage::new(blade.width, blade.height, blade.rgba.clone())?;
+        self.copy = Some(Seizure::image(image, NativeWake::from_context(ctx)));
         Ok(true)
     }
 
-    pub fn poll_copy(&mut self, ctx: &egui::Context) -> Option<Result<()>> {
-        let receive = self.copy.as_ref()?;
-        match receive.try_recv() {
-            Ok(result) => {
-                self.copy = None;
-                Some(result)
-            }
-            Err(TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(24));
+    pub fn poll_copy(&mut self) -> Option<Result<()>> {
+        match self.copy.take()?.try_settle() {
+            Ok(seized) => Some(seized),
+            Err(pending) => {
+                self.copy = Some(pending);
                 None
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.copy = None;
-                Some(Err(anyhow!("clipboard worker stopped without a result")))
             }
         }
     }
