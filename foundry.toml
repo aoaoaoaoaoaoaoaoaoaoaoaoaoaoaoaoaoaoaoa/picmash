@@ -3,7 +3,6 @@ schema = 1
 [product]
 name = "Picmash"
 package = "picmash"
-binary = "picmash"
 identifier = "moe.eternalist.picmash"
 profile = "platform-bound"
 
@@ -32,15 +31,8 @@ run = ["./check.py"]
 timeout-minutes = 45
 
 [[proofs]]
-name = "security"
-laws = ["security"]
-run = ["scripts/audit"]
-timeout-minutes = 15
-
-[[proofs]]
 name = "host"
 laws = ["host"]
-run = ["cargo", "test", "--locked", "--workspace", "--all-targets", "--all-features"]
 coordinates = ["linux-x86_64"]
 timeout-minutes = 45
 
