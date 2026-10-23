@@ -6,7 +6,6 @@ use anyhow::{Context as _, Result, ensure};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::{
-    env,
     ffi::OsStr,
     fmt::Write as _,
     fs,
@@ -68,7 +67,7 @@ impl Specimen {
     pub fn gather() -> Result<Self> {
         let Manifest { photograph } =
             toml::from_str(MANIFEST).context("parse specimen manifest")?;
-        let cache = cache_root()?.join("picmash-acceptance/specimen");
+        let cache = egui_demo::specimen_cache("picmash")?.join("specimen");
         fs::create_dir_all(&cache).with_context(|| format!("create {}", cache.display()))?;
         let mut agent = None;
         let photographs = photograph
@@ -152,14 +151,6 @@ fn evict(cache: &Path, photographs: &[Photograph]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn cache_root() -> Result<PathBuf> {
-    env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|root| root.is_absolute())
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .context("neither an absolute XDG_CACHE_HOME nor HOME names a cache root")
 }
 
 /// An agent that asks only for the formats seals cover: image CDNs negotiate

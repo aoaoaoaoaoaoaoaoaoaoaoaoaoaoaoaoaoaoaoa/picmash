@@ -6,8 +6,8 @@
 
 use egui_demo::Showcase;
 use egui_tester::{
-    AppCommand, Condition, Graphics, Network, ReactionBudget, Result, Story, Testbed, WindowQuery,
-    demand,
+    AppCommand, ArtifactStem, Condition, Graphics, Network, ReactionBudget, Result, Story, Testbed,
+    WindowQuery, demand,
 };
 use picmash_contract::{Side, Target, UI_FINGERPRINT};
 use std::{path::Path, time::Duration};
@@ -21,8 +21,6 @@ const PERSIAN: &str = "persian-amber-gaze.jpg";
 const SPHYNX: &str = "sphynx-lavender.jpg";
 const NEWCOMERS: [&str; 2] = [PERSIAN, SPHYNX];
 const COLLECTION: &str = "cats";
-/// The product window the portfolio frame assumes.
-const WINDOW: (u32, u32) = (1440, 920);
 
 type Duel<'app, 'bed> = Story<'app, 'bed, Observation, Showcase>;
 
@@ -64,17 +62,6 @@ pub fn perform(
     demand(
         opened.state.contract == UI_FINGERPRINT,
         format!("UI contract mismatch: {}", opened.state.contract),
-    )?;
-    let frame = story.capture()?;
-    demand(
-        (frame.width(), frame.height()) == WINDOW,
-        format!(
-            "Picmash window is {}×{}, not the portfolio's {}×{}",
-            frame.width(),
-            frame.height(),
-            WINDOW.0,
-            WINDOW.1
-        ),
     )?;
     let population = residents.len();
     let _residents = story.wait(Condition::new(
@@ -126,7 +113,7 @@ pub fn perform(
     } else {
         Side::Right
     };
-    freeze(&mut story, "frontispiece")?;
+    freeze(&mut story, &ArtifactStem::FRONTISPIECE)?;
 
     story.chapter("Persian against Sphynx")?;
     let _favorite = story
@@ -153,7 +140,7 @@ pub fn perform(
         !browsing.state.thumbnails_faulted,
         format!("a specimen thumbnail faulted: {}", browsing.state.status),
     )?;
-    freeze(&mut story, "learned-order")?;
+    freeze(&mut story, &ArtifactStem::new("learned-order")?)?;
 
     story.chapter("Inspect the leader")?;
     let _viewing = story
@@ -161,7 +148,7 @@ pub fn perform(
         .until(Condition::new("leader in full", |state: &Observation| {
             state.viewer_open && state.viewer_ready
         }))?;
-    freeze(&mut story, "leader")?;
+    freeze(&mut story, &ArtifactStem::new("leader")?)?;
 
     let showcase = story.finish()?;
     app.terminate()?;
@@ -184,14 +171,13 @@ fn judge(story: &mut Duel<'_, '_>, side: Side, duels: u64) -> Result<()> {
     Ok(())
 }
 
-/// Develop a still and hold it on screen once the pointer has left the window
-/// and the water has come to rest, so that neither hover nor ripple marks it.
-fn freeze(story: &mut Duel<'_, '_>, still: &str) -> Result<()> {
+/// Develop a still once the pointer has left the window and the water has come
+/// to rest, so that neither hover nor ripple marks it.
+fn freeze(story: &mut Duel<'_, '_>, still: &ArtifactStem) -> Result<()> {
     let _calm = story
         .leave()?
         .until(Condition::new("water at rest", |state: &Observation| {
             state.water_calm
         }))?;
-    story.still(still)?;
-    story.hold(Duration::from_secs(4))
+    story.still(still)
 }

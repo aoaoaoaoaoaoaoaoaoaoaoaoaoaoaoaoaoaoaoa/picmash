@@ -4,8 +4,8 @@ mod specimen;
 use anyhow::{Context as _, bail, ensure};
 use egui_demo::Showcase;
 use egui_tester::{
-    AppCommand, Application, Button, Error, Graphics, Key, Modifiers, Network, Probe, Result,
-    Testbed, WindowQuery, demand,
+    AppCommand, Application, ArtifactStem, Button, Error, Graphics, Key, Modifiers, Network, Probe,
+    Result, Testbed, WindowQuery, demand,
 };
 use image::{ImageFormat, Rgba, RgbaImage};
 use picmash as _;
@@ -139,7 +139,7 @@ impl Take {
     fn showcase(&self) -> Result<Showcase> {
         match self {
             Self::Stills(directory) => Showcase::stills(directory),
-            Self::Film(directory) => Showcase::film(directory, FILM),
+            Self::Film(directory) => Showcase::film(directory, &ArtifactStem::new(FILM)?),
         }
     }
 
