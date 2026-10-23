@@ -1,5 +1,6 @@
-//! The showcase specimen: public-domain cat photographs fetched from Wikimedia
-//! Commons into the host cache and admitted only by SHA-256.
+//! The showcase specimen: cat photographs free of attribution and share-alike,
+//! fetched from Wikimedia Commons and Pexels into the host cache and admitted
+//! only by SHA-256.
 
 use anyhow::{Context as _, Result, ensure};
 use serde::Deserialize;
@@ -100,7 +101,7 @@ impl Specimen {
     /// Publish the courtesy credits that accompany every still and film.
     pub fn credit(&self, directory: &Path) -> Result<PathBuf> {
         let mut credits = String::from(
-            "# Specimen credits\n\nPhotographs from Wikimedia Commons, each dedicated to or in the public domain, shown scaled and cropped by Picmash.\n\n",
+            "# Specimen credits\n\nPhotographs from Wikimedia Commons and Pexels, none asking attribution or share-alike, shown scaled and cropped by Picmash.\n\n",
         );
         for Photograph { provenance, .. } in &self.photographs {
             let license = match &provenance.license_url {
@@ -161,8 +162,11 @@ fn cache_root() -> Result<PathBuf> {
         .context("neither an absolute XDG_CACHE_HOME nor HOME names a cache root")
 }
 
+/// An agent that asks only for the formats seals cover: image CDNs negotiate
+/// the representation they serve, and a seal names exactly one.
 fn courier() -> Agent {
     Agent::config_builder()
+        .accept("image/jpeg, image/png")
         .user_agent(concat!(
             "picmash-acceptance/",
             env!("CARGO_PKG_VERSION"),

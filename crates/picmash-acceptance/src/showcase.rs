@@ -17,8 +17,8 @@ use crate::{
     specimen::{Photograph, Specimen},
 };
 
-const PERSIAN: &str = "persian-doll-face-kitten.jpg";
-const SPHYNX: &str = "sphynx-oslo.jpg";
+const PERSIAN: &str = "persian-amber-gaze.jpg";
+const SPHYNX: &str = "sphynx-lavender.jpg";
 const NEWCOMERS: [&str; 2] = [PERSIAN, SPHYNX];
 const COLLECTION: &str = "cats";
 /// The product window the portfolio frame assumes.

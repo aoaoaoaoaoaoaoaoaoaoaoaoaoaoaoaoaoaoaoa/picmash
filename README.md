@@ -101,7 +101,8 @@ The showcase is a presentation take, never a verdict. After the build in
 comparison loop and develops its stills, the frontispiece being the fuzzy
 Persian against the Sphynx; `--film DIR` also records `picmash-showcase.mp4`.
 `PICMASH_ACCEPTANCE_BINARY` names the instrumented Picmash, as for acceptance.
-The specimen is the public-domain (CC0 or public domain) Wikimedia Commons
-photographs listed in `crates/picmash-acceptance/specimen/cats.toml`, fetched into
-the host cache and admitted only by SHA-256. Every take publishes
-`specimen-credits.md`, crediting their authors as a courtesy.
+The specimen is the photographs listed in
+`crates/picmash-acceptance/specimen/cats.toml`: CC0 or public-domain Wikimedia
+Commons files and Pexels-licensed photographs, none asking attribution or
+share-alike, fetched into the host cache and admitted only by SHA-256. Every
+take publishes `specimen-credits.md`, crediting their authors as a courtesy.

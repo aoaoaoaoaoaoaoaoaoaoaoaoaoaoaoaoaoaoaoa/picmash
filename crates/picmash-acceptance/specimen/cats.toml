@@ -1,7 +1,29 @@
 # Picmash's showcase specimen: photographs from Wikimedia Commons, each
-# dedicated to the public domain under CC0 1.0 or in the public domain, as its
-# file page records. The showcase fetches each `source` into the host cache and
-# admits it only when its SHA-256 matches; no photograph enters this repository.
+# dedicated to the public domain under CC0 1.0 or in the public domain as its
+# file page records, and from Pexels under the Pexels License; none asks
+# attribution or share-alike. The showcase fetches each `source` into the host
+# cache and admits it only when its SHA-256 matches; no photograph enters this
+# repository.
+
+[[photograph]]
+file = "persian-amber-gaze.jpg"
+title = "White Persian Cat in Close Up Photography"
+author = "Flaneur"
+license = "Pexels License"
+license_url = "https://www.pexels.com/license/"
+page = "https://www.pexels.com/photo/white-persian-cat-in-close-up-photography-13452487/"
+source = "https://images.pexels.com/photos/13452487/pexels-photo-13452487.jpeg"
+sha256 = "8a8c3d5c5597ee367e41d43c39ce0bd4fdeefed1f855f5d4f8f97f90cf3a7ff0"
+
+[[photograph]]
+file = "sphynx-lavender.jpg"
+title = "Close-up Photo of Sphynx Cat"
+author = "Alina Vilchenko"
+license = "Pexels License"
+license_url = "https://www.pexels.com/license/"
+page = "https://www.pexels.com/photo/close-up-photo-of-sphynx-cat-7085475/"
+source = "https://images.pexels.com/photos/7085475/pexels-photo-7085475.jpeg"
+sha256 = "711b1f37666ad0745258e3f9fabd248848329eb8e0d229dcf92a367d0a50cc3f"
 
 [[photograph]]
 file = "persian-doll-face-kitten.jpg"
@@ -143,16 +165,6 @@ source = "https://upload.wikimedia.org/wikipedia/commons/5/54/Sphynx_Kitten.jpg"
 sha256 = "1897ab158dc8bd45e3d8c0e814f79a5fe3e1a6103c8db0e096e1971f4401b4ee"
 
 [[photograph]]
-file = "sphynx-kitten-asleep.jpg"
-title = "Sphynx Kitten Sleeping"
-author = "Sphynxcatlover"
-license = "CC0 1.0"
-license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
-page = "https://commons.wikimedia.org/wiki/File:Sphynx_Kitten_Sleeping.jpg"
-source = "https://upload.wikimedia.org/wikipedia/commons/9/9a/Sphynx_Kitten_Sleeping.jpg"
-sha256 = "37a100d47929ed8be24e9179e1434ac574771bec536379bd251375ec091b028f"
-
-[[photograph]]
 file = "tabby-sunlight.jpg"
 title = "Cat face in sunlight (Unsplash)"
 author = "Alicja Koczaska"
@@ -161,16 +173,6 @@ license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
 page = "https://commons.wikimedia.org/wiki/File:Cat_face_in_sunlight_(Unsplash).jpg"
 source = "https://upload.wikimedia.org/wikipedia/commons/4/45/Cat_face_in_sunlight_%28Unsplash%29.jpg"
 sha256 = "fd9717b8d09419d21491a428c1d9a1a0a47ccd5006220be9e5aec01a5897b9d7"
-
-[[photograph]]
-file = "calico-kitchen.jpg"
-title = "Cat in a kitchen (Unsplash) (2017 photo; cropped 2022)"
-author = "Hector Bermudez"
-license = "CC0 1.0"
-license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
-page = "https://commons.wikimedia.org/wiki/File:Cat_in_a_kitchen_(Unsplash)_(2017_photo;_cropped_2022).jpg"
-source = "https://upload.wikimedia.org/wikipedia/commons/f/f7/Cat_in_a_kitchen_%28Unsplash%29_%282017_photo%3B_cropped_2022%29.jpg"
-sha256 = "4b1b280e6f0bbae16cddfc155e9d09237b21ed13fafb918416187a527a598f89"
 
 [[photograph]]
 file = "tabby-portrait.jpg"
