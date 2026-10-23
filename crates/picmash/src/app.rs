@@ -123,6 +123,9 @@ pub struct Picmash {
     pair: Option<PairView>,
     thumbnails: HashMap<ThumbKey, TextureHandle>,
     thumbnails_inflight: HashSet<ThumbKey>,
+    /// Thumbnails the worker failed to develop, never demanded again until a
+    /// rescan or another collection.
+    thumbnails_faulted: HashSet<ThumbKey>,
     viewer: Option<Viewer>,
     busy: bool,
     scan_progress: Option<ScanProgress>,
@@ -135,6 +138,13 @@ pub struct Picmash {
     water: Surface,
     #[cfg(feature = "egui-test")]
     water_calm: bool,
+    /// Visible browse tiles lacking a texture at their requested resolution,
+    /// counted by the frame that painted the browser; `None` in any other.
+    #[cfg_attr(
+        not(feature = "egui-test"),
+        expect(dead_code, reason = "only the egui-test witness reads it")
+    )]
+    tiles_wanting: Option<usize>,
 }
 
 impl Picmash {
@@ -175,6 +185,7 @@ impl Picmash {
             pair: None,
             thumbnails: HashMap::new(),
             thumbnails_inflight: HashSet::new(),
+            thumbnails_faulted: HashSet::new(),
             viewer: None,
             busy: true,
             scan_progress: None,
@@ -187,10 +198,12 @@ impl Picmash {
             water: Surface::new(wetness),
             #[cfg(feature = "egui-test")]
             water_calm: true,
+            tiles_wanting: None,
         })
     }
 
     pub fn pulse(&mut self, ui: &mut egui::Ui) {
+        self.tiles_wanting = None;
         let ctx = ui.ctx().clone();
         chrome::set_font_scale(&ctx, self.configuration.live().font_scale);
         self.absorb_chooser(&ctx);
@@ -513,6 +526,7 @@ impl Picmash {
             GalleryMotion::First => 0.0,
         });
         let mut demands = Vec::<ThumbKey>::new();
+        let mut wanting = 0;
         let mut retained = HashSet::new();
         let mut opened = None;
         let scroll = egui::ScrollArea::vertical().id_salt("picmash-browser");
@@ -537,7 +551,8 @@ impl Picmash {
                             asset_id: card.presentation.asset_id.clone(),
                             bucket,
                         };
-                        let texture = self.thumbnails.get(&key).or_else(|| {
+                        let developed = self.thumbnails.get(&key);
+                        let texture = developed.or_else(|| {
                             [2, 1, 0].into_iter().find_map(|resident| {
                                 self.thumbnails.get(&ThumbKey {
                                     asset_id: card.presentation.asset_id.clone(),
@@ -548,13 +563,19 @@ impl Picmash {
                         if browse_tile(ui, &mut self.water, card, texture, edge, slot == 0) {
                             opened = Some(card.presentation.asset_id.clone());
                         }
-                        if texture.is_none() && !self.thumbnails_inflight.contains(&key) {
-                            demands.push(key);
+                        if developed.is_none() {
+                            wanting += 1;
+                            if !self.thumbnails_inflight.contains(&key)
+                                && !self.thumbnails_faulted.contains(&key)
+                            {
+                                demands.push(key);
+                            }
                         }
                     }
                 });
             }
         });
+        self.tiles_wanting = Some(wanting);
         self.browse_scroll_offset = body.state.offset.y;
         self.water.heave(ui.ctx(), body.state.offset.y);
         witness::rect(ui.ctx(), Target::Browser, body.inner_rect);
@@ -776,11 +797,13 @@ impl Picmash {
                 self.pair = None;
                 self.thumbnails.clear();
                 self.thumbnails_inflight.clear();
+                self.thumbnails_faulted.clear();
                 self.rebuild_browse_indices();
             }
             Event::CatalogRefreshed { summary, cards } => {
                 self.summary = Some(summary);
                 self.cards = cards;
+                self.thumbnails_faulted.clear();
                 self.rebuild_browse_indices();
             }
             Event::Pair(pair) => {
@@ -858,9 +881,9 @@ impl Picmash {
                 bucket,
                 message,
             } => {
-                let _inflight = self
-                    .thumbnails_inflight
-                    .remove(&ThumbKey { asset_id, bucket });
+                let key = ThumbKey { asset_id, bucket };
+                let _inflight = self.thumbnails_inflight.remove(&key);
+                let _faulted = self.thumbnails_faulted.insert(key);
                 self.status = format!("THUMBNAIL FAULT · {message}");
             }
             Event::Full {
@@ -1214,7 +1237,8 @@ impl Picmash {
                 ]
             }),
             images_per_row: self.images_per_row,
-            tiles_developing: self.thumbnails_inflight.len(),
+            tiles_wanting: self.tiles_wanting,
+            thumbnails_faulted: !self.thumbnails_faulted.is_empty(),
             water_calm: self.water_calm,
             viewer_open: self.viewer.is_some(),
             viewer_ready: self.viewer.as_ref().is_some_and(Viewer::ready),
@@ -1724,7 +1748,8 @@ pub struct Observation {
     pair_rotations: Option<[u8; 2]>,
     pair_files: Option<[String; 2]>,
     images_per_row: u16,
-    tiles_developing: usize,
+    tiles_wanting: Option<usize>,
+    thumbnails_faulted: bool,
     water_calm: bool,
     viewer_open: bool,
     viewer_ready: bool,

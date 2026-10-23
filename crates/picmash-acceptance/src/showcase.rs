@@ -17,10 +17,12 @@ use crate::{
     specimen::{Photograph, Specimen},
 };
 
-const PERSIAN: &str = "persian-mofumofu.jpg";
-const SPHYNX: &str = "sphynx-slavir.jpg";
+const PERSIAN: &str = "persian-doll-face-kitten.jpg";
+const SPHYNX: &str = "sphynx-oslo.jpg";
 const NEWCOMERS: [&str; 2] = [PERSIAN, SPHYNX];
 const COLLECTION: &str = "cats";
+/// The product window the portfolio frame assumes.
+const WINDOW: (u32, u32) = (1440, 920);
 
 type Duel<'app, 'bed> = Story<'app, 'bed, Observation, Showcase>;
 
@@ -33,14 +35,14 @@ pub fn perform(
     let (newcomers, residents): (Vec<_>, Vec<_>) = specimen
         .photographs()
         .iter()
-        .partition(|photograph| NEWCOMERS.contains(&photograph.file.as_str()));
+        .partition(|photograph| NEWCOMERS.contains(&photograph.file()));
     demand(
         newcomers.len() == NEWCOMERS.len(),
         "the specimen lacks its Persian or its Sphynx",
     )?;
     let _collection = testbed.create_private_dir(COLLECTION)?;
     for photograph in &residents {
-        admit(testbed, specimen, photograph)?;
+        admit(testbed, photograph)?;
     }
     let app = testbed.launch(
         AppCommand::new(binary)
@@ -62,6 +64,17 @@ pub fn perform(
     demand(
         opened.state.contract == UI_FINGERPRINT,
         format!("UI contract mismatch: {}", opened.state.contract),
+    )?;
+    let frame = story.capture()?;
+    demand(
+        (frame.width(), frame.height()) == WINDOW,
+        format!(
+            "Picmash window is {}×{}, not the portfolio's {}×{}",
+            frame.width(),
+            frame.height(),
+            WINDOW.0,
+            WINDOW.1
+        ),
     )?;
     let population = residents.len();
     let _residents = story.wait(Condition::new(
@@ -88,7 +101,7 @@ pub fn perform(
 
     story.chapter("Rescan for newcomers")?;
     for photograph in &newcomers {
-        admit(testbed, specimen, photograph)?;
+        admit(testbed, photograph)?;
     }
     let met = story
         .click(Target::Rescan)?
@@ -125,10 +138,21 @@ pub fn perform(
     judge(&mut story, persian, duels)?;
 
     story.chapter("Browse the learned order")?;
-    let _browsing = story.click(Target::BrowseMode)?.until(Condition::new(
-        "every visible tile developed",
-        |state: &Observation| state.mode == "browse" && !state.busy && state.tiles_developing == 0,
-    ))?;
+    let browsing = story
+        .click(Target::BrowseMode)?
+        .until(Condition::new(
+            "every visible tile developed at its resolution",
+            |state: &Observation| {
+                state.mode == "browse"
+                    && !state.busy
+                    && (state.thumbnails_faulted || state.tiles_wanting == Some(0))
+            },
+        ))?
+        .into_value();
+    demand(
+        !browsing.state.thumbnails_faulted,
+        format!("a specimen thumbnail faulted: {}", browsing.state.status),
+    )?;
     freeze(&mut story, "learned-order")?;
 
     story.chapter("Inspect the leader")?;
@@ -144,10 +168,10 @@ pub fn perform(
     Ok(showcase)
 }
 
-fn admit(testbed: &Testbed, specimen: &Specimen, photograph: &Photograph) -> Result<()> {
-    let _admitted = testbed.copy_private(
-        Path::new(COLLECTION).join(&photograph.file),
-        specimen.path(photograph),
+fn admit(testbed: &Testbed, photograph: &Photograph) -> Result<()> {
+    let _admitted = testbed.write_private(
+        Path::new(COLLECTION).join(photograph.file()),
+        photograph.bytes(),
     )?;
     Ok(())
 }

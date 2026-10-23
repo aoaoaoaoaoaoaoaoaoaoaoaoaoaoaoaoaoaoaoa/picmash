@@ -1,10 +1,11 @@
 mod showcase;
 mod specimen;
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, bail, ensure};
 use egui_demo::Showcase;
 use egui_tester::{
-    AppCommand, Application, Button, Graphics, Key, Modifiers, Network, Probe, Testbed, WindowQuery,
+    AppCommand, Application, Button, Error, Graphics, Key, Modifiers, Network, Probe, Result,
+    Testbed, WindowQuery, demand,
 };
 use image::{ImageFormat, Rgba, RgbaImage};
 use picmash as _;
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use specimen::Specimen;
 use std::{
     env,
-    io::Cursor,
+    io::{self, Cursor},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -41,7 +42,8 @@ struct Observation {
     pair_rotations: Option<[u8; 2]>,
     pair_files: Option<[String; 2]>,
     images_per_row: u16,
-    tiles_developing: usize,
+    tiles_wanting: Option<usize>,
+    thumbnails_faulted: bool,
     water_calm: bool,
     viewer_open: bool,
     viewer_ready: bool,
@@ -50,7 +52,7 @@ struct Observation {
     text_edit_focused: bool,
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse()?;
     let binary = env::var_os("PICMASH_ACCEPTANCE_BINARY")
         .map(PathBuf::from)
@@ -66,11 +68,8 @@ fn main() -> Result<()> {
     }
     let Some(take) = cli.take else {
         let id = testbed.run(|testbed| {
-            accept(testbed, &binary, cli.artifacts.as_deref())
-                .map(|()| testbed.id().to_owned())
-                .map_err(|error| egui_tester::Error::Verdict {
-                    detail: format!("{error:#}"),
-                })
+            accept(testbed, &binary, cli.artifacts.as_deref())?;
+            Ok(testbed.id().to_owned())
         })?;
         println!("picmash acceptance passed under {id}");
         return Ok(());
@@ -96,29 +95,30 @@ struct Cli {
 }
 
 impl Cli {
-    fn parse() -> Result<Self> {
+    fn parse() -> anyhow::Result<Self> {
         let mut arguments = env::args_os().skip(1);
         let mut cli = Self {
             artifacts: None,
             take: None,
         };
         while let Some(option) = arguments.next() {
-            let option = option.to_string_lossy();
-            ensure!(
-                matches!(&*option, "--artifacts" | "--stills" | "--film"),
-                "unknown option {option}; use --artifacts DIR, --stills DIR, or --film DIR"
-            );
-            let directory = arguments
-                .next()
-                .map(PathBuf::from)
-                .with_context(|| format!("{option} requires a directory"))?;
-            let take = match &*option {
-                "--artifacts" => {
-                    cli.artifacts = Some(directory);
+            let mut directory = || {
+                arguments
+                    .next()
+                    .map(PathBuf::from)
+                    .with_context(|| format!("{} requires a directory", option.display()))
+            };
+            let take = match option.to_str() {
+                Some("--artifacts") => {
+                    cli.artifacts = Some(directory()?);
                     continue;
                 }
-                "--stills" => Take::Stills(directory),
-                _ => Take::Film(directory),
+                Some("--stills") => Take::Stills(directory()?),
+                Some("--film") => Take::Film(directory()?),
+                _ => bail!(
+                    "unknown option {}; use --artifacts DIR, --stills DIR, or --film DIR",
+                    option.display()
+                ),
             };
             ensure!(
                 cli.take.replace(take).is_none(),
@@ -136,7 +136,7 @@ enum Take {
 }
 
 impl Take {
-    fn showcase(&self) -> egui_tester::Result<Showcase> {
+    fn showcase(&self) -> Result<Showcase> {
         match self {
             Self::Stills(directory) => Showcase::stills(directory),
             Self::Film(directory) => Showcase::film(directory, FILM),
@@ -171,10 +171,10 @@ fn empty_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
     let empty = probe.wait(&app, WAIT, "empty first contact", |frame| {
         !frame.state.busy && frame.state.collection.is_none() && !frame.state.pair_ready
     })?;
-    ensure!(
+    demand(
         empty.state.visible_assets == 0 && empty.state.favorites == 0 && empty.state.duels == 0,
-        "empty first contact projected collection state"
-    );
+        "empty first contact projected collection state",
+    )?;
     let target = Target::OpenCollection.to_string();
     let _open = probe.wait_anchor(&app, &target, WAIT)?;
     capture(&session, artifacts, "picmash-first-contact.png")?;
@@ -195,27 +195,27 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
     let ready = probe.wait(&app, STARTUP, "four-image comparison", |frame| {
         !frame.state.busy && frame.state.pair_ready && frame.state.visible_assets == 4
     })?;
-    ensure!(
+    demand(
         ready.state.contract == UI_FINGERPRINT,
-        "UI contract mismatch"
-    );
-    ensure!(
+        "UI contract mismatch",
+    )?;
+    demand(
         ready.state.mode == "compare",
-        "Picmash did not open in Compare"
-    );
-    ensure!(
+        "Picmash did not open in Compare",
+    )?;
+    demand(
         ready.state.collection.is_some(),
-        "collection path was not projected"
-    );
-    ensure!(!ready.state.guide_open, "Help opened without an intent");
-    ensure!(
+        "collection path was not projected",
+    )?;
+    demand(!ready.state.guide_open, "Help opened without an intent")?;
+    demand(
         !ready.state.settings_open,
-        "Settings opened without an intent"
-    );
-    ensure!(
+        "Settings opened without an intent",
+    )?;
+    demand(
         !ready.state.text_edit_focused,
-        "a hidden editor stole keyboard focus"
-    );
+        "a hidden editor stole keyboard focus",
+    )?;
     capture(&session, artifacts, "picmash-compare.png")?;
 
     let _help_key = session.key(Key::Function(1))?;
@@ -267,19 +267,21 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
     })?;
 
     click(&session, &app, &mut probe, Target::BrowseMode)?;
-    let browsed = probe.wait(&app, WAIT, "collection browser", |frame| {
-        frame.state.mode == "browse" && !frame.state.busy
+    let browsed = probe.wait(&app, WAIT, "collection browser developed", |frame| {
+        frame.state.mode == "browse"
+            && !frame.state.busy
+            && (frame.state.thumbnails_faulted || frame.state.tiles_wanting == Some(0))
     })?;
-    ensure!(
+    demand(
+        !browsed.state.thumbnails_faulted,
+        format!("browser thumbnails faulted: {}", browsed.state.status),
+    )?;
+    demand(
         !browsed.state.status.starts_with("FAULT"),
-        "browser opened in fault: {}",
-        browsed.state.status
-    );
+        format!("browser opened in fault: {}", browsed.state.status),
+    )?;
     let browser_target = Target::Browser.to_string();
     let _browser = probe.wait_anchor(&app, &browser_target, WAIT)?;
-    for _frame in 0..4 {
-        let _fresh = probe.wait_fresh(&app, WAIT)?;
-    }
     let tile_target = Target::BrowseTile.to_string();
     let tile = probe.wait_anchor(&app, &tile_target, WAIT)?;
     let (x, y) = tile.center();
@@ -292,10 +294,10 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
     let viewer = probe.wait(&app, STARTUP, "full-image viewer", |frame| {
         frame.state.viewer_open && frame.state.viewer_ready
     })?;
-    ensure!(
+    demand(
         viewer.state.images_per_row == 5,
-        "browser did not preserve its configured density"
-    );
+        "browser did not preserve its configured density",
+    )?;
     let _surface = probe.wait_anchor(&app, &Target::Viewer.to_string(), WAIT)?;
     let _copy = probe.wait_anchor(&app, &Target::ViewerCopy.to_string(), WAIT)?;
     let _close = probe.wait_anchor(&app, &Target::ViewerClose.to_string(), WAIT)?;
@@ -332,10 +334,10 @@ fn restored_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) 
             && frame.state.favorites == 1
             && frame.state.duels == 1
     })?;
-    ensure!(
+    demand(
         restored.state.contract == UI_FINGERPRINT,
-        "restored UI contract mismatch"
-    );
+        "restored UI contract mismatch",
+    )?;
     capture(&session, artifacts, "picmash-restored.png")?;
     app.terminate()?;
     Ok(())
@@ -379,18 +381,18 @@ recurse = true
     let ready = probe.wait(&app, STARTUP, "bounded remote reservoir", |frame| {
         !frame.state.busy && frame.state.pair_ready && frame.state.remote_ready == 1
     })?;
-    ensure!(
+    demand(
         !ready.state.remote_pair,
-        "remote work interrupted a live pair"
-    );
+        "remote work interrupted a live pair",
+    )?;
     click(&session, &app, &mut probe, Target::Choice(Side::Left))?;
     let challenger = probe.wait(&app, STARTUP, "remote challenger", |frame| {
         !frame.state.busy && frame.state.remote_pair
     })?;
-    ensure!(
+    demand(
         challenger.state.remote_ready == 1,
-        "displayed challenger escaped the reservoir bound"
-    );
+        "displayed challenger escaped the reservoir bound",
+    )?;
     let _stream = probe.wait_anchor(&app, &Target::RejectStream(Side::Right).to_string(), WAIT)?;
     let _rejected = session.key(Key::Character('x'))?;
     let _retired = probe.wait(&app, WAIT, "image rejection", |frame| {
@@ -430,11 +432,10 @@ recurse = true
         frame.state.status.starts_with("FAULT")
             || (!frame.state.busy && frame.state.pair_ready && frame.state.remote_promoting == 1)
     })?;
-    ensure!(
+    demand(
         !advanced.state.status.starts_with("FAULT"),
-        "admission faulted: {}",
-        advanced.state.status
-    );
+        format!("admission faulted: {}", advanced.state.status),
+    )?;
     drop(probe);
     drop(session);
     app.terminate()?;
@@ -456,16 +457,15 @@ recurse = true
                 && frame.state.duels == 5
                 && frame.state.remote_promoting == 0)
     })?;
-    ensure!(
+    demand(
         !promoted.state.status.starts_with("FAULT"),
-        "promotion faulted: {}",
-        promoted.state.status
-    );
+        format!("promotion faulted: {}", promoted.state.status),
+    )?;
     let imported = testbed.private_path("collection/.picmash-imported")?;
-    ensure!(
+    demand(
         contains_jxl(&imported)?,
-        "remote promotion did not materialize canonical JPEG XL"
-    );
+        "remote promotion did not materialize canonical JPEG XL",
+    )?;
     app.terminate()?;
     Ok(())
 }
@@ -483,7 +483,7 @@ fn launch<'a>(
     if with_collection {
         command = command.arg(Testbed::guest_path("collection"));
     }
-    testbed.launch(command).map_err(anyhow::Error::from)
+    testbed.launch(command)
 }
 
 fn click(
@@ -505,8 +505,11 @@ fn capture(
     name: &str,
 ) -> Result<()> {
     if let Some(artifacts) = artifacts {
-        std::fs::create_dir_all(artifacts)
-            .with_context(|| format!("create {}", artifacts.display()))?;
+        std::fs::create_dir_all(artifacts).map_err(|source| Error::Io {
+            operation: "create acceptance artifacts",
+            path: artifacts.to_owned(),
+            source,
+        })?;
         session.capture()?.save_png(artifacts.join(name))?;
     }
     Ok(())
@@ -518,43 +521,57 @@ fn seed(testbed: &Testbed) -> Result<()> {
         .into_iter()
         .enumerate()
     {
-        let bytes = fixture(index as u8, dimensions)?;
-        let _written = testbed.write_private(format!("collection/{index}.png"), &bytes)?;
+        let path = format!("collection/{index}.png");
+        let bytes = fixture(&path, index as u8, dimensions)?;
+        let _written = testbed.write_private(&path, &bytes)?;
         let _copy = testbed.write_private(format!("collection/{index}-copy.png"), &bytes)?;
     }
     for (thread, seed) in [("thread-a", 19), ("thread-b", 23), ("thread-c", 29)] {
         let _thread = testbed.create_private_dir(format!("remote/{thread}"))?;
-        let remote = fixture(seed, (940, 1_180))?;
-        let _written = testbed.write_private(format!("remote/{thread}/challenger.png"), remote)?;
+        let path = format!("remote/{thread}/challenger.png");
+        let remote = fixture(&path, seed, (940, 1_180))?;
+        let _written = testbed.write_private(&path, remote)?;
     }
     Ok(())
 }
 
 fn contains_jxl(root: &Path) -> Result<bool> {
+    let survey = |path: &Path| {
+        std::fs::read_dir(path).map_err(|source| Error::Io {
+            operation: "survey imported archive",
+            path: path.to_owned(),
+            source,
+        })
+    };
     if !root.is_dir() {
         return Ok(false);
     }
-    for source in std::fs::read_dir(root)? {
-        let source = source?.path();
-        if !source.is_dir() {
-            continue;
-        }
-        if std::fs::read_dir(source)?.any(|entry| {
-            entry.is_ok_and(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    == Some("jxl")
+    for source in survey(root)? {
+        let source = source
+            .map_err(|source| Error::Io {
+                operation: "survey imported archive",
+                path: root.to_owned(),
+                source,
+            })?
+            .path();
+        if source.is_dir()
+            && survey(&source)?.any(|entry| {
+                entry.is_ok_and(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        == Some("jxl")
+                })
             })
-        }) {
+        {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn fixture(seed: u8, (width, height): (u32, u32)) -> Result<Vec<u8>> {
+fn fixture(path: &str, seed: u8, (width, height): (u32, u32)) -> Result<Vec<u8>> {
     let mut image = RgbaImage::new(width, height);
     for (x, y, pixel) in image.enumerate_pixels_mut() {
         let band = ((x / 48 + y / 52 + u32::from(seed)) % 4) as u8;
@@ -569,6 +586,12 @@ fn fixture(seed: u8, (width, height): (u32, u32)) -> Result<Vec<u8>> {
         ]);
     }
     let mut bytes = Vec::new();
-    image.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+    image
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+        .map_err(|error| Error::Io {
+            operation: "encode fixture",
+            path: path.into(),
+            source: io::Error::other(error),
+        })?;
     Ok(bytes)
 }
