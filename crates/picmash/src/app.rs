@@ -649,6 +649,12 @@ impl Picmash {
     }
 
     fn apply_action(&mut self, action: Action) {
+        // An open modal owns the pointer, yet egui lets a click through to the
+        // chamber during the modal's invisible first pass: no judgment may
+        // come of a click aimed at the modal.
+        if self.settings.is_open() || self.guide.is_open() {
+            return;
+        }
         match action {
             Action::Choose(side) => {
                 let status = if self
