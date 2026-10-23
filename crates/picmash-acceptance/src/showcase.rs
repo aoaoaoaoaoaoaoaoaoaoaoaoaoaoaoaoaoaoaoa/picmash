@@ -21,6 +21,8 @@ const PERSIAN: &str = "persian-amber-gaze.jpg";
 const SPHYNX: &str = "sphynx-lavender.jpg";
 const NEWCOMERS: [&str; 2] = [PERSIAN, SPHYNX];
 const COLLECTION: &str = "cats";
+const LEARNED_ORDER: ArtifactStem = ArtifactStem::literal("learned-order");
+const LEADER: ArtifactStem = ArtifactStem::literal("leader");
 
 type Duel<'app, 'bed> = Story<'app, 'bed, Observation, Showcase>;
 
@@ -140,7 +142,7 @@ pub fn perform(
         !browsing.state.thumbnails_faulted,
         format!("a specimen thumbnail faulted: {}", browsing.state.status),
     )?;
-    freeze(&mut story, &ArtifactStem::new("learned-order")?)?;
+    freeze(&mut story, &LEARNED_ORDER)?;
 
     story.chapter("Inspect the leader")?;
     let _viewing = story
@@ -148,7 +150,7 @@ pub fn perform(
         .until(Condition::new("leader in full", |state: &Observation| {
             state.viewer_open && state.viewer_ready
         }))?;
-    freeze(&mut story, &ArtifactStem::new("leader")?)?;
+    freeze(&mut story, &LEADER)?;
 
     let showcase = story.finish()?;
     app.terminate()?;

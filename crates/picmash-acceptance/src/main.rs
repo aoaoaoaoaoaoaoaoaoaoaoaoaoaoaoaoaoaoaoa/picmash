@@ -23,7 +23,7 @@ const WAIT: Duration = Duration::from_secs(8);
 const STARTUP: Duration = Duration::from_secs(45);
 const TITLE: &str = "picmash";
 const WITNESS: &str = "probes/picmash.observations";
-const FILM: &str = "picmash-showcase";
+const FILM: ArtifactStem = ArtifactStem::literal("picmash-showcase");
 
 #[derive(Debug, Deserialize)]
 struct Observation {
@@ -139,7 +139,7 @@ impl Take {
     fn showcase(&self) -> Result<Showcase> {
         match self {
             Self::Stills(directory) => Showcase::stills(directory),
-            Self::Film(directory) => Showcase::film(directory, &ArtifactStem::new(FILM)?),
+            Self::Film(directory) => Showcase::film(directory, &FILM),
         }
     }
 

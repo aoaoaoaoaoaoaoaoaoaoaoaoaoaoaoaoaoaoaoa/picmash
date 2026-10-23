@@ -3,6 +3,7 @@
 //! only by SHA-256.
 
 use anyhow::{Context as _, Result, ensure};
+use egui_tester::ArtifactStem;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -16,6 +17,7 @@ use ureq::{
     tls::{TlsConfig, TlsProvider},
 };
 
+const PRODUCT: ArtifactStem = ArtifactStem::literal("picmash");
 const MANIFEST: &str = include_str!("../specimen/cats.toml");
 const CREDITS: &str = "specimen-credits.md";
 /// Ceiling on one photograph's bytes; the largest is 5.6 MiB.
@@ -67,7 +69,7 @@ impl Specimen {
     pub fn gather() -> Result<Self> {
         let Manifest { photograph } =
             toml::from_str(MANIFEST).context("parse specimen manifest")?;
-        let cache = egui_demo::specimen_cache("picmash")?.join("specimen");
+        let cache = egui_demo::specimen_cache(&PRODUCT)?.join("specimen");
         fs::create_dir_all(&cache).with_context(|| format!("create {}", cache.display()))?;
         let mut agent = None;
         let photographs = photograph
