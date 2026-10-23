@@ -7,7 +7,7 @@ pub const PRODUCT_IDENTIFIER: &str = "moe.eternalist.picmash";
 /// Product display name.
 pub const PRODUCT_NAME: &str = "Picmash";
 /// Native UI contract revision.
-pub const UI_FINGERPRINT: &str = "picmash.ui/5";
+pub const UI_FINGERPRINT: &str = "picmash.ui/6";
 
 /// One member of the active comparison.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

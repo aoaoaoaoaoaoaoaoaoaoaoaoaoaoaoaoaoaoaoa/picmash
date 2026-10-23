@@ -1,0 +1,205 @@
+# Picmash's showcase specimen: freely licensed photographs from Wikimedia
+# Commons. The showcase fetches each `source` into the host cache and admits
+# it only when its SHA-256 matches; no photograph enters this repository.
+# `attribution` overrides the credit line where the licensor prescribes one.
+
+[[photograph]]
+file = "persian-malinka.jpg"
+title = "PER Malinka Gerakl of Jem-Dandy (4183729201)"
+author = "Nickolas Titkov from Moscow, Russian Federation"
+license = "CC BY-SA 2.0"
+license_url = "https://creativecommons.org/licenses/by-sa/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:PER_Malinka_Gerakl_of_Jem-Dandy_(4183729201).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/c/c8/PER_Malinka_Gerakl_of_Jem-Dandy_%284183729201%29.jpg"
+sha256 = "1b39ba2680168f36e0ecfd20d5ccc42be852ab09a782951f96f92220cbf721fe"
+
+[[photograph]]
+file = "persian-camilla.jpg"
+title = "Camilla - per (3354724440)"
+author = "Elma from Reykjavík"
+license = "CC BY 2.0"
+license_url = "https://creativecommons.org/licenses/by/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:Camilla_-_per_(3354724440).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/9/90/Camilla_-_per_%283354724440%29.jpg"
+sha256 = "4c9b4fde5f9d7681bbbaa8baa3ab8af05fca08368b8e3ee80f9f410950a2f018"
+
+[[photograph]]
+file = "persian-reclining.jpg"
+title = "Это порода перса (порода кошек) (самка) 2014-02-10 19-21"
+author = "Елизавета 211201"
+license = "CC BY-SA 3.0"
+license_url = "https://creativecommons.org/licenses/by-sa/3.0/"
+page = "https://commons.wikimedia.org/wiki/File:%D0%AD%D1%82%D0%BE_%D0%BF%D0%BE%D1%80%D0%BE%D0%B4%D0%B0_%D0%BF%D0%B5%D1%80%D1%81%D0%B0_(%D0%BF%D0%BE%D1%80%D0%BE%D0%B4%D0%B0_%D0%BA%D0%BE%D1%88%D0%B5%D0%BA)_(%D1%81%D0%B0%D0%BC%D0%BA%D0%B0)_2014-02-10_19-21.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/1/17/%D0%AD%D1%82%D0%BE_%D0%BF%D0%BE%D1%80%D0%BE%D0%B4%D0%B0_%D0%BF%D0%B5%D1%80%D1%81%D0%B0_%28%D0%BF%D0%BE%D1%80%D0%BE%D0%B4%D0%B0_%D0%BA%D0%BE%D1%88%D0%B5%D0%BA%29_%28%D1%81%D0%B0%D0%BC%D0%BA%D0%B0%29_2014-02-10_19-21.jpg"
+sha256 = "2aa669c286120370dcd80a0c1784c66b266e547d52bf82862ebb375ef449fc39"
+
+[[photograph]]
+file = "persian-leaf-race.jpg"
+title = "Leaf Race (50513921428)"
+author = "Reba Spike"
+license = "CC BY 2.0"
+license_url = "https://creativecommons.org/licenses/by/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:Leaf_Race_(50513921428).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/5/57/Leaf_Race_%2850513921428%29.jpg"
+sha256 = "64ed708b3789c592b1b04dc591f43e22372ec2996563ede97f8a313e8b40068c"
+
+[[photograph]]
+file = "sphynx-portrait.jpg"
+title = "1 adult cat Sphynx. img 045"
+author = "Dmitry Makeev"
+license = "CC BY-SA 4.0"
+license_url = "https://creativecommons.org/licenses/by-sa/4.0/"
+page = "https://commons.wikimedia.org/wiki/File:1_adult_cat_Sphynx._img_045.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/9/90/1_adult_cat_Sphynx._img_045.jpg"
+sha256 = "c7ceae8c563f8466c3d8365a25ae0d7ec6dbb2bfadda2fee589022afd9403faf"
+
+[[photograph]]
+file = "sphynx-arete.jpg"
+title = "Arete-Green eyes (3563530048) (2009; cropped 2023)"
+author = "Quinton Moran from Scottsdale, USA"
+license = "CC BY-SA 2.0"
+license_url = "https://creativecommons.org/licenses/by-sa/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:Arete-Green_eyes_(3563530048)_(2009;_cropped_2023).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/9/9a/Arete-Green_eyes_%283563530048%29_%282009%3B_cropped_2023%29.jpg"
+sha256 = "396bc969ccf6a1f4f9cc2a2311490c25b27c9124b12be54ec0a4708a028299f8"
+
+[[photograph]]
+file = "sphynx-studio.jpg"
+title = "Cat - Sphynx. img 023"
+author = "Dmitry Makeev"
+license = "CC BY-SA 4.0"
+license_url = "https://creativecommons.org/licenses/by-sa/4.0/"
+page = "https://commons.wikimedia.org/wiki/File:Cat_-_Sphynx._img_023.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/8/84/Cat_-_Sphynx._img_023.jpg"
+sha256 = "26bf05691c7389e6854529e02b51f4eca4229724f50f527f891ce5d4c80f8288"
+
+[[photograph]]
+file = "sphynx-fidel.jpg"
+title = "SPH Slavir Fidel (14191501375)"
+author = "Nickolas Titkov from Moscow, Russian Federation"
+license = "CC BY-SA 2.0"
+license_url = "https://creativecommons.org/licenses/by-sa/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:SPH_Slavir_Fidel_(14191501375).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/f/f3/SPH_Slavir_Fidel_%2814191501375%29.jpg"
+sha256 = "3d93d4eb74dbd13a9f3fab0cb3957d7295ef6b239dd4eee29cc7e294a674d8d8"
+
+[[photograph]]
+file = "sphynx-gaze.jpg"
+title = "Cat Sphynx. img 033"
+author = "Dmitry Makeev"
+license = "CC BY-SA 4.0"
+license_url = "https://creativecommons.org/licenses/by-sa/4.0/"
+page = "https://commons.wikimedia.org/wiki/File:Cat_Sphynx._img_033.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/b/ba/Cat_Sphynx._img_033.jpg"
+sha256 = "771b93e9f91aaf0fc1801974d25156751bd23e0709f60bb01cc5e1802873a5f8"
+
+[[photograph]]
+file = "bengal-kitten.jpg"
+title = "BEN Bengalian kitten (4492540155)"
+author = "Nickolas Titkov from Moscow, Russian Federation"
+license = "CC BY-SA 2.0"
+license_url = "https://creativecommons.org/licenses/by-sa/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:BEN_Bengalian_kitten_(4492540155).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/4/40/BEN_Bengalian_kitten_%284492540155%29.jpg"
+sha256 = "9fbee3d7c05e428fc45a9fd0a410fdb37e52f2877e628f2d1081426a6e4a3e56"
+
+[[photograph]]
+file = "tabby-efremov.jpg"
+title = "Cat in Efremov, Russia1"
+author = "Юрий Д.К."
+license = "CC BY 4.0"
+license_url = "https://creativecommons.org/licenses/by/4.0/"
+page = "https://commons.wikimedia.org/wiki/File:Cat_in_Efremov,_Russia1.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/2/2a/Cat_in_Efremov%2C_Russia1.jpg"
+sha256 = "7d41c6d04968faf98912fe6375ca24a8be7ad847e515d5ef54d8585907baeb79"
+
+[[photograph]]
+file = "odd-eyed-june.jpg"
+title = "June odd-eyed-cat cropped"
+author = "Keith Kissel"
+license = "CC BY 2.0"
+license_url = "https://creativecommons.org/licenses/by/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:June_odd-eyed-cat_cropped.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/6/69/June_odd-eyed-cat_cropped.jpg"
+sha256 = "97450e6624ff52edb5452b3c7fc00d37b70de5475f4eceec7fad77df30234230"
+
+[[photograph]]
+file = "tabby-blue-eyes.jpg"
+title = "Tabby cat with blue eyes-3336579"
+author = "AdinaVoicu"
+license = "CC0"
+license_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+page = "https://commons.wikimedia.org/wiki/File:Tabby_cat_with_blue_eyes-3336579.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/c/c7/Tabby_cat_with_blue_eyes-3336579.jpg"
+sha256 = "f91f1e37a23344251f40a7731b28b6612fef6cc37a2f1e7f97d5f6610063248c"
+
+[[photograph]]
+file = "chartreux.jpg"
+title = "Chartreux-cat-edouard-marie"
+author = "Stephanemartin"
+license = "CC BY-SA 3.0"
+license_url = "https://creativecommons.org/licenses/by-sa/3.0/"
+page = "https://commons.wikimedia.org/wiki/File:Chartreux-cat-edouard-marie.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/8/80/Chartreux-cat-edouard-marie.jpg"
+sha256 = "793c03f7cb71c5b3aa1bde84141fed124b2e3021dfc95998e07d2be4f7dc9281"
+
+[[photograph]]
+file = "golden-kitten.jpg"
+title = "Golden tabby and white kitten n01"
+author = "Marie-Lan Nguyen"
+attribution = "© Marie-Lan Nguyen / Wikimedia Commons"
+license = "CC BY 2.5"
+license_url = "https://creativecommons.org/licenses/by/2.5/"
+page = "https://commons.wikimedia.org/wiki/File:Golden_tabby_and_white_kitten_n01.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/b/bd/Golden_tabby_and_white_kitten_n01.jpg"
+sha256 = "4c2d10c91d3ed63904fecf670e0a2d809a3222db97e8aca58ce81ab7e5fb3540"
+
+[[photograph]]
+file = "persian-silver-doll.jpg"
+title = "Doll face silver Persian 2"
+author = "Andrey"
+license = "CC BY 2.0"
+license_url = "https://creativecommons.org/licenses/by/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:Doll_face_silver_Persian_2.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/3/31/Doll_face_silver_Persian_2.jpg"
+sha256 = "d7e44e46f119a7373f6be77a3ee802ffa83fb5891a371dd0fd682d569b22daab"
+
+[[photograph]]
+file = "persian-chinchilla.jpg"
+title = "Persian Chinchilla Black shaded kitten (6823768123)"
+author = "Volkan_83"
+license = "CC BY 2.0"
+license_url = "https://creativecommons.org/licenses/by/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:Persian_Chinchilla_Black_shaded_kitten_(6823768123).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/5/59/Persian_Chinchilla_Black_shaded_kitten_%286823768123%29.jpg"
+sha256 = "ad0620c2ca8c393d1e126ade593faa11e579ff40943aa443f33ebcaa2ff1d58d"
+
+[[photograph]]
+file = "sphynx-blue-eyes.jpg"
+title = "Sphynx - cat. img 014"
+author = "Dmitry Makeev"
+license = "CC BY-SA 4.0"
+license_url = "https://creativecommons.org/licenses/by-sa/4.0/"
+page = "https://commons.wikimedia.org/wiki/File:Sphynx_-_cat._img_014.jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/8/88/Sphynx_-_cat._img_014.jpg"
+sha256 = "0c38a530707f1715bed6c4c24a6dd43d84843c63bca735280147ec441bedda23"
+
+[[photograph]]
+file = "persian-mofumofu.jpg"
+title = "Super mofumofu cat (8113011025)"
+author = "Takashi Hososhima from Tokyo, Japan"
+license = "CC BY-SA 2.0"
+license_url = "https://creativecommons.org/licenses/by-sa/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:Super_mofumofu_cat_(8113011025).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/e/e7/Super_mofumofu_cat_%288113011025%29.jpg"
+sha256 = "55604392891fe6e31bcf6cecb9ccd86ed87e403ca2d534d4d3c98c658734ba0c"
+
+[[photograph]]
+file = "sphynx-slavir.jpg"
+title = "SPH Slavir Fidel (14188206691)"
+author = "Nickolas Titkov from Moscow, Russian Federation"
+license = "CC BY-SA 2.0"
+license_url = "https://creativecommons.org/licenses/by-sa/2.0/"
+page = "https://commons.wikimedia.org/wiki/File:SPH_Slavir_Fidel_(14188206691).jpg"
+source = "https://upload.wikimedia.org/wikipedia/commons/3/31/SPH_Slavir_Fidel_%2814188206691%29.jpg"
+sha256 = "a9ceeb661745d95a606000f3ef06e0cc87e9cffdcf2c1907a2c98e6481c3dd52"

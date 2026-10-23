@@ -133,6 +133,8 @@ pub struct Picmash {
     configuration: ConfigurationLedger<Configuration>,
     living_wait: LivingWait,
     water: Surface,
+    #[cfg(feature = "egui-test")]
+    water_calm: bool,
 }
 
 impl Picmash {
@@ -183,6 +185,8 @@ impl Picmash {
             configuration,
             living_wait: LivingWait::default(),
             water: Surface::new(wetness),
+            #[cfg(feature = "egui-test")]
+            water_calm: true,
         })
     }
 
@@ -239,7 +243,12 @@ impl Picmash {
         tooltip_rects: &[egui::Rect],
     ) -> brass_poolrooms::water::Frame {
         self.living_wait.compose(ctx, &mut self.water);
-        self.water.frame(ctx, pixels_per_point, tooltip_rects, None)
+        let frame = self.water.frame(ctx, pixels_per_point, tooltip_rects, None);
+        #[cfg(feature = "egui-test")]
+        {
+            self.water_calm = !frame.wants_repaint();
+        }
+        frame
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {
@@ -1198,7 +1207,15 @@ impl Picmash {
                     pair.pair.right.rotation_quarters(),
                 ]
             }),
+            pair_files: self.pair.as_ref().map(|pair| {
+                [
+                    file_name(pair.pair.left.path()),
+                    file_name(pair.pair.right.path()),
+                ]
+            }),
             images_per_row: self.images_per_row,
+            tiles_developing: self.thumbnails_inflight.len(),
+            water_calm: self.water_calm,
             viewer_open: self.viewer.is_some(),
             viewer_ready: self.viewer.as_ref().is_some_and(Viewer::ready),
             guide_open: self.guide.is_open(),
@@ -1705,7 +1722,10 @@ pub struct Observation {
     remote_ready: usize,
     remote_promoting: usize,
     pair_rotations: Option<[u8; 2]>,
+    pair_files: Option<[String; 2]>,
     images_per_row: u16,
+    tiles_developing: usize,
+    water_calm: bool,
     viewer_open: bool,
     viewer_ready: bool,
     guide_open: bool,

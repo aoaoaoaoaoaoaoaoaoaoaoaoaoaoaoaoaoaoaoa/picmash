@@ -1,4 +1,8 @@
+mod showcase;
+mod specimen;
+
 use anyhow::{Context as _, Result, ensure};
+use egui_demo::Showcase;
 use egui_tester::{
     AppCommand, Application, Button, Graphics, Key, Modifiers, Network, Probe, Testbed, WindowQuery,
 };
@@ -6,6 +10,7 @@ use image::{ImageFormat, Rgba, RgbaImage};
 use picmash as _;
 use picmash_contract::{Side, Target, UI_FINGERPRINT};
 use serde::Deserialize;
+use specimen::Specimen;
 use std::{
     env,
     io::Cursor,
@@ -17,6 +22,7 @@ const WAIT: Duration = Duration::from_secs(8);
 const STARTUP: Duration = Duration::from_secs(45);
 const TITLE: &str = "picmash";
 const WITNESS: &str = "probes/picmash.observations";
+const FILM: &str = "picmash-showcase";
 
 #[derive(Debug, Deserialize)]
 struct Observation {
@@ -33,7 +39,10 @@ struct Observation {
     remote_ready: usize,
     remote_promoting: usize,
     pair_rotations: Option<[u8; 2]>,
+    pair_files: Option<[String; 2]>,
     images_per_row: u16,
+    tiles_developing: usize,
+    water_calm: bool,
     viewer_open: bool,
     viewer_ready: bool,
     guide_open: bool,
@@ -42,23 +51,111 @@ struct Observation {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse()?;
     let binary = env::var_os("PICMASH_ACCEPTANCE_BINARY")
         .map(PathBuf::from)
         .context("PICMASH_ACCEPTANCE_BINARY must name the instrumented Picmash binary")?;
-    let artifacts = env::args_os().nth(1).map(PathBuf::from);
     ensure!(
         binary.is_file(),
         "Picmash binary not found: {}",
         binary.display()
     );
-    let testbed = Testbed::raise().context("raise hermetic X11 testbed")?;
-    seed(&testbed)?;
-    empty_session(&testbed, &binary, artifacts.as_deref())?;
-    first_session(&testbed, &binary, artifacts.as_deref())?;
-    restored_session(&testbed, &binary, artifacts.as_deref())?;
-    remote_session(&testbed, &binary, artifacts.as_deref())?;
-    println!("picmash acceptance passed under {}", testbed.id());
+    let mut testbed = Testbed::builder();
+    if let Some(artifacts) = &cli.artifacts {
+        testbed = testbed.failure_artifacts(artifacts);
+    }
+    let Some(take) = cli.take else {
+        let id = testbed.run(|testbed| {
+            accept(testbed, &binary, cli.artifacts.as_deref())
+                .map(|()| testbed.id().to_owned())
+                .map_err(|error| egui_tester::Error::Verdict {
+                    detail: format!("{error:#}"),
+                })
+        })?;
+        println!("picmash acceptance passed under {id}");
+        return Ok(());
+    };
+    let specimen = Specimen::gather()?;
+    let showcase = take.showcase()?;
+    let showcase =
+        testbed.run(|testbed| showcase::perform(testbed, &binary, &specimen, showcase))?;
+    for artifact in showcase
+        .publish()?
+        .into_iter()
+        .chain([specimen.credit(take.directory())?])
+    {
+        println!("{}", artifact.display());
+    }
     Ok(())
+}
+
+/// One invocation: the acceptance suite, or a showcase take.
+struct Cli {
+    artifacts: Option<PathBuf>,
+    take: Option<Take>,
+}
+
+impl Cli {
+    fn parse() -> Result<Self> {
+        let mut arguments = env::args_os().skip(1);
+        let mut cli = Self {
+            artifacts: None,
+            take: None,
+        };
+        while let Some(option) = arguments.next() {
+            let option = option.to_string_lossy();
+            ensure!(
+                matches!(&*option, "--artifacts" | "--stills" | "--film"),
+                "unknown option {option}; use --artifacts DIR, --stills DIR, or --film DIR"
+            );
+            let directory = arguments
+                .next()
+                .map(PathBuf::from)
+                .with_context(|| format!("{option} requires a directory"))?;
+            let take = match &*option {
+                "--artifacts" => {
+                    cli.artifacts = Some(directory);
+                    continue;
+                }
+                "--stills" => Take::Stills(directory),
+                _ => Take::Film(directory),
+            };
+            ensure!(
+                cli.take.replace(take).is_none(),
+                "a showcase is one take: --stills or --film"
+            );
+        }
+        Ok(cli)
+    }
+}
+
+/// A showcase take: its stills alone, or its stills and its film.
+enum Take {
+    Stills(PathBuf),
+    Film(PathBuf),
+}
+
+impl Take {
+    fn showcase(&self) -> egui_tester::Result<Showcase> {
+        match self {
+            Self::Stills(directory) => Showcase::stills(directory),
+            Self::Film(directory) => Showcase::film(directory, FILM),
+        }
+    }
+
+    fn directory(&self) -> &Path {
+        match self {
+            Self::Stills(directory) | Self::Film(directory) => directory,
+        }
+    }
+}
+
+fn accept(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> Result<()> {
+    seed(testbed)?;
+    empty_session(testbed, binary, artifacts)?;
+    first_session(testbed, binary, artifacts)?;
+    restored_session(testbed, binary, artifacts)?;
+    remote_session(testbed, binary, artifacts)
 }
 
 fn empty_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> Result<()> {

@@ -93,3 +93,15 @@ The canonical gate formats, lints, and tests the workspace. The hermetic native
 story proves favorite, rotation, voting, hiding, browsing, restart persistence,
 a bounded local-source reservoir, nonblocking durable archive resumption, and
 canonical remote promotion without network access.
+
+## Showcase
+
+The showcase is a presentation take, never a verdict. After the build in
+`scripts/test-acceptance`, `picmash-acceptance --stills DIR` performs the
+comparison loop and develops its stills, the frontispiece being the fuzzy
+Persian against the Sphynx; `--film DIR` also records `picmash-showcase.mp4`.
+`PICMASH_ACCEPTANCE_BINARY` names the instrumented Picmash, as for acceptance.
+The specimen is the freely licensed Wikimedia Commons photographs listed in
+`crates/picmash-acceptance/specimen/cats.toml`, fetched into the host cache and
+admitted only by SHA-256. Every take publishes `specimen-credits.md`; any
+published still or film carries those credits.

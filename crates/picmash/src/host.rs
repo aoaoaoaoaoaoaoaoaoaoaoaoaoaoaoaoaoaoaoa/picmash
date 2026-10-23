@@ -13,7 +13,7 @@ pub fn run(ingress: Ingress, ctx: egui::Context, collection: Option<PathBuf>) ->
 impl NativeApp for Picmash {
     const PRODUCT: ProductIdentity = PRODUCT;
     const RELEASE: &'static str = env!("CARGO_PKG_VERSION");
-    const WINDOW: WindowSpec = WindowSpec::new("picmash", [1_420.0, 900.0]);
+    const WINDOW: WindowSpec = WindowSpec::new("picmash", [1_440.0, 920.0]);
 
     fn draw(&mut self, ui: &mut egui::Ui) {
         self.pulse(ui);
