@@ -173,13 +173,9 @@ fn judge(story: &mut Duel<'_, '_>, side: Side, duels: u64) -> Result<()> {
     Ok(())
 }
 
-/// Develop a still once the pointer has left the window and the water has come
-/// to rest, so that neither hover nor ripple marks it.
+/// Develop a still once the pointer has left the window, so no hover marks it;
+/// the story's rest waits out the water.
 fn freeze(story: &mut Duel<'_, '_>, still: &ArtifactStem) -> Result<()> {
-    let _calm = story
-        .leave()?
-        .until(Condition::new("water at rest", |state: &Observation| {
-            state.water_calm
-        }))?;
+    let _withdrawn = story.leave()?;
     story.still(still)
 }

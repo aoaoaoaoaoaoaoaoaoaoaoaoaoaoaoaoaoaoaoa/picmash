@@ -44,7 +44,6 @@ struct Observation {
     images_per_row: u16,
     tiles_wanting: Option<usize>,
     thumbnails_faulted: bool,
-    water_calm: bool,
     viewer_open: bool,
     viewer_ready: bool,
     guide_open: bool,
