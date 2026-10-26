@@ -22,10 +22,10 @@ arboard = "3.6.1"
 atomic-write-file = "0.3.1"
 base64 = "0.23.1"
 blake3 = "1.8.7"
-brass_poolrooms = "0.15.0"
+brass_poolrooms = "0.16.0"
 crossbeam-channel = "0.5.16"
 egui = "=0.36.1"
-eternalist-apps = "0.12.0"
+eternalist-apps = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 jxl-oxide = { version = "0.12.6", features = ["image"] }
 md5 = "0.8.1"

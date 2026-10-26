@@ -250,15 +250,15 @@ dependencies = [
 
 [[package]]
 name = "brass_foundry"
-version = "0.15.4"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb0a1aa4c5a5cfe36b167367fa729751f218c42cf151595fb1f157b6614a97b7"
+checksum = "80b5c28b5d3d56dccd0475c83fa72f7c00ad9e43268889ee11b338d6f450f823"
 
 [[package]]
 name = "brass_poolrooms"
-version = "0.15.4"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c071a241eb19ae351ca8fc66dd0ab1d1a1d2bd431bb27fb298e6f436f7568d1"
+checksum = "c0c9fdcb7405459fe9eafe244e8a3265e73529a8dbec3641392a8caf5092a032"
 dependencies = [
  "anyhow",
  "brass_foundry",
@@ -405,9 +405,9 @@ dependencies = [
 
 [[package]]
 name = "clipboard-win"
-version = "5.4.1"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+checksum = "052af7878466feccda12ba7a6a67d019d712f296809559b47c12c8cc196d3a9a"
 dependencies = [
  "error-code",
 ]
@@ -463,6 +463,12 @@ checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "constant_time_eq"
@@ -616,6 +622,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer",
+ "const-oid",
  "crypto-common",
 ]
 
@@ -730,10 +737,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "egui-tester"
-version = "0.9.14"
+name = "egui-demo"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba0beb8008e84f8b9571f560c493141d7b5c319ab6986670128d47239ca74222"
+checksum = "4f590c33d985b7b0e99321f7686283d0396aef6c1926019c8c225cbd045c1123"
+dependencies = [
+ "egui-tester",
+ "font8x8",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "egui-tester"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2100d17dc3021280bd7ba86975cee913e633694ac2f723093fb5283ee0ed8699"
 dependencies = [
  "bitflags 2.13.1",
  "egui-tester-witness",
@@ -751,9 +771,9 @@ dependencies = [
 
 [[package]]
 name = "egui-tester-witness"
-version = "0.9.14"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d19998dfbd2f8939dea965fbe6994bec5e23b60776760a304a30204e5300648"
+checksum = "dbb0b84639b93cf2bcedb24f2101a5ce26280d7064caf8f6357342298b3abffc"
 dependencies = [
  "egui",
  "rustix 1.1.4",
@@ -872,9 +892,9 @@ checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 
 [[package]]
 name = "eternalist-apps"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33e11bb1fc9f21742bc0d9dfd058d730629b00325f2bb1be83455739fc9f7bc3"
+checksum = "ee74d390690053257788d60357ca66abd687dd6f48def5763336d9c0aac63cf0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -988,6 +1008,12 @@ checksum = "e64eb721ca85a34323425f4041adc5d82704d3782d5f8f03793bc012419dce23"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "foreign-types"
@@ -2459,11 +2485,15 @@ name = "picmash-acceptance"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "egui-demo",
  "egui-tester",
  "image",
  "picmash",
  "picmash-contract",
  "serde",
+ "sha2",
+ "toml",
+ "ureq",
 ]
 
 [[package]]
@@ -3393,7 +3423,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

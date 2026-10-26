@@ -8,8 +8,8 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
-egui-demo = "0.9.14"
-egui-tester = "0.9.14"
+egui-demo = "0.10.0"
+egui-tester = "0.10.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 picmash = { path = "../picmash", features = ["egui-test"] }
 picmash-contract = { path = "../picmash-contract" }
