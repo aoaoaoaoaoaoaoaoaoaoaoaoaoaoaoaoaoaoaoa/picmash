@@ -138,10 +138,6 @@ pub struct Picmash {
     water: Surface,
     /// Visible browse tiles lacking a texture at their requested resolution,
     /// counted by the frame that painted the browser; `None` in any other.
-    #[cfg_attr(
-        not(feature = "egui-test"),
-        expect(dead_code, reason = "only the egui-test witness reads it")
-    )]
     tiles_wanting: Option<usize>,
 }
 
