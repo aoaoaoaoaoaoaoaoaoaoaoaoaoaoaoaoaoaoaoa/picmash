@@ -103,12 +103,14 @@ struct FairQueue {
 }
 
 impl FairQueue {
-    fn choose(
-        &mut self,
+    /// The eligible source owed service first: least service per unit of
+    /// weight, ties to the lower index.
+    fn next(
+        &self,
         sources: &[SourceState],
         eligible: impl Fn(SourceIx) -> bool,
     ) -> Option<SourceIx> {
-        let chosen = sources
+        sources
             .iter()
             .enumerate()
             .filter(|(index, source)| source.weight > 0 && eligible(SourceIx::new(*index)))
@@ -120,7 +122,15 @@ impl FairQueue {
                     .cmp(&right_finish)
                     .then_with(|| left_index.cmp(right_index))
             })
-            .map(|(index, _)| SourceIx::new(index))?;
+            .map(|(index, _)| SourceIx::new(index))
+    }
+
+    fn choose(
+        &mut self,
+        sources: &[SourceState],
+        eligible: impl Fn(SourceIx) -> bool,
+    ) -> Option<SourceIx> {
+        let chosen = self.next(sources, &eligible)?;
         self.services[chosen.get()] += 1;
         if self.services[chosen.get()] >= SERVICE_REBASE {
             let rounds = sources
@@ -474,6 +484,26 @@ impl Machine {
         }
         self.audit()?;
         Ok(self.offered.as_ref())
+    }
+
+    /// The candidate the next remote pair would show were the live prompt
+    /// resolved now and nothing else to change: the live offer unless it is
+    /// `resolving`, else the one `offer` would choose.
+    pub fn next_offer(&self, resolving: bool) -> Option<&Prepared> {
+        if !resolving && let Some(offered) = &self.offered {
+            return Some(offered);
+        }
+        if self.promoting.len() == ARCHIVE_CAPACITY {
+            return None;
+        }
+        let source = self.offer_fairness.next(&self.sources, |source| {
+            self.prepared
+                .iter()
+                .any(|candidate| candidate.discovery.source == source)
+        })?;
+        self.prepared
+            .iter()
+            .find(|candidate| candidate.discovery.source == source)
     }
 
     pub fn retire_offer(&mut self) -> Result<Option<Prepared>> {

@@ -54,8 +54,11 @@ left intact.
 identity, collection state, immutable observations, and preference snapshots.
 The native `picmash` crate owns presentation and sends bounded commands to one
 engine worker; scanning, SQLite, image decoding, and preference fitting never
-run on the event-loop thread. `picmash-contract` contains the dependency-light
-UI vocabulary shared with the external `picmash-acceptance` executable.
+run on the event-loop thread. While a pair is judged, two smith threads decode
+the images of the pair likely to follow it: the engine's forecast of the next
+local pair, or the next remote offer and its anchor. `picmash-contract`
+contains the dependency-light UI vocabulary shared with the external
+`picmash-acceptance` executable.
 
 Remote source definitions, sampling chance, reservoir capacity, filters, and
 import policy live under `[remote]` in `picmash.toml`. Existing web-app source

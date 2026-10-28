@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use atomic_write_file::AtomicWriteFile;
-use crossbeam_channel::{Receiver, Sender, TrySendError, after, bounded, select};
+use crossbeam_channel::{Receiver, Sender, TrySendError, after, bounded, never, select};
 use eternalist_apps::NativeWake;
 use image::{RgbaImage, imageops};
 use picmash_contract::Side;
@@ -22,6 +22,7 @@ use std::{
 
 use crate::{
     application_paths::{ApplicationPaths, PicmashPaths as _},
+    armory::{Armory, Billet},
     configuration::{ImportPolicy, Probability, RemoteConfig},
     facets::source_label,
     remote::{
@@ -32,7 +33,7 @@ use crate::{
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
-const PROMPT_EDGE: u32 = 1_800;
+pub const PROMPT_EDGE: u32 = 1_800;
 const THUMB_EDGE: u32 = 360;
 const CONTEXT_REVISION: &str = "poolrooms-pairwise-v1";
 
@@ -312,6 +313,7 @@ struct EngineState {
     scan_failures: usize,
     remote: Reactor,
     archive: ArchiveLane,
+    armory: Armory,
     remote_probability: Probability,
     lottery: Lottery,
     remote_anchor_cursor: usize,
@@ -333,21 +335,41 @@ enum LivePrompt {
     },
 }
 
-struct Lottery(u64);
+/// A xorshift stream that knows its next sample before drawing it, so the
+/// blades a draw will choose can be forged ahead of it.
+struct Lottery {
+    state: u64,
+    next: u16,
+}
 
 impl Lottery {
     fn new() -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-        Self(seed ^ 0x9e37_79b9_7f4a_7c15)
+        let mut lottery = Self {
+            state: seed ^ 0x9e37_79b9_7f4a_7c15,
+            next: 0,
+        };
+        lottery.next = lottery.advance();
+        lottery
+    }
+
+    fn advance(&mut self) -> u16 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state % 1_000) as u16
+    }
+
+    const fn peek(&self) -> u16 {
+        self.next
     }
 
     fn draw(&mut self) -> u16 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 % 1_000) as u16
+        let drawn = self.next;
+        self.next = self.advance();
+        drawn
     }
 }
 
@@ -381,6 +403,7 @@ fn run(
                 scan_failures: 0,
                 remote,
                 archive,
+                armory: Armory::raise()?,
                 remote_probability: remote_config.sample_probability,
                 lottery: Lottery::new(),
                 remote_anchor_cursor: 0,
@@ -400,6 +423,7 @@ fn run(
     }
     let remote_completions = state.remote.completions().clone();
     let archive_completions = state.archive.completions().clone();
+    let mut forged = state.armory.forged().clone();
     while !stop.load(Ordering::Acquire) {
         let deadline = after(state.remote.wait());
         select! {
@@ -408,12 +432,22 @@ fn run(
                 Err(_) => break,
             },
             recv(remote_completions) -> completion => match completion {
-                Ok(completion) => service_remote(&mut state, &events, &wake, Some(completion)),
+                Ok(completion) => {
+                    service_remote(&mut state, &events, &wake, Some(completion));
+                    provision(&mut state);
+                }
                 Err(_) => break,
             },
             recv(archive_completions) -> completion => match completion {
-                Ok(completion) => service_archive(&mut state, &events, &wake, completion),
+                Ok(completion) => {
+                    service_archive(&mut state, &events, &wake, completion);
+                    provision(&mut state);
+                }
                 Err(_) => break,
+            },
+            recv(forged) -> blade => match blade {
+                Ok(blade) => state.armory.receive(blade),
+                Err(_) => forged = never(),
             },
             recv(deadline) -> _ => service_remote(&mut state, &events, &wake, None),
         }
@@ -466,6 +500,7 @@ fn conduct(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake, c
     if let Err(error) = result {
         publish(events, wake, Event::Fault(format!("{error:#}")));
     }
+    provision(state);
 }
 
 fn load_collection(
@@ -494,6 +529,7 @@ fn load_collection(
     state.collection = Some(scan.collection_id);
     state.session = Some(session.id);
     state.prompt = None;
+    state.armory.order([]);
     state.scan_failures = scan.failures.len();
     state.remote.activate()?;
     publish(events, wake, Event::Remote(state.remote.summary()));
@@ -527,7 +563,6 @@ fn choose(
         .context("there is no live comparison to judge")?;
     match prompt {
         LivePrompt::Local { prompt, born } => {
-            publish(events, wake, Event::Busy("FORGING NEXT PAIR"));
             let prompt = prompt.clone();
             let response_ms = elapsed_ms(*born);
             let winner = match side {
@@ -541,7 +576,9 @@ fn choose(
                 Some(response_ms),
             )?;
             state.prompt = None;
-            publish_collection(state, events, wake)
+            forge_pair(state, events, wake)?;
+            let collection = active_collection(state)?;
+            refresh_collection(state, events, wake, collection)
         }
         LivePrompt::Remote {
             candidate,
@@ -872,13 +909,8 @@ fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake
     let prompt = state.engine.propose_comparison(active_session(state)?)?;
     let left = card_for(state, &prompt.left.asset_id)?.clone();
     let right = card_for(state, &prompt.right.asset_id)?.clone();
-    let left_blade =
-        decode_thumbnail(&left.path, left.presentation.rotation_quarters, PROMPT_EDGE)?;
-    let right_blade = decode_thumbnail(
-        &right.path,
-        right.presentation.rotation_quarters,
-        PROMPT_EDGE,
-    )?;
+    let left_blade = state.armory.draw(&billet(&left))?;
+    let right_blade = state.armory.draw(&billet(&right))?;
     state.prompt = Some(LivePrompt::Local {
         prompt,
         born: Instant::now(),
@@ -896,8 +928,51 @@ fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake
     Ok(())
 }
 
+/// Orders from the armory the blades the next pair will show: the next offer
+/// and its anchor when the next draw falls to a remote challenger, else the
+/// pair the engine forecasts once the live prompt is judged.
+fn provision(state: &mut EngineState) {
+    let resolving = matches!(state.prompt, Some(LivePrompt::Remote { .. }));
+    let mut billets = Vec::new();
+    if !state.cards.is_empty()
+        && (state.cards.len() < 2 || state.remote_probability.draw(state.lottery.peek()))
+        && let Some(candidate) = state.remote.next_offer(resolving)
+    {
+        billets.push(billet(
+            &state.cards[state.remote_anchor_cursor % state.cards.len()],
+        ));
+        billets.push(Billet {
+            path: candidate.cache_path.clone(),
+            rotation_quarters: 0,
+        });
+    } else if state.cards.len() >= 2
+        && let Some(session) = &state.session
+    {
+        let pending = if let Some(LivePrompt::Local { prompt, .. }) = &state.prompt {
+            Some([&prompt.left.asset_id, &prompt.right.asset_id])
+        } else {
+            None
+        };
+        if let Ok(Some(pair)) = state.engine.forecast_comparison(session, pending) {
+            billets.extend(
+                pair.iter()
+                    .filter_map(|asset| card_for(state, asset).ok())
+                    .map(billet),
+            );
+        }
+    }
+    state.armory.order(billets);
+}
+
+fn billet(card: &Card) -> Billet {
+    Billet {
+        path: card.path.clone(),
+        rotation_quarters: card.presentation.rotation_quarters,
+    }
+}
+
 fn publish_remote_pair(
-    state: &EngineState,
+    state: &mut EngineState,
     events: &Sender<Event>,
     wake: &NativeWake,
     candidate: &Prepared,
@@ -913,10 +988,13 @@ fn publish_remote_pair(
     else {
         bail!("remote pair was replaced by a local prompt");
     };
+    let rotation_quarters = *rotation_quarters;
     let left = card_for(state, &anchor.asset_id)?.clone();
-    let left_blade =
-        decode_thumbnail(&left.path, left.presentation.rotation_quarters, PROMPT_EDGE)?;
-    let right_blade = decode_thumbnail(&candidate.cache_path, *rotation_quarters, PROMPT_EDGE)?;
+    let left_blade = state.armory.draw(&billet(&left))?;
+    let right_blade = state.armory.draw(&Billet {
+        path: candidate.cache_path.clone(),
+        rotation_quarters,
+    })?;
     let (width, height) = if rotation_quarters % 2 == 0 {
         (candidate.discovery.width, candidate.discovery.height)
     } else {
@@ -932,7 +1010,7 @@ fn publish_remote_pair(
                 width,
                 height,
                 #[cfg(feature = "egui-test")]
-                rotation_quarters: *rotation_quarters,
+                rotation_quarters,
                 title: candidate.discovery.title.clone(),
                 source: source_label(&candidate.discovery.upstream),
                 stream: candidate.discovery.stream_title.clone(),
@@ -1159,7 +1237,7 @@ fn elapsed_ms(born: Instant) -> u32 {
     u32::try_from(born.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
-fn decode_thumbnail(path: &Path, rotation_quarters: u8, edge: u32) -> Result<Blade> {
+pub fn decode_thumbnail(path: &Path, rotation_quarters: u8, edge: u32) -> Result<Blade> {
     let image = decode_rgba(path, rotation_quarters)?;
     Ok(blade(fitted_thumbnail(&image, edge, edge)))
 }

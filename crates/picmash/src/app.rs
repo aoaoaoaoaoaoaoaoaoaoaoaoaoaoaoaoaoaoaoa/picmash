@@ -43,6 +43,9 @@ const DUEL_CONTROL_HEIGHT: f32 = MechanismSize::Small.side();
 const DUEL_PANEL_HEIGHT: f32 = DUEL_CONTROL_HEIGHT + 8.0;
 const DUEL_PANEL_BLEED: f32 = 2.0;
 const BRONZE_RIM: f32 = 4.0;
+/// How long a judged pair holds the chamber before the wait for its
+/// successor shows: a successor forged ahead arrives well within it.
+const CHOICE_GRACE: Duration = Duration::from_millis(250);
 const WATER: SettingSpec = SettingSpec::new(
     "living_water",
     "LIVING WATER",
@@ -93,6 +96,13 @@ struct PairView {
     right_texture: TextureHandle,
 }
 
+/// A judgment sent to the worker, holding its pair until the next arrives.
+#[derive(Clone, Copy)]
+struct Choice {
+    sent: Instant,
+    status: &'static str,
+}
+
 #[derive(Clone, Copy)]
 enum Action {
     Choose(Side),
@@ -138,6 +148,10 @@ pub struct Picmash {
     thumbnails_faulted: HashSet<ThumbKey>,
     viewer: Option<Viewer>,
     busy: bool,
+    /// The judgment awaiting its next pair.
+    choice: Option<Choice>,
+    /// The chamber shows the worker's wait this frame.
+    wait_shown: bool,
     scan_progress: Option<ScanProgress>,
     status: String,
     panels: PanelNavigator,
@@ -198,6 +212,8 @@ impl Picmash {
             thumbnails_faulted: HashSet::new(),
             viewer: None,
             busy: true,
+            choice: None,
+            wait_shown: true,
             scan_progress: None,
             status: "WAKING ENGINE".to_owned(),
             panels: PanelNavigator::default(),
@@ -268,6 +284,7 @@ impl Picmash {
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {
+        self.wait_shown = self.shows_wait(ui.ctx());
         let mut panels = std::mem::take(&mut self.panels);
         let inspector = Inspector::new("picmash-controls")
             .scroll_id("picmash-controls-scroll")
@@ -314,12 +331,17 @@ impl Picmash {
                 let _none = ui.label(chrome::muted("NO COLLECTION CLAIMED"));
                 ui.add_space(5.0);
             }
-            let open = plate_enabled(ui, !self.busy, "OPEN COLLECTION", false);
+            let open = plate_enabled(ui, !self.wait_shown, "OPEN COLLECTION", false);
             witness::response(ui, Target::OpenCollection, &open);
             if open.clicked() {
                 self.open_collection(ui.ctx());
             }
-            let rescan = plate_enabled(ui, self.summary.is_some() && !self.busy, "RESCAN", false);
+            let rescan = plate_enabled(
+                ui,
+                self.summary.is_some() && !self.wait_shown,
+                "RESCAN",
+                false,
+            );
             witness::response(ui, Target::Rescan, &rescan);
             if rescan.clicked() {
                 self.send(Command::Rescan, true, "SCANNING COLLECTION");
@@ -417,8 +439,8 @@ impl Picmash {
         let arena = ui.available_rect_before_wrap();
         self.water.begin(Domain::shelf(arena));
         self.water
-            .set_floor(self.busy.then_some(Floor::shallow(arena)));
-        match (self.busy, self.summary.is_some(), self.mode) {
+            .set_floor(self.wait_shown.then_some(Floor::shallow(arena)));
+        match (self.wait_shown, self.summary.is_some(), self.mode) {
             (true, _, _) => {
                 let _rect = match self.scan_progress {
                     Some(progress) => {
@@ -513,8 +535,11 @@ impl Picmash {
             &right.0,
             right_layout.panel,
         ));
-        for action in actions {
-            self.apply_action(action);
+        // A judged pair holding the chamber through its grace is inert.
+        if !self.busy {
+            for action in actions {
+                self.apply_action(action);
+            }
         }
     }
 
@@ -682,7 +707,12 @@ impl Picmash {
                 } else {
                     "FORGING NEXT PAIR"
                 };
-                self.send(Command::Choose(side), true, status);
+                if self.dispatch(Command::Choose(side), true) {
+                    self.choice = Some(Choice {
+                        sent: Instant::now(),
+                        status,
+                    });
+                }
             }
             Action::Favorite(side) => {
                 let remote = self.pair.as_ref().is_some_and(|pair| match side {
@@ -711,16 +741,46 @@ impl Picmash {
     }
 
     fn send(&mut self, command: Command, waits: bool, status: &'static str) {
+        if self.dispatch(command, waits) {
+            status.clone_into(&mut self.status);
+        }
+    }
+
+    /// Sends `command` to the worker; one that waits holds the chamber until
+    /// the worker answers.
+    fn dispatch(&mut self, command: Command, waits: bool) -> bool {
+        self.choice = None;
         match self.worker.send(command) {
             Ok(()) => {
                 self.busy |= waits;
-                status.clone_into(&mut self.status);
+                true
             }
             Err(error) => {
                 self.busy = false;
                 self.status = format!("FAULT · {error:#}");
+                false
             }
         }
+    }
+
+    /// Whether the chamber shows the worker's wait. A choice holds its pair
+    /// for [`CHOICE_GRACE`] first, so a successor forged ahead replaces it
+    /// without a flash of waiting.
+    fn shows_wait(&mut self, ctx: &egui::Context) -> bool {
+        if !self.busy {
+            return false;
+        }
+        let Some(choice) = self.choice else {
+            return true;
+        };
+        let remaining = CHOICE_GRACE.saturating_sub(choice.sent.elapsed());
+        if !remaining.is_zero() && self.pair.is_some() {
+            ctx.request_repaint_after(remaining);
+            return false;
+        }
+        choice.status.clone_into(&mut self.status);
+        self.choice = None;
+        true
     }
 
     fn open_collection(&mut self, ctx: &egui::Context) {
@@ -824,6 +884,11 @@ impl Picmash {
             }
             Event::CatalogRefreshed { summary, cards } => {
                 self.summary = Some(summary);
+                if let Some(view) = self.pair.as_mut() {
+                    for card in [&mut view.pair.left, &mut view.pair.right] {
+                        refresh_card(card, &cards);
+                    }
+                }
                 self.cards = cards;
                 self.thumbnails_faulted.clear();
                 self.rebuild_browse_indices();
@@ -838,6 +903,7 @@ impl Picmash {
                     right_texture,
                 });
                 self.busy = false;
+                self.choice = None;
                 self.scan_progress = None;
                 if remote {
                     "REMOTE CHALLENGER · CHOOSE, FAVORITE, REJECT, OR REJECT STREAM"
@@ -1756,6 +1822,18 @@ fn file_name(path: &Path) -> String {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// Brings a shown local card's statistics up to date with a refreshed
+/// catalog, provided the catalog still names the same rendering.
+fn refresh_card(card: &mut PairCard, cards: &[Card]) {
+    if let PairCard::Local(card) = card
+        && let Some(fresh) = cards
+            .iter()
+            .find(|fresh| fresh.presentation == card.presentation && fresh.path == card.path)
+    {
+        card.clone_from(fresh);
+    }
 }
 
 fn upload(ctx: &egui::Context, name: &str, blade: &Blade) -> TextureHandle {

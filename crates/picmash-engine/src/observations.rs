@@ -81,101 +81,9 @@ impl Engine {
         let mut connection = self.connection.lock();
         let tx = connection.transaction()?;
         let collection_id = active_session_collection(&tx, session_id)?;
-        let pair = tx
-            .query_row(
-                r"
-                WITH representatives AS (
-                    SELECT o.asset_id, o.id AS occurrence_id, a.render_digest,
-                           o.rotation_quarters,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY o.asset_id
-                               ORDER BY o.width * o.height DESC, o.byte_len DESC, o.path ASC
-                           ) AS rank
-                    FROM pm_occurrences o
-                    JOIN pm_assets a ON a.id = o.asset_id
-                    JOIN pm_collection_assets ca
-                      ON ca.collection_id = o.collection_id AND ca.asset_id = o.asset_id
-                    WHERE o.collection_id = ?1 AND o.present = 1 AND ca.hidden = 0
-                ), latest_snapshot AS (
-                    SELECT id FROM pm_preference_snapshots
-                    WHERE collection_id = ?1 ORDER BY id DESC LIMIT 1
-                ), duel_counts AS (
-                    SELECT asset_id, COUNT(*) AS duel_count
-                    FROM (
-                        SELECT d.left_asset_id AS asset_id
-                        FROM pm_asset_duels d
-                        JOIN pm_observations e ON e.id = d.observation_id
-                        JOIN pm_sessions s ON s.id = e.session_id
-                        WHERE s.collection_id = ?1
-                        UNION ALL
-                        SELECT d.right_asset_id AS asset_id
-                        FROM pm_asset_duels d
-                        JOIN pm_observations e ON e.id = d.observation_id
-                        JOIN pm_sessions s ON s.id = e.session_id
-                        WHERE s.collection_id = ?1
-                    )
-                    GROUP BY asset_id
-                ), visible AS (
-                    SELECT r.asset_id, r.occurrence_id, r.render_digest, r.rotation_quarters,
-                           COALESCE(ps.score, 0.0) AS score,
-                           COALESCE(dc.duel_count, 0) AS duel_count
-                    FROM representatives r
-                    LEFT JOIN latest_snapshot ls
-                    LEFT JOIN pm_preference_scores ps
-                      ON ps.snapshot_id = ls.id AND ps.asset_id = r.asset_id
-                    LEFT JOIN duel_counts dc ON dc.asset_id = r.asset_id
-                    WHERE r.rank = 1
-                ), anchor AS (
-                    SELECT * FROM visible
-                    ORDER BY duel_count ASC, asset_id ASC
-                    LIMIT 1
-                ), pair_counts AS (
-                    SELECT
-                        CASE WHEN d.left_asset_id < d.right_asset_id
-                            THEN d.left_asset_id ELSE d.right_asset_id END AS low_id,
-                        CASE WHEN d.left_asset_id < d.right_asset_id
-                            THEN d.right_asset_id ELSE d.left_asset_id END AS high_id,
-                        COUNT(*) AS duel_count
-                    FROM pm_asset_duels d
-                    JOIN pm_observations o ON o.id = d.observation_id
-                    JOIN pm_sessions s ON s.id = o.session_id
-                    WHERE s.collection_id = ?1
-                    GROUP BY low_id, high_id
-                )
-                SELECT a.asset_id, a.occurrence_id, a.render_digest, a.rotation_quarters,
-                       opponent.asset_id, opponent.occurrence_id,
-                       opponent.render_digest, opponent.rotation_quarters,
-                       (SELECT id FROM latest_snapshot)
-                FROM anchor a
-                JOIN visible opponent ON opponent.asset_id != a.asset_id
-                LEFT JOIN pair_counts pc ON
-                    pc.low_id = MIN(a.asset_id, opponent.asset_id)
-                    AND pc.high_id = MAX(a.asset_id, opponent.asset_id)
-                ORDER BY COALESCE(pc.duel_count, 0) ASC,
-                         opponent.duel_count ASC,
-                         ABS(a.score - opponent.score) ASC,
-                         opponent.asset_id ASC
-                LIMIT 1
-                ",
-                [collection_id.get()],
-                |row| {
-                    Ok(PairRow {
-                        left_id: row.get(0)?,
-                        left_occurrence: row.get(1)?,
-                        left_render: row.get(2)?,
-                        left_rotation: row.get(3)?,
-                        right_id: row.get(4)?,
-                        right_occurrence: row.get(5)?,
-                        right_render: row.get(6)?,
-                        right_rotation: row.get(7)?,
-                        snapshot_id: row.get(8)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or_else(|| {
-                Fault::InvalidInput("a comparison requires at least two visible assets".to_owned())
-            })?;
+        let pair = select_pair(&tx, collection_id, None)?.ok_or_else(|| {
+            Fault::InvalidInput("a comparison requires at least two visible assets".to_owned())
+        })?;
         let issued = tx.query_row(
             "SELECT COUNT(*) FROM pm_prompts p
              JOIN pm_sessions s ON s.id = p.session_id
@@ -187,6 +95,28 @@ impl Engine {
         insert_prompt(&tx, &prompt)?;
         tx.commit()?;
         Ok(prompt)
+    }
+
+    /// The pair [`Engine::propose_comparison`] would propose once the
+    /// `pending` assets had dueled, were nothing else to change. A forecast
+    /// issues nothing: it lets the next pair's images be developed while the
+    /// pending pair is judged.
+    pub fn forecast_comparison(
+        &self,
+        session_id: &SessionId,
+        pending: Option<[&AssetId; 2]>,
+    ) -> Result<Option<[AssetId; 2]>> {
+        let mut connection = self.connection.lock();
+        let tx = connection.transaction()?;
+        let collection_id = active_session_collection(&tx, session_id)?;
+        select_pair(&tx, collection_id, pending)?
+            .map(|pair| {
+                Ok([
+                    AssetId::parse(pair.left_id)?,
+                    AssetId::parse(pair.right_id)?,
+                ])
+            })
+            .transpose()
     }
 
     pub fn record_comparison(
@@ -1050,6 +980,118 @@ fn similarity_digest_parts(
         ]);
     }
     parts
+}
+
+/// The policy's next pair in a collection: the least-dueled anchor against
+/// the opponent it has met least, then the least dueled, then the nearest in
+/// preference. `pending` counts as one more duel between its two assets.
+fn select_pair(
+    tx: &Transaction<'_>,
+    collection_id: CollectionId,
+    pending: Option<[&AssetId; 2]>,
+) -> Result<Option<PairRow>> {
+    let first = pending.map(|[first, _]| first.as_str());
+    let second = pending.map(|[_, second]| second.as_str());
+    Ok(tx
+        .query_row(
+            r"
+            WITH representatives AS (
+                SELECT o.asset_id, o.id AS occurrence_id, a.render_digest,
+                       o.rotation_quarters,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY o.asset_id
+                           ORDER BY o.width * o.height DESC, o.byte_len DESC, o.path ASC
+                       ) AS rank
+                FROM pm_occurrences o
+                JOIN pm_assets a ON a.id = o.asset_id
+                JOIN pm_collection_assets ca
+                  ON ca.collection_id = o.collection_id AND ca.asset_id = o.asset_id
+                WHERE o.collection_id = ?1 AND o.present = 1 AND ca.hidden = 0
+            ), latest_snapshot AS (
+                SELECT id FROM pm_preference_snapshots
+                WHERE collection_id = ?1 ORDER BY id DESC LIMIT 1
+            ), duel_counts AS (
+                SELECT asset_id, COUNT(*) AS duel_count
+                FROM (
+                    SELECT d.left_asset_id AS asset_id
+                    FROM pm_asset_duels d
+                    JOIN pm_observations e ON e.id = d.observation_id
+                    JOIN pm_sessions s ON s.id = e.session_id
+                    WHERE s.collection_id = ?1
+                    UNION ALL
+                    SELECT d.right_asset_id AS asset_id
+                    FROM pm_asset_duels d
+                    JOIN pm_observations e ON e.id = d.observation_id
+                    JOIN pm_sessions s ON s.id = e.session_id
+                    WHERE s.collection_id = ?1
+                    UNION ALL
+                    SELECT ?2 WHERE ?2 IS NOT NULL
+                    UNION ALL
+                    SELECT ?3 WHERE ?3 IS NOT NULL
+                )
+                GROUP BY asset_id
+            ), visible AS (
+                SELECT r.asset_id, r.occurrence_id, r.render_digest, r.rotation_quarters,
+                       COALESCE(ps.score, 0.0) AS score,
+                       COALESCE(dc.duel_count, 0) AS duel_count
+                FROM representatives r
+                LEFT JOIN latest_snapshot ls
+                LEFT JOIN pm_preference_scores ps
+                  ON ps.snapshot_id = ls.id AND ps.asset_id = r.asset_id
+                LEFT JOIN duel_counts dc ON dc.asset_id = r.asset_id
+                WHERE r.rank = 1
+            ), anchor AS (
+                SELECT * FROM visible
+                ORDER BY duel_count ASC, asset_id ASC
+                LIMIT 1
+            ), pair_counts AS (
+                SELECT low_id, high_id, COUNT(*) AS duel_count
+                FROM (
+                    SELECT
+                        CASE WHEN d.left_asset_id < d.right_asset_id
+                            THEN d.left_asset_id ELSE d.right_asset_id END AS low_id,
+                        CASE WHEN d.left_asset_id < d.right_asset_id
+                            THEN d.right_asset_id ELSE d.left_asset_id END AS high_id
+                    FROM pm_asset_duels d
+                    JOIN pm_observations o ON o.id = d.observation_id
+                    JOIN pm_sessions s ON s.id = o.session_id
+                    WHERE s.collection_id = ?1
+                    UNION ALL
+                    SELECT MIN(?2, ?3), MAX(?2, ?3) WHERE ?2 IS NOT NULL
+                )
+                GROUP BY low_id, high_id
+            )
+            SELECT a.asset_id, a.occurrence_id, a.render_digest, a.rotation_quarters,
+                   opponent.asset_id, opponent.occurrence_id,
+                   opponent.render_digest, opponent.rotation_quarters,
+                   (SELECT id FROM latest_snapshot)
+            FROM anchor a
+            JOIN visible opponent ON opponent.asset_id != a.asset_id
+            LEFT JOIN pair_counts pc ON
+                pc.low_id = MIN(a.asset_id, opponent.asset_id)
+                AND pc.high_id = MAX(a.asset_id, opponent.asset_id)
+            ORDER BY COALESCE(pc.duel_count, 0) ASC,
+                     opponent.duel_count ASC,
+                     ABS(a.score - opponent.score) ASC,
+                     opponent.asset_id ASC
+            LIMIT 1
+            ",
+            params![collection_id.get(), first, second],
+            |row| {
+                Ok(PairRow {
+                    left_id: row.get(0)?,
+                    left_occurrence: row.get(1)?,
+                    left_render: row.get(2)?,
+                    left_rotation: row.get(3)?,
+                    right_id: row.get(4)?,
+                    right_occurrence: row.get(5)?,
+                    right_render: row.get(6)?,
+                    right_rotation: row.get(7)?,
+                    snapshot_id: row.get(8)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 struct PairRow {

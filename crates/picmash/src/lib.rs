@@ -2,6 +2,7 @@
 
 mod app;
 mod application_paths;
+mod armory;
 use application_paths::PicmashPaths as _;
 mod commands;
 mod configuration;

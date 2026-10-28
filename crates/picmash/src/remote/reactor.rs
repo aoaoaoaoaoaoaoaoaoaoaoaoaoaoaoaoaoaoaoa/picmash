@@ -220,6 +220,12 @@ impl Reactor {
         Ok(self.machine.offer()?.cloned())
     }
 
+    /// The candidate the next remote pair would show; see
+    /// `Machine::next_offer`.
+    pub fn next_offer(&self, resolving: bool) -> Option<&Prepared> {
+        self.machine.next_offer(resolving)
+    }
+
     pub fn take_restored_promotions(&mut self) -> Vec<PromotionIntent> {
         std::mem::take(&mut self.restored_promotions)
     }

@@ -93,6 +93,10 @@ fn catalog_judgment_and_preference_form_one_durable_law() -> Result<()> {
     let mirrored = engine.propose_comparison(&session.id)?;
     assert_eq!(prompt.left.asset_id, mirrored.right.asset_id);
     assert_eq!(prompt.right.asset_id, mirrored.left.asset_id);
+    let forecast = engine.forecast_comparison(
+        &session.id,
+        Some([&prompt.left.asset_id, &prompt.right.asset_id]),
+    )?;
     let command = CommandId::parse("duel-1")?;
     let observation =
         engine.record_comparison(&prompt.id, &prompt.left.asset_id, &command, Some(125))?;
@@ -104,6 +108,9 @@ fn catalog_judgment_and_preference_form_one_durable_law() -> Result<()> {
         engine.record_comparison(&prompt.id, &prompt.right.asset_id, &command, Some(125)),
         Err(Fault::CommandCollision)
     ));
+    let next = engine.propose_comparison(&session.id)?;
+    let forecast = forecast.context("forecast pair")?;
+    assert!(forecast.contains(&next.left.asset_id) && forecast.contains(&next.right.asset_id));
 
     engine.record_threshold(
         &session.id,
