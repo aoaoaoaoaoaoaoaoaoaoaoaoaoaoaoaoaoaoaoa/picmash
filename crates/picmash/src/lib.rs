@@ -5,6 +5,7 @@ mod application_paths;
 use application_paths::PicmashPaths as _;
 mod commands;
 mod configuration;
+mod facets;
 mod host;
 mod remote;
 mod viewer;
@@ -36,7 +37,8 @@ pub fn run() -> anyhow::Result<()> {
             let engine = picmash_engine::Engine::open(paths.database_path())?;
             let report = engine.import_legacy(source)?;
             println!(
-                "imported {} assets and {} observations ({} ambiguous){}",
+                "imported {} assets and {} observations ({} ambiguous){}\n\
+                 attested the provenance of {} legacy imports ({} not in this collection)",
                 report.imported_assets,
                 report.imported_observations,
                 report.ambiguous_observations,
@@ -44,7 +46,9 @@ pub fn run() -> anyhow::Result<()> {
                     " · already imported"
                 } else {
                     ""
-                }
+                },
+                report.attested_provenance,
+                report.unattested_provenance,
             );
             return Ok(());
         }

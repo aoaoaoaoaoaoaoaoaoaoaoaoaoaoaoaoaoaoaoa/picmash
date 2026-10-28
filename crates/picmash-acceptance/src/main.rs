@@ -33,6 +33,7 @@ struct Observation {
     status: String,
     collection: Option<String>,
     visible_assets: usize,
+    browse_visible: usize,
     favorites: usize,
     duels: u64,
     pair_ready: bool,
@@ -464,6 +465,42 @@ recurse = true
     demand(
         contains_jxl(&imported)?,
         "remote promotion did not materialize canonical JPEG XL",
+    )?;
+    click(&session, &app, &mut probe, Target::BrowseMode)?;
+    let everything = promoted.state.visible_assets;
+    let _browsing = probe.wait(&app, WAIT, "browser over every image", |frame| {
+        frame.state.mode == "browse" && frame.state.browse_visible == everything
+    })?;
+    click(&session, &app, &mut probe, Target::ScopeSource(0))?;
+    let _source = probe.wait(&app, WAIT, "browser scoped to the remote source", |frame| {
+        frame.state.browse_visible == 1
+    })?;
+    click(&session, &app, &mut probe, Target::ScopeStream(0))?;
+    let _stream = probe.wait(
+        &app,
+        WAIT,
+        "browser scoped to the promoted thread",
+        |frame| frame.state.browse_visible == 1,
+    )?;
+    for _frame in 0..4 {
+        let _fresh = probe.wait_fresh(&app, WAIT)?;
+    }
+    capture(&session, artifacts, "picmash-scope.png")?;
+    click(&session, &app, &mut probe, Target::BrowseTile)?;
+    let _viewing = probe.wait(&app, WAIT, "promoted image in the viewer", |frame| {
+        frame.state.viewer_open && frame.state.viewer_ready
+    })?;
+    capture(&session, artifacts, "picmash-provenance.png")?;
+    click(&session, &app, &mut probe, Target::ViewerStream)?;
+    let _thread = probe.wait(&app, WAIT, "viewer handing over to its thread", |frame| {
+        !frame.state.viewer_open && frame.state.browse_visible == 1
+    })?;
+    click(&session, &app, &mut probe, Target::ScopeUnsourced)?;
+    let _unsourced = probe.wait(
+        &app,
+        WAIT,
+        "browser scoped to images from no source",
+        |frame| frame.state.browse_visible == everything - 1,
     )?;
     app.terminate()?;
     Ok(())

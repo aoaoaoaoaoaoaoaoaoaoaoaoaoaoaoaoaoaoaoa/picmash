@@ -25,6 +25,7 @@ use crate::{
         supported_path,
     },
     model::{AssetOccurrence, AssetView, Collection, ScanFailure, ScanProgress, ScanReport},
+    provenance::{self, Provenance},
 };
 
 const SCAN_THREADS: usize = 2;
@@ -332,28 +333,37 @@ impl Engine {
                 preference_score: row.get(12)?,
             })
         })?;
-        rows.map(|row| row.map_err(Fault::from).and_then(AssetRow::finish))
-            .collect()
+        let mut views = rows
+            .map(|row| row.map_err(Fault::from).and_then(AssetRow::finish))
+            .collect::<Result<Vec<_>>>()?;
+        let mut ledger = provenance::by_asset(&connection, collection_id)?;
+        for view in &mut views {
+            view.provenance = ledger.remove(&view.id).unwrap_or_default();
+        }
+        Ok(views)
     }
 
     /// Admits one already-materialized file without walking the collection.
-    pub fn ingest_occurrence(
+    /// Admits one occurrence beneath a collection and records the item it was
+    /// admitted from, atomically.
+    pub fn admit(
         &self,
         collection_id: CollectionId,
         path: impl AsRef<Path>,
+        provenance: &Provenance,
     ) -> Result<AssetId> {
         let root = self.collection(collection_id)?.root;
         let path = path.as_ref().canonicalize().at(path.as_ref())?;
         if !path.starts_with(&root) {
             return Err(Fault::InvalidInput(format!(
-                "ingested occurrence {} lies outside collection {}",
+                "admitted occurrence {} lies outside collection {}",
                 path.display(),
                 root.display()
             )));
         }
         if !supported_path(&path) {
             return Err(Fault::InvalidInput(format!(
-                "ingested occurrence {} has an unsupported format",
+                "admitted occurrence {} has an unsupported format",
                 path.display()
             )));
         }
@@ -368,6 +378,7 @@ impl Engine {
         )?;
         let (changed, asset_id) =
             upsert_candidate(&tx, collection_id, generation, &candidate, now)?;
+        provenance::inscribe(&tx, &asset_id, provenance, now)?;
         tx.execute(
             "DELETE FROM pm_scan_failures WHERE collection_id = ?1 AND path = ?2",
             params![collection_id.get(), encode_path(&candidate.path)],
@@ -754,6 +765,7 @@ impl AssetRow {
             duel_count: u32::try_from(self.duel_count)
                 .map_err(|_| Fault::Corrupt("invalid duel count".to_owned()))?,
             preference_score: self.preference_score,
+            provenance: Vec::new(),
         })
     }
 }

@@ -4,7 +4,12 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::fault::{Fault, Result};
 
-pub const SCHEMA_VERSION: i64 = 2;
+type Install = fn(&rusqlite::Transaction<'_>) -> Result<()>;
+
+/// Schema version `n` is installed by `MIGRATIONS[n - 1]`.
+const MIGRATIONS: [Install; 3] = [install_v1, install_v2, install_v3];
+
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 pub fn configure(connection: &Connection) -> Result<()> {
     connection.busy_timeout(Duration::from_secs(15))?;
@@ -24,7 +29,7 @@ pub fn migrate(connection: &mut Connection, now_ns: i64) -> Result<()> {
              applied_at_ns INTEGER NOT NULL
          ) STRICT;",
     )?;
-    let mut current = tx.query_row(
+    let current = tx.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM pm_schema_migrations",
         [],
         |row| row.get::<_, i64>(0),
@@ -34,20 +39,14 @@ pub fn migrate(connection: &mut Connection, now_ns: i64) -> Result<()> {
             "database schema {current} is newer than supported schema {SCHEMA_VERSION}"
         )));
     }
-    if current == 0 {
-        install_v1(&tx)?;
-        tx.execute(
-            "INSERT INTO pm_schema_migrations(version, applied_at_ns) VALUES (?1, ?2)",
-            params![1, now_ns],
-        )?;
-        current = 1;
-    }
-    if current < 2 {
-        install_v2(&tx)?;
-        tx.execute(
-            "INSERT INTO pm_schema_migrations(version, applied_at_ns) VALUES (?1, ?2)",
-            params![2, now_ns],
-        )?;
+    for (version, install) in (1..).zip(MIGRATIONS) {
+        if current < version {
+            install(&tx)?;
+            tx.execute(
+                "INSERT INTO pm_schema_migrations(version, applied_at_ns) VALUES (?1, ?2)",
+                params![version, now_ns],
+            )?;
+        }
     }
     let violation = tx
         .prepare("PRAGMA foreign_key_check")?
@@ -64,6 +63,38 @@ pub fn migrate(connection: &mut Connection, now_ns: i64) -> Result<()> {
 
 fn install_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch("ALTER TABLE pm_occurrences ADD COLUMN file_seal BLOB;")?;
+    Ok(())
+}
+
+fn install_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE pm_sources (
+             id TEXT PRIMARY KEY,
+             kind TEXT NOT NULL CHECK(kind IN ('4chan_board', 'local_directory')),
+             locator BLOB NOT NULL
+         ) STRICT, WITHOUT ROWID;
+
+         CREATE TABLE pm_streams (
+             source_id TEXT NOT NULL REFERENCES pm_sources(id),
+             id TEXT NOT NULL,
+             title TEXT NOT NULL,
+             PRIMARY KEY(source_id, id)
+         ) STRICT, WITHOUT ROWID;
+
+         CREATE TABLE pm_provenance (
+             item_id TEXT PRIMARY KEY,
+             asset_id TEXT NOT NULL REFERENCES pm_assets(id),
+             source_id TEXT NOT NULL,
+             stream_id TEXT NOT NULL,
+             origin_kind TEXT NOT NULL CHECK(origin_kind IN ('url', 'file')),
+             origin BLOB NOT NULL,
+             md5 TEXT CHECK(md5 IS NULL OR origin_kind = 'url'),
+             admitted_at_ns INTEGER NOT NULL,
+             FOREIGN KEY(source_id, stream_id) REFERENCES pm_streams(source_id, id)
+         ) STRICT, WITHOUT ROWID;
+
+         CREATE INDEX pm_provenance_asset ON pm_provenance(asset_id);",
+    )?;
     Ok(())
 }
 

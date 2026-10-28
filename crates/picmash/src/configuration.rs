@@ -1,11 +1,12 @@
 use std::{
-    fmt, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result};
 use brass_poolrooms::chrome::FontScale;
 use eternalist_apps::configuration::Configuration as ConfigurationContract;
+use picmash_engine::{Source, SourceId};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CATALOG_THREADS: u16 = 24;
@@ -131,15 +132,14 @@ pub struct SourceConfig {
 }
 
 impl SourceConfig {
-    pub fn identity(&self) -> SourceIdentity {
+    pub fn identity(&self) -> SourceId {
+        self.source().id()
+    }
+
+    pub fn source(&self) -> Source {
         match &self.upstream {
-            Upstream::FourChanBoard(source) => {
-                SourceIdentity::new(format!("4chan:{}", source.board))
-            }
-            Upstream::LocalDirectory(source) => {
-                let digest = blake3::hash(source.root.as_os_str().as_encoded_bytes());
-                SourceIdentity::new(format!("directory:{}", &digest.to_hex()[..16]))
-            }
+            Upstream::FourChanBoard(board) => Source::FourChanBoard(board.board.clone()),
+            Upstream::LocalDirectory(directory) => Source::LocalDirectory(directory.root.clone()),
         }
     }
 
@@ -264,25 +264,6 @@ pub enum ImportPolicy {
     #[default]
     NotX,
     Hearted,
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SourceIdentity(String);
-
-impl SourceIdentity {
-    pub(crate) fn new(identity: String) -> Self {
-        Self(identity)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for SourceIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]

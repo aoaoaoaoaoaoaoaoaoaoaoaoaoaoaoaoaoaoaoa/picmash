@@ -4,6 +4,7 @@ use crate::{
     fault::{Fault, Result},
     ids::{AssetId, CollectionId, ObservationId, OccurrenceId, PromptId, SessionId, SnapshotId},
     media::{BlobDigest, RenderDigest},
+    provenance::Provenance,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub struct AssetView {
     pub favorite: bool,
     pub duel_count: u32,
     pub preference_score: Option<f64>,
+    pub provenance: Vec<Provenance>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +79,10 @@ pub struct LegacyImportReport {
     pub imported_observations: usize,
     pub ambiguous_observations: usize,
     pub already_imported: bool,
+    /// Legacy provenance records matched to engine assets, on this run.
+    pub attested_provenance: usize,
+    /// Legacy provenance records whose asset the engine does not hold.
+    pub unattested_provenance: usize,
 }
 
 #[derive(Debug, Clone)]

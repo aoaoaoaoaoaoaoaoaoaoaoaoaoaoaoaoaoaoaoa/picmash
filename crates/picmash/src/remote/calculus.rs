@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Result, ensure};
 
 use super::{
-    Discovery, Epoch, Harvest, Prepared, RemoteItemId, SourceIx, StreamId, Summary,
+    Discovery, Epoch, Harvest, ItemId, Prepared, SourceIx, StreamId, Summary,
     promotion::ARCHIVE_CAPACITY,
 };
 use crate::configuration::{RemoteConfig, SourceConfig};
@@ -270,10 +270,10 @@ pub struct Machine {
     catalog_permits: PermitPool<CatalogKind, CATALOG_CONCURRENCY>,
     fetch_permits: PermitPool<FetchKind, FETCH_CONCURRENCY>,
     discovered: VecDeque<Discovery>,
-    fetching: HashMap<RemoteItemId, Discovery>,
+    fetching: HashMap<ItemId, Discovery>,
     prepared: VecDeque<Prepared>,
     offered: Option<Prepared>,
-    promoting: HashMap<RemoteItemId, Prepared>,
+    promoting: HashMap<ItemId, Prepared>,
     blocked_streams: HashSet<(String, StreamId)>,
 }
 
@@ -521,7 +521,7 @@ impl Machine {
         self.audit()
     }
 
-    pub fn finish_promotion(&mut self, item: &RemoteItemId) -> Result<Prepared> {
+    pub fn finish_promotion(&mut self, item: &ItemId) -> Result<Prepared> {
         let candidate = self
             .promoting
             .remove(item)
@@ -530,13 +530,13 @@ impl Machine {
         Ok(candidate)
     }
 
-    pub fn promotion(&self, item: &RemoteItemId) -> Result<&Prepared> {
+    pub fn promotion(&self, item: &ItemId) -> Result<&Prepared> {
         self.promoting
             .get(item)
             .ok_or_else(|| anyhow::anyhow!("remote promotion {item} is not pending"))
     }
 
-    pub fn abort_promotion(&mut self, item: &RemoteItemId) -> Result<()> {
+    pub fn abort_promotion(&mut self, item: &ItemId) -> Result<()> {
         let candidate = self
             .promoting
             .remove(item)
@@ -597,7 +597,7 @@ impl Machine {
         let key = (source_identity.to_owned(), stream.clone());
         let _new = self.blocked_streams.insert(key.clone());
         self.discovered.retain(|candidate| {
-            (candidate.source_identity.as_str(), &candidate.stream_id) != (source_identity, stream)
+            (candidate.upstream.id().as_str(), &candidate.stream_id) != (source_identity, stream)
         });
         let mut retired = Vec::new();
         self.prepared.retain(|candidate| {
@@ -694,10 +694,10 @@ impl Machine {
                 .discoveries
                 .into_iter()
                 .filter(|candidate| candidate.source == harvest.source)
-                .filter(|candidate| candidate.source_identity == source_identity)
+                .filter(|candidate| candidate.upstream.id() == source_identity)
                 .filter(|candidate| {
                     !self.blocked_streams.contains(&(
-                        candidate.source_identity.as_str().to_owned(),
+                        candidate.upstream.id().as_str().to_owned(),
                         candidate.stream_id.clone(),
                     ))
                 })
@@ -739,7 +739,7 @@ impl Machine {
 
 fn stream_key(candidate: &Prepared) -> (String, StreamId) {
     (
-        candidate.discovery.source_identity.as_str().to_owned(),
+        candidate.discovery.upstream.id().as_str().to_owned(),
         candidate.discovery.stream_id.clone(),
     )
 }
@@ -754,10 +754,11 @@ mod tests {
     use crate::{
         configuration::{
             ImageFilter, ImportPolicy, LocalDirectory, MetadataCapacity, Probability,
-            ReservoirCapacity, ScanInterval, SourceIdentity, Upstream, Weight,
+            ReservoirCapacity, ScanInterval, Upstream, Weight,
         },
-        remote::{Origin, StreamId},
+        remote::{OriginSnapshot, StreamId},
     };
+    use picmash_engine::Source;
 
     fn config(weights: &[u8], capacity: u8) -> Result<RemoteConfig> {
         Ok(RemoteConfig {
@@ -784,21 +785,16 @@ mod tests {
         })
     }
 
-    fn discovery(
-        source: SourceIx,
-        source_identity: &SourceIdentity,
-        serial: u64,
-    ) -> Result<Discovery> {
+    fn discovery(source: SourceIx, upstream: &Source, serial: u64) -> Result<Discovery> {
         Ok(Discovery {
             source,
-            source_identity: source_identity.clone(),
-            source_name: format!("source {}", source.get()),
+            upstream: upstream.clone(),
             import_policy: ImportPolicy::NotX,
-            stream_id: StreamId::new(format!("stream-{serial}")),
+            stream_id: StreamId::parse(format!("stream-{serial}"))?,
             stream_title: format!("stream {serial}"),
-            item_id: RemoteItemId::new(format!("item-{}-{serial}", source.get())),
+            item_id: ItemId::parse(format!("item-{}-{serial}", source.get()))?,
             title: format!("item {serial}"),
-            origin: Origin::Local {
+            origin: OriginSnapshot::Local {
                 path: PathBuf::from(format!("/item/{serial}")),
                 stamp: crate::remote::FileStamp::parse(vec![0; 56])?,
             },
@@ -831,13 +827,13 @@ mod tests {
                         },
                         1 => if let Some(intent) = catalogs.pop_front() {
                             let source = intent.source();
-                            let source_identity = intent.config().identity();
+                            let upstream = intent.config().source();
                             let harvest = Harvest {
                                 source,
-                                source_identity: source_identity.clone(),
+                                source_identity: upstream.id(),
                                 discoveries: (0..32).map(|_| {
                                     serial += 1;
-                                    discovery(source, &source_identity, serial)
+                                    discovery(source, &upstream, serial)
                                 }).collect::<Result<Vec<_>>>()?,
                             };
                             machine.settle_catalog(intent.complete(Ok(harvest)), Moment::from_millis(serial * 20_000))?;

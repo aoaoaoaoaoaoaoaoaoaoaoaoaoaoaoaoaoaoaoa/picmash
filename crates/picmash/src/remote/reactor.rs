@@ -11,10 +11,11 @@ use std::{
 
 use anyhow::{Context as _, Result, ensure};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use picmash_engine::Engine;
 
 use super::{
-    CatalogIntent, Epoch, FetchIntent, FetchSettlement, Harvest, Harvester, Machine, Moment,
-    Prepared, PromotionIntent, PromotionJudgment, RemoteItemId, RemoteStore, Summary,
+    CatalogIntent, Epoch, FetchIntent, FetchSettlement, Harvest, Harvester, ItemId, Machine,
+    Moment, Prepared, PromotionIntent, PromotionJudgment, RemoteStore, Summary,
 };
 use crate::{
     application_paths::{ApplicationPaths, PicmashPaths as _},
@@ -256,7 +257,7 @@ impl Reactor {
             .abort_promotion(&intent.candidate.discovery.item_id)
     }
 
-    pub fn promotion_failed(&self, item: &RemoteItemId, message: &str) -> Result<()> {
+    pub fn promotion_failed(&self, item: &ItemId, message: &str) -> Result<()> {
         self.store.promotion_failed(item, message)
     }
 
@@ -276,7 +277,7 @@ impl Reactor {
             .cloned()
             .context("there is no remote offer to veto")?;
         let _retired = self.machine.retire_stream(
-            candidate.discovery.source_identity.as_str(),
+            candidate.discovery.upstream.id().as_str(),
             &candidate.discovery.stream_id,
         )?;
         self.store.reject_stream(&candidate)?;
@@ -292,6 +293,21 @@ impl Reactor {
         );
         self.store.promoted(candidate)?;
         let _finished = self.machine.finish_promotion(item)?;
+        Ok(())
+    }
+
+    /// Attests the provenance of promotions sealed before admissions recorded
+    /// it. A promotion whose occurrence no collection holds stays pending.
+    pub fn attest_promotions(&self, engine: &Engine) -> Result<()> {
+        for pending in self.store.unattested()? {
+            if engine.attest(
+                &pending.archive,
+                &pending.provenance,
+                pending.promoted_at_ns,
+            )? {
+                self.store.attested(&pending.provenance.item)?;
+            }
+        }
         Ok(())
     }
 
@@ -369,7 +385,7 @@ fn restore(
         store.release(&candidate)?;
         released
             .entry(candidate.discovery.source)
-            .or_insert_with(|| (candidate.discovery.source_identity.clone(), Vec::new()))
+            .or_insert_with(|| (candidate.discovery.upstream.id(), Vec::new()))
             .1
             .push(candidate.discovery);
     }

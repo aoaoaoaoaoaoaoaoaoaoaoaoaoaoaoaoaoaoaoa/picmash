@@ -5,7 +5,7 @@ mod sources;
 mod store;
 
 use std::{
-    fmt, fs,
+    fs,
     io::Cursor,
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
@@ -15,7 +15,9 @@ use anyhow::{Context as _, Result, ensure};
 use image::ImageDecoder as _;
 use jxl_oxide::integration::JxlDecoder;
 
-use crate::configuration::{ImportPolicy, SourceIdentity};
+use picmash_engine::{ItemId, Provenance, Source, SourceId, Stream, StreamId};
+
+use crate::configuration::ImportPolicy;
 
 pub use calculus::{CatalogIntent, FetchIntent, FetchSettlement, Machine, Moment};
 pub use sources::Harvester;
@@ -49,34 +51,8 @@ impl SourceIx {
     }
 }
 
-macro_rules! textual_id {
-    ($name:ident) => {
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(String);
-
-        impl $name {
-            pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
-            }
-        }
-    };
-}
-
-textual_id!(StreamId);
-textual_id!(RemoteItemId);
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Origin {
+pub enum OriginSnapshot {
     Network {
         url: String,
         expected_md5: Option<String>,
@@ -85,6 +61,19 @@ pub enum Origin {
         path: PathBuf,
         stamp: FileStamp,
     },
+}
+
+impl OriginSnapshot {
+    /// Where the bytes were read, without the validation the fetch needs.
+    pub fn origin(&self) -> picmash_engine::Origin {
+        match self {
+            Self::Network { url, expected_md5 } => picmash_engine::Origin::Url {
+                url: url.clone(),
+                md5: expected_md5.clone(),
+            },
+            Self::Local { path, .. } => picmash_engine::Origin::File(path.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,19 +117,33 @@ impl FileStamp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Discovery {
     pub source: SourceIx,
-    pub source_identity: SourceIdentity,
-    pub source_name: String,
+    pub upstream: Source,
     pub import_policy: ImportPolicy,
     pub stream_id: StreamId,
     pub stream_title: String,
-    pub item_id: RemoteItemId,
+    pub item_id: ItemId,
     pub title: String,
-    pub origin: Origin,
+    pub origin: OriginSnapshot,
     pub extension: String,
     pub width: u32,
     pub height: u32,
     pub byte_len: u64,
     pub max_pixels: u64,
+}
+
+impl Discovery {
+    /// What an admission of this discovery records about where it came from.
+    pub fn provenance(&self) -> Provenance {
+        Provenance {
+            source: self.upstream.clone(),
+            stream: Stream {
+                id: self.stream_id.clone(),
+                title: self.stream_title.clone(),
+            },
+            item: self.item_id.clone(),
+            origin: self.origin.origin(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,7 +156,7 @@ pub struct Prepared {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Harvest {
     pub source: SourceIx,
-    pub source_identity: SourceIdentity,
+    pub source_identity: SourceId,
     pub discoveries: Vec<Discovery>,
 }
 

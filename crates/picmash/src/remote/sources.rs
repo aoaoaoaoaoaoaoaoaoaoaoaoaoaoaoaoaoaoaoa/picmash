@@ -13,7 +13,7 @@ use atomic_write_file::AtomicWriteFile;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::ImageDecoder as _;
 use jxl_oxide::integration::JxlDecoder;
-use picmash_engine::canonical_image;
+use picmash_engine::{Stream, canonical_image, plain_text};
 use serde::Deserialize;
 use ureq::{
     Agent,
@@ -22,7 +22,7 @@ use ureq::{
 use walkdir::WalkDir;
 
 use super::{
-    Discovery, FileStamp, Harvest, Origin, Prepared, RemoteItemId, SourceIx, StreamId, slug,
+    Discovery, FileStamp, Harvest, ItemId, OriginSnapshot, Prepared, SourceIx, StreamId, slug,
     validate_payload_dimensions,
 };
 use crate::configuration::{FourChanBoard, LocalDirectory, SourceConfig, Upstream};
@@ -77,7 +77,7 @@ impl Harvester {
 
     pub fn fetch(&self, discovery: &Discovery) -> Result<Prepared> {
         let bytes = match &discovery.origin {
-            Origin::Network { url, expected_md5 } => {
+            OriginSnapshot::Network { url, expected_md5 } => {
                 let mut response = self
                     .agent
                     .get(url)
@@ -104,7 +104,7 @@ impl Harvester {
                 }
                 bytes
             }
-            Origin::Local { path, stamp } => {
+            OriginSnapshot::Local { path, stamp } => {
                 let metadata = fs::metadata(path)
                     .with_context(|| format!("inspect remote local file {}", path.display()))?;
                 ensure!(
@@ -136,9 +136,7 @@ impl Harvester {
             "remote candidate decoded empty"
         );
         let payload_digest = blake3::hash(&bytes).to_hex().to_string();
-        let directory = self
-            .cache_root
-            .join(slug(discovery.source_identity.as_str()));
+        let directory = self.cache_root.join(slug(discovery.upstream.id().as_str()));
         fs::create_dir_all(&directory)
             .with_context(|| format!("create source cache at {}", directory.display()))?;
         let stem = blake3::hash(discovery.item_id.as_str().as_bytes()).to_hex();
@@ -190,6 +188,7 @@ impl Harvester {
         } else {
             usize::try_from(ordinal % u64::try_from(threads.len())?)?
         };
+        let upstream = config.source();
         let mut discoveries = Vec::new();
         for thread in threads.iter().cycle().skip(start).take(fetches) {
             let url = format!("{API_ROOT}/{}/thread/{}.json", board.board, thread.no);
@@ -209,7 +208,7 @@ impl Harvester {
             let stream_title = thread
                 .posts
                 .first()
-                .map(post_title)
+                .map(thread_title)
                 .unwrap_or_else(|| "UNTITLED THREAD".to_owned());
             for post in thread.posts.into_iter().rev() {
                 let Some(extension) = post.extension.as_deref().and_then(image_extension) else {
@@ -237,14 +236,13 @@ impl Harvester {
                 }
                 discoveries.push(Discovery {
                     source,
-                    source_identity: config.identity(),
-                    source_name: format!("4CHAN /{}/", board.board.to_ascii_uppercase()),
+                    upstream: upstream.clone(),
                     import_policy: config.import_policy,
-                    stream_id: StreamId::new(format!("4chan:{}:{}", board.board, thread_no(&post))),
+                    stream_id: StreamId::thread(&board.board, thread_no(&post)),
                     stream_title: stream_title.clone(),
-                    item_id: RemoteItemId::new(format!("4chan:{}:{}", board.board, post.no)),
+                    item_id: ItemId::post(&board.board, post.no),
                     title: post_title(&post),
-                    origin: Origin::Network {
+                    origin: OriginSnapshot::Network {
                         url: format!("{IMAGE_ROOT}/{}/{}.{extension}", board.board, timestamp),
                         expected_md5: Some(md5),
                     },
@@ -327,6 +325,8 @@ impl Harvester {
         let mut ranked = selection.into_sorted_vec();
         ranked.reverse();
         let mut discoveries = Vec::with_capacity(ranked.len());
+        let upstream = config.source();
+        let source_id = upstream.id();
         for candidate in ranked {
             let Some((width, height)) = image_dimensions(&candidate.path) else {
                 continue;
@@ -345,28 +345,19 @@ impl Harvester {
                 .strip_prefix(&directory.root)
                 .unwrap_or(&candidate.path);
             let parent = relative.parent().unwrap_or_else(|| Path::new("."));
-            let stream_digest = blake3::hash(parent.as_os_str().as_encoded_bytes());
-            let mut item_hasher = blake3::Hasher::new();
-            item_hasher.update(config.identity().as_str().as_bytes());
-            item_hasher.update(relative.as_os_str().as_encoded_bytes());
-            item_hasher.update(candidate.stamp.as_bytes());
-            let item_digest = item_hasher.finalize();
+            let stream = Stream::folder(&directory.root, parent);
             discoveries.push(Discovery {
                 source,
-                source_identity: config.identity(),
-                source_name: directory.root.file_name().map_or_else(
-                    || directory.root.display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                ),
+                upstream: upstream.clone(),
                 import_policy: config.import_policy,
-                stream_id: StreamId::new(format!("directory:{}", &stream_digest.to_hex()[..20])),
-                stream_title: parent.display().to_string(),
-                item_id: RemoteItemId::new(format!("directory:{}", &item_digest.to_hex()[..24])),
+                stream_id: stream.id,
+                stream_title: stream.title,
+                item_id: ItemId::file(&source_id, relative, candidate.stamp.as_bytes()),
                 title: candidate.path.file_name().map_or_else(
                     || candidate.path.display().to_string(),
                     |name| name.to_string_lossy().into_owned(),
                 ),
-                origin: Origin::Local {
+                origin: OriginSnapshot::Local {
                     path: candidate.path,
                     stamp: candidate.stamp,
                 },
@@ -476,6 +467,8 @@ struct Post {
     resto: i64,
     #[serde(default)]
     sub: Option<String>,
+    #[serde(default, rename = "com")]
+    comment: Option<String>,
     #[serde(default)]
     filename: Option<String>,
     #[serde(default, rename = "tim")]
@@ -503,13 +496,52 @@ fn thread_no(post: &Post) -> i64 {
     if post.resto == 0 { post.no } else { post.resto }
 }
 
+/// A thread is named by its subject, else by its opening comment, else by the
+/// opening post's file.
+fn thread_title(op: &Post) -> String {
+    title([
+        op.sub.as_deref(),
+        op.comment.as_deref(),
+        op.filename.as_deref(),
+    ])
+    .unwrap_or_else(|| format!("THREAD {}", op.no))
+}
+
+/// A post's image is named by its uploaded file.
 fn post_title(post: &Post) -> String {
-    post.filename
-        .as_deref()
-        .or(post.sub.as_deref())
-        .filter(|title| !title.is_empty())
-        .map_or_else(
-            || format!("POST {}", post.no),
-            |title| title.chars().take(160).collect(),
-        )
+    title([post.filename.as_deref()]).unwrap_or_else(|| format!("POST {}", post.no))
+}
+
+/// The first candidate with visible text, as plain text of at most 160
+/// characters.
+fn title<const N: usize>(candidates: [Option<&str>; N]) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(plain_text)
+        .find(|text| !text.is_empty())
+        .map(|text| text.chars().take(160).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::{Post, post_title, thread_title};
+
+    #[test]
+    fn fourchan_titles_are_plain_text_and_threads_prefer_their_subject() -> Result<()> {
+        // The first implementation named threads by the opening post's file,
+        // which every opening post has, so no subject was ever shown.
+        let titled: Post = serde_json::from_str(
+            r#"{"no": 7, "sub": "Misaka &amp; friends", "com": "hello", "filename": "IMG_1211"}"#,
+        )?;
+        assert_eq!(thread_title(&titled), "Misaka & friends");
+        assert_eq!(post_title(&titled), "IMG_1211");
+        let untitled: Post = serde_json::from_str(
+            r#"{"no": 8, "com": "<span class=\"quote\">&gt;Girls&#039; night</span><br>long<wbr>word &lt;b&gt;", "filename": "x"}"#,
+        )?;
+        assert_eq!(thread_title(&untitled), ">Girls' night longword <b>");
+        Ok(())
+    }
 }

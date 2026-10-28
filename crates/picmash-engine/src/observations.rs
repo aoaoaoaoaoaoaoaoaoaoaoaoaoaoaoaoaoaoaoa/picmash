@@ -6,7 +6,9 @@ use crate::{
     Engine,
     engine::now_ns,
     fault::{Fault, Result},
-    ids::{AssetId, CollectionId, CommandId, ObservationId, PromptId, SessionId, SnapshotId},
+    ids::{
+        AssetId, CollectionId, CommandId, ItemId, ObservationId, PromptId, SessionId, SnapshotId,
+    },
     media::RenderDigest,
     model::{ComparisonPrompt, DuelVictor, JudgmentSession, PresentedAsset, ThresholdJudgment},
 };
@@ -241,14 +243,13 @@ impl Engine {
     pub fn reserve_promoted_comparison(
         &self,
         session_id: &SessionId,
-        remote_identity: &str,
+        item: &ItemId,
         anchor: &PresentedAsset,
         challenger_rotation_quarters: u8,
         victor: DuelVictor,
         command_id: &CommandId,
         response_ms: u32,
     ) -> Result<ObservationId> {
-        validate_remote_identity(remote_identity)?;
         if challenger_rotation_quarters >= 4 {
             return Err(Fault::InvalidInput(format!(
                 "invalid remote presentation rotation {challenger_rotation_quarters}"
@@ -256,7 +257,7 @@ impl Engine {
         }
         let digest = promoted_duel_digest(
             session_id,
-            remote_identity,
+            item,
             anchor,
             challenger_rotation_quarters,
             victor,
@@ -291,7 +292,7 @@ impl Engine {
     pub fn record_promoted_comparison(
         &self,
         session_id: &SessionId,
-        remote_identity: &str,
+        item: &ItemId,
         anchor: &PresentedAsset,
         challenger: &AssetId,
         challenger_rotation_quarters: u8,
@@ -304,10 +305,9 @@ impl Engine {
                 "a promoted comparison requires two distinct assets".to_owned(),
             ));
         }
-        validate_remote_identity(remote_identity)?;
         let digest = promoted_duel_digest(
             session_id,
-            remote_identity,
+            item,
             anchor,
             challenger_rotation_quarters,
             victor,
@@ -418,11 +418,10 @@ impl Engine {
     pub fn reserve_promoted_favorite(
         &self,
         session_id: &SessionId,
-        remote_identity: &str,
+        item: &ItemId,
         command_id: &CommandId,
     ) -> Result<ObservationId> {
-        validate_remote_identity(remote_identity)?;
-        let digest = promoted_favorite_digest(session_id, remote_identity);
+        let digest = promoted_favorite_digest(session_id, item);
         let now = now_ns()?;
         let mut connection = self.connection.lock();
         let tx = connection.transaction()?;
@@ -451,12 +450,11 @@ impl Engine {
     pub fn set_promoted_favorite(
         &self,
         session_id: &SessionId,
-        remote_identity: &str,
+        item: &ItemId,
         asset_id: &AssetId,
         command_id: &CommandId,
     ) -> Result<ObservationId> {
-        validate_remote_identity(remote_identity)?;
-        let digest = promoted_favorite_digest(session_id, remote_identity);
+        let digest = promoted_favorite_digest(session_id, item);
         let now = now_ns()?;
         let mut connection = self.connection.lock();
         let tx = connection.transaction()?;
@@ -990,19 +988,9 @@ fn payload_digest(parts: &[&str]) -> String {
     format!("command-v1:{}", hasher.finalize().to_hex())
 }
 
-fn validate_remote_identity(remote_identity: &str) -> Result<()> {
-    if remote_identity.is_empty() {
-        Err(Fault::InvalidInput(
-            "remote promotion identity cannot be empty".to_owned(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 fn promoted_duel_digest(
     session_id: &SessionId,
-    remote_identity: &str,
+    item: &ItemId,
     anchor: &PresentedAsset,
     challenger_rotation_quarters: u8,
     victor: DuelVictor,
@@ -1015,7 +1003,7 @@ fn promoted_duel_digest(
     payload_digest(&[
         "remote-admission-duel-v2",
         session_id.as_str(),
-        remote_identity,
+        item.as_str(),
         anchor.asset_id.as_str(),
         &occurrence,
         anchor.render.as_str(),
@@ -1029,11 +1017,11 @@ fn promoted_duel_digest(
     ])
 }
 
-fn promoted_favorite_digest(session_id: &SessionId, remote_identity: &str) -> String {
+fn promoted_favorite_digest(session_id: &SessionId, item: &ItemId) -> String {
     payload_digest(&[
         "remote-admission-favorite-v1",
         session_id.as_str(),
-        remote_identity,
+        item.as_str(),
         "true",
     ])
 }

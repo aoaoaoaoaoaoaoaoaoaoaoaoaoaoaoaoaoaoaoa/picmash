@@ -9,13 +9,29 @@ use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, Transaction, params};
 use walkdir::WalkDir;
 
+use super::promotion::archive_path;
 use super::{
-    Discovery, DuelVictor, FileStamp, Harvest, Origin, Prepared, PromotionIntent,
-    PromotionJudgment, RemoteItemId, SourceIx, StreamId,
+    Discovery, DuelVictor, FileStamp, Harvest, ItemId, OriginSnapshot, Prepared, PromotionIntent,
+    PromotionJudgment, SourceIx, StreamId,
 };
-use crate::configuration::{ImportPolicy, RemoteConfig, SourceConfig, SourceIdentity};
+use picmash_engine::{Provenance, Source, Stream};
 
-const SCHEMA: i64 = 4;
+use crate::configuration::{ImportPolicy, RemoteConfig, SourceConfig};
+
+const SCHEMA: i64 = 5;
+
+/// Every source this store has known, so a persisted item can be restored or
+/// attested after its source leaves the configuration; and the promotions
+/// sealed before admissions recorded provenance.
+const ATTESTATION_SCHEMA: &str = "CREATE TABLE pr_sources(
+         source_id TEXT PRIMARY KEY,
+         kind TEXT NOT NULL CHECK(kind IN ('4chan_board', 'local_directory')),
+         locator BLOB NOT NULL
+     ) STRICT, WITHOUT ROWID;
+
+     CREATE TABLE pr_unattested(
+         item_id TEXT PRIMARY KEY REFERENCES pr_items(item_id)
+     ) STRICT, WITHOUT ROWID;";
 const PROMOTION_SCHEMA: &str = "CREATE TABLE pr_promotions(
          item_id TEXT PRIMARY KEY REFERENCES pr_items(item_id) ON DELETE CASCADE,
          collection_root BLOB NOT NULL,
@@ -89,7 +105,7 @@ impl RemoteStore {
         let mut admitted = Vec::new();
         for discovery in harvest.discoveries {
             ensure!(
-                discovery.source_identity == harvest.source_identity,
+                discovery.upstream.id() == harvest.source_identity,
                 "harvest mixed remote source identities"
             );
             tx.execute(
@@ -98,7 +114,7 @@ impl RemoteStore {
                  ON CONFLICT(source_id, stream_id) DO UPDATE SET
                     title = excluded.title, updated_at_ns = excluded.updated_at_ns",
                 params![
-                    discovery.source_identity.as_str(),
+                    discovery.upstream.id().as_str(),
                     discovery.stream_id.as_str(),
                     discovery.stream_title,
                     now,
@@ -107,7 +123,7 @@ impl RemoteStore {
             let vetoed = tx.query_row(
                 "SELECT vetoed FROM pr_streams WHERE source_id = ?1 AND stream_id = ?2",
                 params![
-                    discovery.source_identity.as_str(),
+                    discovery.upstream.id().as_str(),
                     discovery.stream_id.as_str()
                 ],
                 |row| row.get::<_, bool>(0),
@@ -131,7 +147,7 @@ impl RemoteStore {
         })
     }
 
-    pub fn begin_fetch(&self, item: &RemoteItemId) -> Result<()> {
+    pub fn begin_fetch(&self, item: &ItemId) -> Result<()> {
         let changed = self.connection.execute(
             "UPDATE pr_items SET state = 'fetching', updated_at_ns = ?2, error = NULL
              WHERE item_id = ?1 AND state = 'discovered'",
@@ -141,7 +157,7 @@ impl RemoteStore {
         Ok(())
     }
 
-    pub fn fetch_failed(&self, item: &RemoteItemId, error: &str) -> Result<()> {
+    pub fn fetch_failed(&self, item: &ItemId, error: &str) -> Result<()> {
         self.connection.execute(
             "UPDATE pr_items SET state = 'discovered', updated_at_ns = ?2, error = ?3
              WHERE item_id = ?1 AND state = 'fetching'",
@@ -181,6 +197,10 @@ impl RemoteStore {
     }
 
     pub fn restore(&self, config: &RemoteConfig) -> Result<Restoration> {
+        for source in &config.sources {
+            record_source(&self.connection, &source.source())?;
+        }
+        let known = known_sources(&self.connection)?;
         let sources = source_index(config);
         let mut discovered = HashMap::<SourceIx, Vec<Discovery>>::new();
         let mut prepared = Vec::new();
@@ -244,17 +264,14 @@ impl RemoteStore {
             );
             let configured = sources.get(&row.source_id);
             let discovery = if let Some((source, source_config)) = configured {
-                row.discovery(
-                    *source,
-                    source_config.identity(),
-                    source_config.identity().to_string(),
-                    source_config.import_policy,
-                )?
+                row.discovery(*source, source_config.source(), source_config.import_policy)?
             } else if row.promotion_kind.is_some() {
                 row.discovery(
                     SourceIx::new(config.sources.len()),
-                    SourceIdentity::new(row.source_id.clone()),
-                    row.source_id.clone(),
+                    known
+                        .get(&row.source_id)
+                        .cloned()
+                        .with_context(|| format!("promoted source {} is unknown", row.source_id))?,
                     ImportPolicy::NotX,
                 )?
             } else {
@@ -310,6 +327,45 @@ impl RemoteStore {
             prepared,
             promotions,
         })
+    }
+
+    /// Promotions sealed before admissions recorded provenance, whose source
+    /// this store knows.
+    pub fn unattested(&self) -> Result<Vec<Unattested>> {
+        let rows = self
+            .connection
+            .prepare(
+                "SELECT i.item_id, i.stream_id, st.title, i.origin_kind, i.origin, i.origin_seal,
+                    i.expected_md5, i.updated_at_ns, src.kind, src.locator
+             FROM pr_unattested u
+             JOIN pr_items i ON i.item_id = u.item_id
+             JOIN pr_streams st ON st.source_id = i.source_id AND st.stream_id = i.stream_id
+             JOIN pr_sources src ON src.source_id = i.source_id",
+            )?
+            .query_map([], |row| {
+                Ok(UnattestedRow {
+                    item: row.get(0)?,
+                    stream: row.get(1)?,
+                    title: row.get(2)?,
+                    origin_kind: row.get(3)?,
+                    origin: row.get(4)?,
+                    seal: row.get(5)?,
+                    md5: row.get(6)?,
+                    promoted_at_ns: row.get(7)?,
+                    kind: row.get(8)?,
+                    locator: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(UnattestedRow::finish).collect()
+    }
+
+    pub fn attested(&self, item: &ItemId) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM pr_unattested WHERE item_id = ?1",
+            [item.as_str()],
+        )?;
+        Ok(())
     }
 
     pub fn begin_promotion(&self, intent: &PromotionIntent) -> Result<()> {
@@ -402,7 +458,7 @@ impl RemoteStore {
         Ok(())
     }
 
-    pub fn abort_promotion(&self, item: &RemoteItemId) -> Result<()> {
+    pub fn abort_promotion(&self, item: &ItemId) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
         let changed = tx.execute(
             "DELETE FROM pr_promotions WHERE item_id = ?1",
@@ -418,7 +474,7 @@ impl RemoteStore {
         Ok(())
     }
 
-    pub fn promotion_failed(&self, item: &RemoteItemId, message: &str) -> Result<()> {
+    pub fn promotion_failed(&self, item: &ItemId, message: &str) -> Result<()> {
         self.connection.execute(
             "UPDATE pr_items SET error = ?2, updated_at_ns = ?3 WHERE item_id = ?1",
             params![item.as_str(), message, now_ns()?],
@@ -453,7 +509,7 @@ impl RemoteStore {
             )?;
             let rows = statement.query_map(
                 params![
-                    candidate.discovery.source_identity.as_str(),
+                    candidate.discovery.upstream.id().as_str(),
                     candidate.discovery.stream_id.as_str(),
                 ],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -466,7 +522,7 @@ impl RemoteStore {
             "UPDATE pr_streams SET vetoed = 1, updated_at_ns = ?3
              WHERE source_id = ?1 AND stream_id = ?2",
             params![
-                candidate.discovery.source_identity.as_str(),
+                candidate.discovery.upstream.id().as_str(),
                 candidate.discovery.stream_id.as_str(),
                 now,
             ],
@@ -479,7 +535,7 @@ impl RemoteStore {
                    SELECT 1 FROM pr_promotions p WHERE p.item_id = pr_items.item_id
                )",
             params![
-                candidate.discovery.source_identity.as_str(),
+                candidate.discovery.upstream.id().as_str(),
                 candidate.discovery.stream_id.as_str(),
                 now,
             ],
@@ -496,7 +552,7 @@ impl RemoteStore {
         self.finish(candidate, "promoted", "promoted")
     }
 
-    pub fn note_duel(&self, item: &RemoteItemId, remote_won: bool) -> Result<()> {
+    pub fn note_duel(&self, item: &ItemId, remote_won: bool) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
         insert_event(
             &tx,
@@ -610,18 +666,21 @@ fn prune_retired(connection: &Connection) -> Result<()> {
 }
 
 fn upsert_discovery(tx: &Transaction<'_>, discovery: &Discovery, now: i64) -> Result<()> {
+    record_source(tx, &discovery.upstream)?;
     let byte_len = i64::try_from(discovery.byte_len)
         .context("remote byte length exceeds the database range")?;
     let max_pixels = i64::try_from(discovery.max_pixels)
         .context("remote pixel limit exceeds the database range")?;
     let (origin_kind, origin, origin_seal, expected_md5) = match &discovery.origin {
-        Origin::Network { url, expected_md5 } => (
+        OriginSnapshot::Network { url, expected_md5 } => (
             "network",
             url.as_bytes().to_vec(),
             None,
             expected_md5.as_deref(),
         ),
-        Origin::Local { path, stamp } => ("local", path_bytes(path), Some(stamp.as_bytes()), None),
+        OriginSnapshot::Local { path, stamp } => {
+            ("local", path_bytes(path), Some(stamp.as_bytes()), None)
+        }
     };
     tx.execute(
         "INSERT INTO pr_items(
@@ -639,7 +698,7 @@ fn upsert_discovery(tx: &Transaction<'_>, discovery: &Discovery, now: i64) -> Re
          WHERE pr_items.state IN ('discovered', 'fetching', 'prepared', 'retired')",
         params![
             discovery.item_id.as_str(),
-            discovery.source_identity.as_str(),
+            discovery.upstream.id().as_str(),
             discovery.stream_id.as_str(),
             discovery.title,
             origin_kind,
@@ -657,7 +716,7 @@ fn upsert_discovery(tx: &Transaction<'_>, discovery: &Discovery, now: i64) -> Re
     Ok(())
 }
 
-fn insert_event(tx: &Transaction<'_>, item: &RemoteItemId, kind: &str, now: i64) -> Result<()> {
+fn insert_event(tx: &Transaction<'_>, item: &ItemId, kind: &str, now: i64) -> Result<()> {
     tx.execute(
         "INSERT INTO pr_events(item_id, kind, recorded_at_ns)
          SELECT ?1, ?2, ?3
@@ -704,34 +763,22 @@ impl PersistedItem {
     fn discovery(
         &self,
         source: SourceIx,
-        source_identity: SourceIdentity,
-        source_name: String,
+        upstream: Source,
         import_policy: ImportPolicy,
     ) -> Result<Discovery> {
-        let origin = match self.origin_kind.as_str() {
-            "network" => Origin::Network {
-                url: String::from_utf8(self.origin.clone())
-                    .context("decode persisted remote URL")?,
-                expected_md5: self.expected_md5.clone(),
-            },
-            "local" => Origin::Local {
-                path: path_from_bytes(self.origin.clone()),
-                stamp: FileStamp::parse(
-                    self.origin_seal
-                        .clone()
-                        .context("persisted local source lacks a file stamp")?,
-                )?,
-            },
-            invalid => anyhow::bail!("invalid persisted remote origin `{invalid}`"),
-        };
+        let origin = snapshot(
+            &self.origin_kind,
+            self.origin.clone(),
+            self.origin_seal.clone(),
+            self.expected_md5.clone(),
+        )?;
         Ok(Discovery {
             source,
-            source_identity,
-            source_name,
+            upstream,
             import_policy,
-            stream_id: StreamId::new(self.stream_id.clone()),
+            stream_id: StreamId::parse(self.stream_id.clone())?,
             stream_title: self.stream_title.clone(),
-            item_id: RemoteItemId::new(self.item_id.clone()),
+            item_id: ItemId::parse(self.item_id.clone())?,
             title: self.title.clone(),
             origin,
             extension: self.extension.clone(),
@@ -926,6 +973,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              ) STRICT;",
         )?;
         tx.execute_batch(PROMOTION_SCHEMA)?;
+        tx.execute_batch(ATTESTATION_SCHEMA)?;
         tx.execute(
             "INSERT INTO pr_schema(version, applied_at_ns) VALUES (?1, ?2)",
             params![SCHEMA, now_ns()?],
@@ -962,6 +1010,98 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             [now_ns()?],
         )?;
     }
+    if (1..=4).contains(&current) {
+        tx.execute_batch(ATTESTATION_SCHEMA)?;
+        tx.execute_batch(
+            "INSERT INTO pr_unattested SELECT item_id FROM pr_items WHERE state = 'promoted';",
+        )?;
+        tx.execute(
+            "INSERT INTO pr_schema(version, applied_at_ns) VALUES (5, ?1)",
+            [now_ns()?],
+        )?;
+    }
     tx.commit()?;
     Ok(())
+}
+
+fn snapshot(
+    kind: &str,
+    origin: Vec<u8>,
+    seal: Option<Vec<u8>>,
+    expected_md5: Option<String>,
+) -> Result<OriginSnapshot> {
+    Ok(match kind {
+        "network" => OriginSnapshot::Network {
+            url: String::from_utf8(origin).context("decode persisted remote URL")?,
+            expected_md5,
+        },
+        "local" => OriginSnapshot::Local {
+            path: path_from_bytes(origin),
+            stamp: FileStamp::parse(seal.context("persisted local source lacks a file stamp")?)?,
+        },
+        invalid => anyhow::bail!("invalid persisted remote origin `{invalid}`"),
+    })
+}
+
+fn record_source(connection: &Connection, source: &Source) -> Result<()> {
+    let (kind, locator) = source.parts();
+    connection.execute(
+        "INSERT INTO pr_sources(source_id, kind, locator) VALUES (?1, ?2, ?3)
+         ON CONFLICT(source_id) DO NOTHING",
+        params![source.id().as_str(), kind, locator],
+    )?;
+    Ok(())
+}
+
+fn known_sources(connection: &Connection) -> Result<HashMap<String, Source>> {
+    let rows = connection
+        .prepare("SELECT source_id, kind, locator FROM pr_sources")?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get::<_, String>(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String, Vec<u8>)>>>()?;
+    rows.into_iter()
+        .map(|(id, kind, locator)| Ok((id, Source::from_parts(&kind, locator)?)))
+        .collect()
+}
+
+/// A promotion sealed before admissions recorded provenance.
+pub struct Unattested {
+    /// The promoted file, relative to its collection's root.
+    pub archive: PathBuf,
+    pub provenance: Provenance,
+    pub promoted_at_ns: i64,
+}
+
+struct UnattestedRow {
+    item: String,
+    stream: String,
+    title: String,
+    origin_kind: String,
+    origin: Vec<u8>,
+    seal: Option<Vec<u8>>,
+    md5: Option<String>,
+    promoted_at_ns: i64,
+    kind: String,
+    locator: Vec<u8>,
+}
+
+impl UnattestedRow {
+    fn finish(self) -> Result<Unattested> {
+        let source = Source::from_parts(&self.kind, self.locator)?;
+        let item = ItemId::parse(self.item)?;
+        Ok(Unattested {
+            archive: archive_path(&source.id(), &item),
+            provenance: Provenance {
+                stream: Stream {
+                    id: StreamId::parse(self.stream)?,
+                    title: self.title,
+                },
+                origin: snapshot(&self.origin_kind, self.origin, self.seal, self.md5)?.origin(),
+                source,
+                item,
+            },
+            promoted_at_ns: self.promoted_at_ns,
+        })
+    }
 }

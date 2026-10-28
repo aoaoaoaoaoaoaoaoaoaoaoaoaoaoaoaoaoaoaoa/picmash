@@ -7,7 +7,7 @@ pub const PRODUCT_IDENTIFIER: &str = "moe.eternalist.picmash";
 /// Product display name.
 pub const PRODUCT_NAME: &str = "Picmash";
 /// Native UI contract revision.
-pub const UI_FINGERPRINT: &str = "picmash.ui/8";
+pub const UI_FINGERPRINT: &str = "picmash.ui/9";
 
 /// One member of the active comparison.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -54,6 +54,14 @@ pub enum Target {
     RejectStream(Side),
     /// Collection browser surface.
     Browser,
+    /// Browse scope that admits every image.
+    ScopeAll,
+    /// Browse scope that admits the images admitted from no source.
+    ScopeUnsourced,
+    /// Browse scope for the n-th listed source.
+    ScopeSource(usize),
+    /// Browse scope for the n-th listed stream of the chosen source.
+    ScopeStream(usize),
     /// One visible browser tile.
     BrowseTile,
     /// Full-image viewer surface.
@@ -62,6 +70,8 @@ pub enum Target {
     ViewerCopy,
     /// Close the full-image viewer.
     ViewerClose,
+    /// Browse the stream the viewed image was admitted from.
+    ViewerStream,
 }
 
 impl Target {
@@ -84,10 +94,19 @@ impl Target {
                 Cow::Owned(format!("picmash.comparison.reject-stream/{}", side.wire()))
             }
             Self::Browser => Cow::Borrowed("picmash.collection.browser"),
+            Self::ScopeAll => Cow::Borrowed("picmash.collection.scope.all"),
+            Self::ScopeUnsourced => Cow::Borrowed("picmash.collection.scope.unsourced"),
+            Self::ScopeSource(ordinal) => {
+                Cow::Owned(format!("picmash.collection.scope.source/{ordinal}"))
+            }
+            Self::ScopeStream(ordinal) => {
+                Cow::Owned(format!("picmash.collection.scope.stream/{ordinal}"))
+            }
             Self::BrowseTile => Cow::Borrowed("picmash.collection.browser.tile"),
             Self::Viewer => Cow::Borrowed("picmash.collection.viewer"),
             Self::ViewerCopy => Cow::Borrowed("picmash.collection.viewer.copy"),
             Self::ViewerClose => Cow::Borrowed("picmash.collection.viewer.close"),
+            Self::ViewerStream => Cow::Borrowed("picmash.collection.viewer.stream"),
         }
     }
 }

@@ -6,7 +6,7 @@ use image::{RgbaImage, imageops};
 use picmash_contract::Side;
 use picmash_engine::{
     AssetId, AssetView, CollectionId, CommandId, ComparisonPrompt, Engine, PreferenceEvaluation,
-    PresentedAsset, ScanProgress, SessionId, canonical_image,
+    PresentedAsset, Provenance, ScanProgress, SessionId, canonical_image,
 };
 use std::{
     fs,
@@ -23,6 +23,7 @@ use std::{
 use crate::{
     application_paths::{ApplicationPaths, PicmashPaths as _},
     configuration::{ImportPolicy, Probability, RemoteConfig},
+    facets::source_label,
     remote::{
         ArchiveEffect, ArchiveLane, DuelVictor, Effect as RemoteEffect, Prepared, PromotionIntent,
         PromotionJudgment, Reactor, Summary as RemoteSummary,
@@ -45,6 +46,7 @@ pub struct Card {
     pub favorite: bool,
     pub duel_count: u32,
     pub preference_score: Option<f64>,
+    pub provenance: Vec<Provenance>,
 }
 
 impl From<&AssetView> for Card {
@@ -63,6 +65,7 @@ impl From<&AssetView> for Card {
             favorite: view.favorite,
             duel_count: view.duel_count,
             preference_score: view.preference_score,
+            provenance: view.provenance.clone(),
         }
     }
 }
@@ -361,6 +364,7 @@ fn run(
         .map_err(anyhow::Error::from)
         .and_then(|engine| {
             let mut remote = Reactor::open(&paths, &remote_config)?;
+            remote.attest_promotions(&engine)?;
             let archive = ArchiveLane::raise()?;
             for intent in remote.take_restored_promotions() {
                 reserve_promotion(&engine, &intent)?;
@@ -930,7 +934,7 @@ fn publish_remote_pair(
                 #[cfg(feature = "egui-test")]
                 rotation_quarters: *rotation_quarters,
                 title: candidate.discovery.title.clone(),
-                source: candidate.discovery.source_name.clone(),
+                source: source_label(&candidate.discovery.upstream),
                 stream: candidate.discovery.stream_title.clone(),
             }),
             left_blade,
@@ -966,7 +970,7 @@ fn queue_promotion(
 }
 
 fn reserve_promotion(engine: &Engine, intent: &PromotionIntent) -> Result<()> {
-    let identity = intent.candidate.discovery.item_id.as_str();
+    let item = &intent.candidate.discovery.item_id;
     match &intent.judgment {
         PromotionJudgment::Duel {
             session_id,
@@ -977,7 +981,7 @@ fn reserve_promotion(engine: &Engine, intent: &PromotionIntent) -> Result<()> {
         } => {
             engine.reserve_promoted_comparison(
                 session_id,
-                identity,
+                item,
                 anchor,
                 intent.rotation_quarters,
                 *victor,
@@ -989,7 +993,7 @@ fn reserve_promotion(engine: &Engine, intent: &PromotionIntent) -> Result<()> {
             session_id,
             command_id,
         } => {
-            engine.reserve_promoted_favorite(session_id, identity, command_id)?;
+            engine.reserve_promoted_favorite(session_id, item, command_id)?;
         }
     }
     Ok(())
@@ -1007,8 +1011,11 @@ fn commit_promotion(
         root == intent.collection_root,
         "promotion collection changed before admission"
     );
-    let challenger = state.engine.ingest_occurrence(collection, path)?;
-    let identity = intent.candidate.discovery.item_id.as_str();
+    let challenger =
+        state
+            .engine
+            .admit(collection, path, &intent.candidate.discovery.provenance())?;
+    let item = &intent.candidate.discovery.item_id;
     match &intent.judgment {
         PromotionJudgment::Duel {
             anchor,
@@ -1022,7 +1029,7 @@ fn commit_promotion(
             } else {
                 state.engine.record_promoted_comparison(
                     session_id,
-                    identity,
+                    item,
                     anchor,
                     &challenger,
                     intent.rotation_quarters,
@@ -1035,7 +1042,7 @@ fn commit_promotion(
         PromotionJudgment::Favorite { command_id, .. } => {
             state
                 .engine
-                .set_promoted_favorite(session_id, identity, &challenger, command_id)?;
+                .set_promoted_favorite(session_id, item, &challenger, command_id)?;
         }
     }
     state.remote.seal_promoted(intent)?;

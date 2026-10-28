@@ -6,7 +6,10 @@ use tempfile::tempdir;
 
 use rusqlite::{Connection, params};
 
-use crate::{CommandId, Engine, Fault, ThresholdJudgment, inspect_bytes};
+use crate::{
+    CommandId, Engine, Fault, ItemId, Origin, Provenance, Source, Stream, StreamId,
+    ThresholdJudgment, inspect_bytes,
+};
 
 fn write_image(path: &Path, color: [u8; 3]) -> Result<Vec<u8>> {
     let image = RgbImage::from_pixel(32, 24, Rgb(color));
@@ -208,7 +211,7 @@ fn remote_archive_reserves_order_and_exact_presentation() -> Result<()> {
     let remote_command = CommandId::parse("remote-duel")?;
     let reserved = engine.reserve_promoted_comparison(
         &session.id,
-        "remote-item-1",
+        &ItemId::parse("remote-item-1")?,
         &anchor,
         0,
         crate::DuelVictor::Challenger,
@@ -237,11 +240,23 @@ fn remote_archive_reserves_order_and_exact_presentation() -> Result<()> {
 
     let challenger_path = corpus.join("remote.png");
     let _remote = write_image(&challenger_path, [220, 160, 20])?;
-    let challenger = engine.ingest_occurrence(collection, &challenger_path)?;
+    let provenance = Provenance {
+        source: Source::FourChanBoard("s".to_owned()),
+        stream: Stream {
+            id: StreamId::thread("s", 1),
+            title: "fixture thread".to_owned(),
+        },
+        item: ItemId::post("s", 2),
+        origin: Origin::Url {
+            url: "https://i.4cdn.org/s/1.png".to_owned(),
+            md5: Some("bWQ1".to_owned()),
+        },
+    };
+    let challenger = engine.admit(collection, &challenger_path, &provenance)?;
     assert_eq!(
         engine.record_promoted_comparison(
             &session.id,
-            "remote-item-1",
+            &ItemId::parse("remote-item-1")?,
             &anchor,
             &challenger,
             0,
@@ -264,32 +279,32 @@ fn remote_archive_reserves_order_and_exact_presentation() -> Result<()> {
     let favorite_command = CommandId::parse("remote-favorite")?;
     let favorite = engine.reserve_promoted_favorite(
         &favorite_session.id,
-        "remote-item-2",
+        &ItemId::parse("remote-item-2")?,
         &favorite_command,
     )?;
     engine.end_session(&favorite_session.id)?;
     assert_eq!(
         engine.set_promoted_favorite(
             &favorite_session.id,
-            "remote-item-2",
+            &ItemId::parse("remote-item-2")?,
             &challenger,
             &favorite_command,
         )?,
         favorite
     );
-    assert!(
-        engine
-            .assets(collection)?
-            .into_iter()
-            .find(|asset| asset.id == challenger)
-            .context("promoted favorite")?
-            .favorite
-    );
+    let promoted = engine
+        .assets(collection)?
+        .into_iter()
+        .find(|asset| asset.id == challenger)
+        .context("promoted favorite")?;
+    assert!(promoted.favorite);
+    assert_eq!(promoted.provenance, [provenance]);
     Ok(())
 }
 
 #[test]
-fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Result<()> {
+fn legacy_import_is_read_only_idempotent_attests_provenance_and_rejects_old_derived_state()
+-> Result<()> {
     let temporary = tempdir()?;
     let corpus = temporary.path().join("legacy-corpus");
     fs::create_dir(&corpus)?;
@@ -332,7 +347,20 @@ fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Resu
                 asset_a_id TEXT, asset_b_id TEXT, asset_c_id TEXT,
                 chosen_pair TEXT, created_at INTEGER
             );
-            CREATE TABLE asset_external_provenance(asset_id TEXT);
+            CREATE TABLE external_sources(
+                source_key TEXT PRIMARY KEY, display_name TEXT, kind TEXT, board TEXT
+            );
+            CREATE TABLE external_streams(
+                id INTEGER PRIMARY KEY, source_key TEXT, thread_no INTEGER, title TEXT
+            );
+            CREATE TABLE external_items(
+                id INTEGER PRIMARY KEY, source_key TEXT, stream_id INTEGER, thread_no INTEGER,
+                post_no INTEGER, stream_title TEXT, title TEXT, image_url TEXT, md5 TEXT
+            );
+            CREATE TABLE asset_external_provenance(
+                asset_id TEXT PRIMARY KEY, source_key TEXT, stream_id INTEGER,
+                item_id INTEGER UNIQUE, imported_at INTEGER
+            );
             ",
     )?;
     let legacy_render =
@@ -368,7 +396,20 @@ fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Resu
             INSERT INTO nudge_events VALUES (1, 1, 'a', 1.0, 3);
             INSERT INTO heart_events VALUES (1, 1, 'a', 1, 4);
             INSERT INTO heart_events VALUES (2, 1, 'a', 0, 5);
-            INSERT INTO asset_external_provenance VALUES ('a');
+            INSERT INTO external_sources VALUES
+                ('4chan:s', '4chan:s', '4chan_board', 's'),
+                ('local:shelf', 'dir:shelf', 'local_directory', '/shelf');
+            INSERT INTO external_streams VALUES
+                (7, '4chan:s', 100, 'Subject of 100'),
+                (8, 'local:shelf', 555, 'legacy folder title');
+            INSERT INTO external_items VALUES
+                (1, '4chan:s', 7, 100, 101, 'Subject of 100', 'a', 'https://i.4cdn.org/s/1.png',
+                 'bWQ1'),
+                (2, 'local:shelf', 8, 555, 556, 'legacy folder title', 'b.png',
+                 'file:///shelf/sub%20dir/b.png', NULL);
+            INSERT INTO asset_external_provenance VALUES
+                ('a', '4chan:s', 7, 1, 10),
+                ('b', 'local:shelf', 8, 2, 11);
             ",
     )?;
     drop(connection);
@@ -379,13 +420,50 @@ fn legacy_import_is_read_only_idempotent_and_rejects_old_derived_state() -> Resu
     assert_eq!(report.imported_observations, 4);
     assert_eq!(report.ambiguous_observations, 0);
     assert!(!report.already_imported);
+    assert_eq!(
+        (report.attested_provenance, report.unattested_provenance),
+        (2, 0)
+    );
     let repeated = engine.import_legacy(&legacy)?;
     assert!(repeated.already_imported);
+    assert_eq!(repeated.attested_provenance, 2);
 
     let collection = engine.scan(&corpus)?;
     let assets = engine.assets(collection.collection_id)?;
     assert_eq!(assets.len(), 2);
     assert!(assets.iter().all(|asset| !asset.favorite));
+    let lineage = |id: &str| -> Result<Vec<Provenance>> {
+        Ok(assets
+            .iter()
+            .find(|asset| asset.id.as_str() == id)
+            .context("legacy asset")?
+            .provenance
+            .clone())
+    };
+    assert_eq!(
+        lineage("a")?,
+        [Provenance {
+            source: Source::FourChanBoard("s".to_owned()),
+            stream: Stream {
+                id: StreamId::thread("s", 100),
+                title: "Subject of 100".to_owned(),
+            },
+            item: ItemId::post("s", 101),
+            origin: Origin::Url {
+                url: "https://i.4cdn.org/s/1.png".to_owned(),
+                md5: Some("bWQ1".to_owned()),
+            },
+        }]
+    );
+    // Legacy folders are reminted under native stream identity, and their
+    // file URLs are percent-decoded.
+    let local = lineage("b")?;
+    assert_eq!(local.len(), 1);
+    assert_eq!(
+        local[0].stream,
+        Stream::folder(Path::new("/shelf"), Path::new("sub dir"))
+    );
+    assert_eq!(local[0].origin, Origin::File("/shelf/sub dir/b.png".into()));
     let preference = engine.rebuild_preferences(collection.collection_id)?;
     assert!(
         preference

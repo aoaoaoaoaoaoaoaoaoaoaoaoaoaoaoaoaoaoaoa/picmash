@@ -19,7 +19,9 @@ use atomic_write_file::AtomicWriteFile;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use image::ImageFormat;
 pub use picmash_engine::DuelVictor;
-use picmash_engine::{CommandId, PresentedAsset, SessionId, canonical_image, inspect_bytes};
+use picmash_engine::{
+    CommandId, ItemId, PresentedAsset, SessionId, SourceId, canonical_image, inspect_bytes,
+};
 use tempfile::Builder;
 use wait_timeout::ChildExt as _;
 
@@ -249,13 +251,15 @@ pub fn promote(
         "promotion changed the canonical image"
     );
 
-    let directory = collection
-        .join(".picmash-imported")
-        .join(slug(candidate.discovery.source_identity.as_str()));
-    fs::create_dir_all(&directory)
+    let target = collection.join(archive_path(
+        &candidate.discovery.upstream.id(),
+        &candidate.discovery.item_id,
+    ));
+    let directory = target
+        .parent()
+        .context("promotion target names no directory")?;
+    fs::create_dir_all(directory)
         .with_context(|| format!("create promotion directory at {}", directory.display()))?;
-    let identity = blake3::hash(candidate.discovery.item_id.as_str().as_bytes());
-    let target = directory.join(format!("{}.jxl", &identity.to_hex()[..32]));
     let mut file = AtomicWriteFile::open(&target)
         .with_context(|| format!("stage promoted image at {}", target.display()))?;
     file.write_all(&encoded)
@@ -263,4 +267,12 @@ pub fn promote(
     file.commit()
         .with_context(|| format!("commit promoted image at {}", target.display()))?;
     Ok(Promotion { path: target })
+}
+
+/// Where a promoted item is archived, relative to its collection's root.
+pub fn archive_path(source: &SourceId, item: &ItemId) -> PathBuf {
+    let stem = blake3::hash(item.as_str().as_bytes()).to_hex();
+    Path::new(".picmash-imported")
+        .join(slug(source.as_str()))
+        .join(format!("{}.jxl", &stem[..32]))
 }

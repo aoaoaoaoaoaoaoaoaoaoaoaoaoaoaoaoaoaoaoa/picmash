@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    os::unix::ffi::OsStringExt as _,
     path::{Path, PathBuf},
 };
 
@@ -10,9 +12,10 @@ use crate::{
     catalog::encode_path,
     engine::now_ns,
     fault::{Fault, Result},
-    ids::{AssetId, CollectionId},
+    ids::{AssetId, CollectionId, ItemId, StreamId},
     media::RenderDigest,
     model::LegacyImportReport,
+    provenance::{self, Origin, Provenance, Source, Stream, plain_text},
 };
 
 #[derive(Debug)]
@@ -109,6 +112,7 @@ impl Engine {
     ///
     /// Learned scores, unversioned embeddings, external-source interactions,
     /// and face state are deliberately not promoted into engine authority.
+    /// The provenance of external imports is attested on every run.
     pub fn import_legacy(&self, source: impl AsRef<Path>) -> Result<LegacyImportReport> {
         let source = source
             .as_ref()
@@ -119,56 +123,71 @@ impl Engine {
             })?;
         let legacy = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let dump = LegacyDump::load(&legacy)?;
+        let lineage = LegacyLineage::load(&legacy)?;
         let fingerprint = format!(
             "legacy-v1:{}",
             blake3::hash(format!("{dump:?}").as_bytes()).to_hex()
         );
 
         let mut connection = self.connection.lock();
-        if let Some(report) = prior_report(&connection, &fingerprint)? {
-            return Ok(report);
-        }
+        let mut report = match prior_report(&connection, &fingerprint)? {
+            Some(report) => report,
+            None => import_dump(&mut connection, &dump, &source, fingerprint)?,
+        };
         let tx = connection.transaction()?;
-        let now = now_ns()?;
-        let collections = import_collections(&tx, &dump.corpora)?;
-        let assets = import_assets(&tx, &dump.assets)?;
-        import_occurrences(&tx, &dump.occurrences, &collections, &assets, now)?;
-        import_sessions(&tx, &dump.sessions, &collections, &fingerprint)?;
-        let (imported_observations, ambiguous_observations) =
-            import_events(&tx, &dump, &collections, &assets, &fingerprint, now)?;
-        let imported_assets = assets.values().collect::<BTreeSet<_>>().len();
-        let imported_assets_sql = i64::try_from(imported_assets).map_err(|_| {
-            Fault::Corrupt("legacy asset count exceeds the database range".to_owned())
-        })?;
-        let imported_observations_sql = i64::try_from(imported_observations).map_err(|_| {
-            Fault::Corrupt("legacy observation count exceeds the database range".to_owned())
-        })?;
-        let ambiguous_observations_sql = i64::try_from(ambiguous_observations).map_err(|_| {
-            Fault::Corrupt("ambiguous observation count exceeds the database range".to_owned())
-        })?;
-        tx.execute(
-            "INSERT INTO pm_legacy_imports(
+        (report.attested_provenance, report.unattested_provenance) = attest_lineage(&tx, &lineage)?;
+        tx.commit()?;
+        Ok(report)
+    }
+}
+
+fn import_dump(
+    connection: &mut Connection,
+    dump: &LegacyDump,
+    source: &Path,
+    fingerprint: String,
+) -> Result<LegacyImportReport> {
+    let tx = connection.transaction()?;
+    let now = now_ns()?;
+    let collections = import_collections(&tx, &dump.corpora)?;
+    let assets = import_assets(&tx, &dump.assets)?;
+    import_occurrences(&tx, &dump.occurrences, &collections, &assets, now)?;
+    import_sessions(&tx, &dump.sessions, &collections, &fingerprint)?;
+    let (imported_observations, ambiguous_observations) =
+        import_events(&tx, dump, &collections, &assets, &fingerprint, now)?;
+    let imported_assets = assets.values().collect::<BTreeSet<_>>().len();
+    let imported_assets_sql = i64::try_from(imported_assets)
+        .map_err(|_| Fault::Corrupt("legacy asset count exceeds the database range".to_owned()))?;
+    let imported_observations_sql = i64::try_from(imported_observations).map_err(|_| {
+        Fault::Corrupt("legacy observation count exceeds the database range".to_owned())
+    })?;
+    let ambiguous_observations_sql = i64::try_from(ambiguous_observations).map_err(|_| {
+        Fault::Corrupt("ambiguous observation count exceeds the database range".to_owned())
+    })?;
+    tx.execute(
+        "INSERT INTO pm_legacy_imports(
                  source_fingerprint, source_path, imported_at_ns,
                  imported_assets, imported_observations, ambiguous_observations
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                fingerprint,
-                encode_path(&source),
-                now,
-                imported_assets_sql,
-                imported_observations_sql,
-                ambiguous_observations_sql,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(LegacyImportReport {
-            source_fingerprint: fingerprint,
-            imported_assets,
-            imported_observations,
-            ambiguous_observations,
-            already_imported: false,
-        })
-    }
+        params![
+            fingerprint,
+            encode_path(source),
+            now,
+            imported_assets_sql,
+            imported_observations_sql,
+            ambiguous_observations_sql,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(LegacyImportReport {
+        source_fingerprint: fingerprint,
+        imported_assets,
+        imported_observations,
+        ambiguous_observations,
+        already_imported: false,
+        attested_provenance: 0,
+        unattested_provenance: 0,
+    })
 }
 
 impl LegacyDump {
@@ -366,7 +385,7 @@ fn import_assets(
 ) -> Result<BTreeMap<String, AssetId>> {
     let mut mapping = BTreeMap::new();
     for asset in assets {
-        let (render, authority) = legacy_render(asset)?;
+        let (render, authority) = legacy_render(&asset.id, asset.render_hash.as_deref())?;
         let existing = tx
             .query_row(
                 "SELECT id FROM pm_assets WHERE render_digest = ?1",
@@ -879,16 +898,14 @@ fn presentation(tx: &Transaction<'_>, asset: &AssetId) -> Result<(Option<i64>, R
     Ok((occurrence, RenderDigest::parse(render)?, rotation))
 }
 
-fn legacy_render(asset: &LegacyAsset) -> Result<(RenderDigest, &'static str)> {
-    let exact = asset
-        .render_hash
-        .as_deref()
+fn legacy_render(id: &str, render_hash: Option<&str>) -> Result<(RenderDigest, &'static str)> {
+    let exact = render_hash
         .and_then(|hash| hash.strip_prefix("render:v1:"))
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     if let Some(digest) = exact {
         Ok((RenderDigest::parse(format!("rgba-v1:{digest}"))?, "exact"))
     } else {
-        Ok((RenderDigest::legacy(&asset.id), "legacy"))
+        Ok((RenderDigest::legacy(id), "legacy"))
     }
 }
 
@@ -944,7 +961,164 @@ fn prior_report(connection: &Connection, fingerprint: &str) -> Result<Option<Leg
                 ambiguous_observations: usize::try_from(ambiguous)
                     .map_err(|_| Fault::Corrupt("invalid ambiguous count".to_owned()))?,
                 already_imported: true,
+                attested_provenance: 0,
+                unattested_provenance: 0,
             })
         })
         .transpose()
+}
+
+/// One legacy external import: the item an asset was admitted from.
+#[derive(Debug)]
+struct LegacyLineage {
+    asset: String,
+    render_hash: Option<String>,
+    kind: String,
+    locator: String,
+    thread: i64,
+    post: i64,
+    title: String,
+    url: String,
+    md5: Option<String>,
+    imported_at: i64,
+}
+
+impl LegacyLineage {
+    fn load(connection: &Connection) -> Result<Vec<Self>> {
+        let mut present = 0;
+        for table in [
+            "asset_external_provenance",
+            "external_items",
+            "external_streams",
+            "external_sources",
+        ] {
+            present += usize::from(table_exists(connection, table)?);
+        }
+        match present {
+            0 => return Ok(Vec::new()),
+            4 => {}
+            _ => {
+                return Err(Fault::UnsupportedLegacy(
+                    "external provenance tables are incomplete".to_owned(),
+                ));
+            }
+        }
+        load_rows(
+            connection,
+            "SELECT a.id, a.render_hash, s.kind, s.board, i.thread_no, i.post_no, st.title,
+                    i.image_url, i.md5, p.imported_at
+             FROM asset_external_provenance p
+             JOIN assets a ON a.id = p.asset_id
+             JOIN external_items i ON i.id = p.item_id
+             JOIN external_streams st ON st.id = p.stream_id
+             JOIN external_sources s ON s.source_key = p.source_key
+             ORDER BY p.imported_at, p.item_id",
+            |row| {
+                Ok(Self {
+                    asset: row.get(0)?,
+                    render_hash: row.get(1)?,
+                    kind: row.get(2)?,
+                    locator: row.get(3)?,
+                    thread: row.get(4)?,
+                    post: row.get(5)?,
+                    title: row.get(6)?,
+                    url: row.get(7)?,
+                    md5: row.get(8)?,
+                    imported_at: row.get(9)?,
+                })
+            },
+        )
+    }
+
+    fn provenance(&self) -> Result<Provenance> {
+        match self.kind.as_str() {
+            "4chan_board" => Ok(Provenance {
+                source: Source::FourChanBoard(self.locator.clone()),
+                stream: Stream {
+                    id: StreamId::thread(&self.locator, self.thread),
+                    title: plain_text(&self.title),
+                },
+                item: ItemId::post(&self.locator, self.post),
+                origin: Origin::Url {
+                    url: self.url.clone(),
+                    md5: self.md5.clone(),
+                },
+            }),
+            "local_directory" => {
+                let root = PathBuf::from(&self.locator);
+                let path = file_url_path(&self.url)?;
+                let relative = path.strip_prefix(&root).map_err(|_| {
+                    Fault::UnsupportedLegacy(format!(
+                        "{} lies outside its source {}",
+                        path.display(),
+                        root.display()
+                    ))
+                })?;
+                let source = Source::LocalDirectory(root.clone());
+                // The legacy post number stands in for the native file stamp:
+                // both name one version of one file.
+                let item = ItemId::file(&source.id(), relative, &self.post.to_le_bytes());
+                Ok(Provenance {
+                    stream: Stream::folder(
+                        &root,
+                        relative.parent().unwrap_or_else(|| Path::new("")),
+                    ),
+                    item,
+                    origin: Origin::File(path.clone()),
+                    source,
+                })
+            }
+            other => Err(Fault::UnsupportedLegacy(format!(
+                "external source kind `{other}` is unknown"
+            ))),
+        }
+    }
+}
+
+fn attest_lineage(tx: &Transaction<'_>, lineage: &[LegacyLineage]) -> Result<(usize, usize)> {
+    let mut attested = 0;
+    for entry in lineage {
+        let (render, _) = legacy_render(&entry.asset, entry.render_hash.as_deref())?;
+        let asset = tx
+            .query_row(
+                "SELECT id FROM pm_assets WHERE render_digest = ?1",
+                [render.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(asset) = asset {
+            provenance::inscribe(
+                tx,
+                &AssetId::parse(asset)?,
+                &entry.provenance()?,
+                seconds_to_ns(entry.imported_at),
+            )?;
+            attested += 1;
+        }
+    }
+    Ok((attested, lineage.len() - attested))
+}
+
+/// The path a legacy `file://` URL names, percent-decoded byte for byte.
+fn file_url_path(url: &str) -> Result<PathBuf> {
+    let mut rest = url
+        .strip_prefix("file://")
+        .ok_or_else(|| Fault::UnsupportedLegacy(format!("local item {url} is not a file URL")))?
+        .as_bytes();
+    let mut decoded = Vec::with_capacity(rest.len());
+    while let Some((&byte, tail)) = rest.split_first() {
+        let escaped = (byte == b'%')
+            .then(|| tail.get(..2))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        if let Some(value) = escaped {
+            decoded.push(value);
+            rest = &tail[2..];
+        } else {
+            decoded.push(byte);
+            rest = tail;
+        }
+    }
+    Ok(PathBuf::from(OsString::from_vec(decoded)))
 }

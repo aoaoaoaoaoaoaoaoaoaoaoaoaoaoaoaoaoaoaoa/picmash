@@ -16,6 +16,11 @@ collection occurrence by decoding the payload, applying its presentation
 rotation, losslessly re-encoding the canonical raster as JPEG XL, verifying
 render identity, and atomically writing beneath `.picmash-imported/`.
 
+The archive admits that occurrence with its provenance (source, stream, item,
+and origin) in one engine transaction, so Browse can narrow to its board,
+thread, directory, or folder. Archives promoted before provenance was recorded
+are attested from their durable promotion records when the worker starts.
+
 `not_x` promotes either winner of a remote comparison: choosing the local image
 still means the challenger was not rejected. `hearted` promotes only a remote
 winner or an explicit favorite. Reject (`X`) retires one candidate. Reject

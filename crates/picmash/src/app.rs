@@ -26,6 +26,7 @@ use crate::{
     application_paths::{self, PicmashPaths as _},
     commands::{self, Edict},
     configuration::{Configuration, Probability, ReservoirCapacity},
+    facets::{Facets, Scope},
     remote::Summary as RemoteSummary,
     viewer::{Action as ViewerAction, Viewer},
     witness,
@@ -120,6 +121,15 @@ pub struct Picmash {
     images_per_row: u16,
     browse_scroll_offset: f32,
     favorites_only: bool,
+    scope: Scope,
+    /// Facets drawn in the browser. A fresh tally waits in `pending_facets`
+    /// while the pointer rests on them, so no row moves under it.
+    facets: Facets,
+    pending_facets: Option<Facets>,
+    facets_hovered: bool,
+    stream_filter: String,
+    /// The browser returns to its first row on the next frame.
+    browse_rewind: bool,
     pair: Option<PairView>,
     thumbnails: HashMap<ThumbKey, TextureHandle>,
     thumbnails_inflight: HashSet<ThumbKey>,
@@ -176,6 +186,12 @@ impl Picmash {
             images_per_row,
             browse_scroll_offset: 0.0,
             favorites_only: false,
+            scope: Scope::All,
+            facets: Facets::default(),
+            pending_facets: None,
+            facets_hovered: false,
+            stream_filter: String::new(),
+            browse_rewind: false,
             pair: None,
             thumbnails: HashMap::new(),
             thumbnails_inflight: HashSet::new(),
@@ -334,6 +350,17 @@ impl Picmash {
                 self.water.checkbox(&filter);
                 if before != self.favorites_only {
                     self.rebuild_browse_indices();
+                }
+                if !self.facets_hovered
+                    && let Some(facets) = self.pending_facets.take()
+                {
+                    self.facets = facets;
+                }
+                let picked =
+                    ui.scope(|ui| self.facets.show(ui, &self.scope, &mut self.stream_filter));
+                self.facets_hovered = picked.response.contains_pointer();
+                if let Some(scope) = picked.inner {
+                    self.narrow(scope);
                 }
             });
             self.water.fold(view.wake);
@@ -505,11 +532,15 @@ impl Picmash {
             && !ui.ctx().text_edit_focused())
         .then(|| ui.ctx().input(gallery_motion))
         .flatten();
-        let offset = motion.map(|motion| match motion {
-            GalleryMotion::PreviousRow => (self.browse_scroll_offset - row_height).max(0.0),
-            GalleryMotion::NextRow => self.browse_scroll_offset + row_height,
-            GalleryMotion::First => 0.0,
-        });
+        let offset = std::mem::take(&mut self.browse_rewind)
+            .then_some(0.0)
+            .or_else(|| {
+                motion.map(|motion| match motion {
+                    GalleryMotion::PreviousRow => (self.browse_scroll_offset - row_height).max(0.0),
+                    GalleryMotion::NextRow => self.browse_scroll_offset + row_height,
+                    GalleryMotion::First => 0.0,
+                })
+            });
         let mut demands = Vec::<ThumbKey>::new();
         let mut wanting = 0;
         let mut retained = HashSet::new();
@@ -917,12 +948,30 @@ impl Picmash {
     }
 
     fn rebuild_browse_indices(&mut self) {
+        let facets = Facets::tally(&self.cards, self.favorites_only);
+        if !facets.holds(&self.scope) {
+            self.scope = Scope::All;
+        }
+        self.pending_facets = Some(facets);
         self.browse_indices = self
             .cards
             .iter()
             .enumerate()
-            .filter_map(|(index, card)| (!self.favorites_only || card.favorite).then_some(index))
+            .filter_map(|(index, card)| {
+                ((!self.favorites_only || card.favorite) && self.scope.admits(card))
+                    .then_some(index)
+            })
             .collect();
+    }
+
+    /// Narrows the browser to `scope`, from its first row.
+    fn narrow(&mut self, scope: Scope) {
+        if scope.source() != self.scope.source() {
+            self.stream_filter.clear();
+        }
+        self.scope = scope;
+        self.browse_rewind = true;
+        self.rebuild_browse_indices();
     }
 
     fn open_viewer(&mut self, ctx: &egui::Context, asset_id: &AssetId) {
@@ -1000,6 +1049,11 @@ impl Picmash {
                 {
                     self.send(Command::FavoriteAsset(asset_id), false, "MARKING FAVORITE");
                 }
+            }
+            ViewerAction::Stream(source, stream) => {
+                self.viewer = None;
+                self.water.close_pond();
+                self.narrow(Scope::Stream(source, stream));
             }
             ViewerAction::Previous | ViewerAction::Next => {
                 if self
@@ -1206,6 +1260,7 @@ impl Picmash {
                 .as_ref()
                 .map(|summary| summary.root.display().to_string()),
             visible_assets: self.cards.len(),
+            browse_visible: self.browse_indices.len(),
             favorites: favorite_total(&self.cards),
             duels: duel_total(&self.cards),
             pair_ready: self.pair.is_some(),
@@ -1717,6 +1772,7 @@ pub struct Observation {
     status: String,
     collection: Option<String>,
     visible_assets: usize,
+    browse_visible: usize,
     favorites: usize,
     duels: u64,
     pair_ready: bool,

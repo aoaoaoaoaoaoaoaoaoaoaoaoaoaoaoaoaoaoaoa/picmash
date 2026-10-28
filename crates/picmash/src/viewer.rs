@@ -8,11 +8,12 @@ use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use eternalist_apps::commands::{CommandDispatch, CommandStatus};
 use picmash_contract::Target;
-use picmash_engine::AssetId;
+use picmash_engine::{AssetId, SourceId, StreamId};
 use std::{borrow::Cow, thread};
 
 use crate::{
     commands::{self, Edict},
+    facets::{source_label, stream_noun},
     witness,
     worker::{Blade, Card},
 };
@@ -21,13 +22,15 @@ const VIEWER_ID: &str = "picmash-viewer";
 const VIEWER_CHROME: f32 = 40.0;
 const VIEWER_MARGIN: f32 = 14.0;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Close,
     Copy,
     Favorite,
     Previous,
     Next,
+    /// Browse the stream the viewed image was admitted from.
+    Stream(SourceId, StreamId),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -128,7 +131,7 @@ impl Viewer {
                 .slot
                 .checked_add(1)
                 .filter(|slot| *slot < self.sequence.len()),
-            Action::Close | Action::Copy | Action::Favorite => None,
+            Action::Close | Action::Copy | Action::Favorite | Action::Stream(..) => None,
         };
         let Some(target) = target else {
             return false;
@@ -301,12 +304,50 @@ fn viewer_bar(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let _row = ui.horizontal(|ui| {
-                let _name = ui.label(
-                    chrome::TypeRole::Label
-                        .text(file_name(card))
+                // An admitted image is named by where it came from, its
+                // archive file name serving only as the link's hover text.
+                let cap = (ui.available_width() * 0.5).max(120.0);
+                let mut shown = Vec::new();
+                for provenance in &card.provenance {
+                    let key = (provenance.source.id(), provenance.stream.id.clone());
+                    if shown.contains(&key) {
+                        continue;
+                    }
+                    let label = chrome::TypeRole::Label
+                        .text(format!(
+                            "{} · {}",
+                            source_label(&provenance.source),
+                            provenance.stream.title
+                        ))
                         .strong()
-                        .color(chrome::HOT),
-                );
+                        .color(chrome::HOT);
+                    let link = ui
+                        .allocate_ui(egui::vec2(cap, ui.available_height()), |ui| {
+                            ui.add(egui::Button::new(label).frame(false).truncate())
+                        })
+                        .inner
+                        .on_hover_text(format!(
+                            "{}\nBrowse this {}",
+                            file_name(card),
+                            stream_noun(&provenance.source).to_lowercase()
+                        ));
+                    chrome::shallow_tension(ui, &link);
+                    if link.clicked() {
+                        actions.push(Action::Stream(key.0.clone(), key.1.clone()));
+                    }
+                    if shown.is_empty() {
+                        witness::response(ui, Target::ViewerStream, &link);
+                    }
+                    shown.push(key);
+                }
+                if shown.is_empty() {
+                    let _name = ui.label(
+                        chrome::TypeRole::Label
+                            .text(file_name(card))
+                            .strong()
+                            .color(chrome::HOT),
+                    );
+                }
                 let score = card.preference_score.map_or_else(
                     || "UNRANKED".to_owned(),
                     |score| format!("PREF {score:+.2}"),
