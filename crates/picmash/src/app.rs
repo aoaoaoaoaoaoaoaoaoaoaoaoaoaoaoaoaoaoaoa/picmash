@@ -451,14 +451,12 @@ impl Picmash {
                 (arena.bottom() - DUEL_PANEL_HEIGHT - DUEL_PANEL_BLEED).max(arena.top()),
             ),
         );
-        let [left_slot, right_slot] = optimal_pair_partition(
+        let [left_layout, right_layout] = comparison_layouts(
             image_arena,
             left.1.size_vec2(),
             right.1.size_vec2(),
             ui.spacing().item_spacing.x,
         );
-        let left_layout = comparison_layout(left_slot, left.1.size_vec2());
-        let right_layout = comparison_layout(right_slot, right.1.size_vec2());
         let _advanced = ui.advance_cursor_after_rect(arena);
         let mut actions = Vec::new();
         if let Some(action) = comparison_image(
@@ -1248,18 +1246,44 @@ struct ComparisonLayout {
     panel: egui::Rect,
 }
 
-fn comparison_layout(slot: egui::Rect, image_size: egui::Vec2) -> ComparisonLayout {
-    let image = contain_top_centered(slot.shrink(BRONZE_RIM), image_size);
-    let frame = image.expand(BRONZE_RIM);
-    let panel = egui::Rect::from_min_size(
-        frame.left_bottom(),
-        egui::vec2(frame.width(), DUEL_PANEL_HEIGHT),
-    );
-    ComparisonLayout {
-        image,
-        frame,
-        panel,
-    }
+/// Lays the duel out on one baseline: both images take one height, the
+/// largest at which both fit within their bronze rims, so their frames and
+/// the rails beneath them align. Width left over is split between the slots,
+/// each image centered in its own.
+fn comparison_layouts(
+    arena: egui::Rect,
+    left: egui::Vec2,
+    right: egui::Vec2,
+    gap: f32,
+) -> [ComparisonLayout; 2] {
+    let gap = gap.clamp(0.0, arena.width());
+    let width = (arena.width() - gap - 4.0 * BRONZE_RIM).max(2.0);
+    let aspects = [positive_aspect(left), positive_aspect(right)];
+    let height = (arena.height() - 2.0 * BRONZE_RIM)
+        .max(1.0)
+        .min(width / (aspects[0] + aspects[1]));
+    let slack = (width - (aspects[0] + aspects[1]) * height) * 0.5;
+    let mut left_edge = arena.left();
+    aspects.map(|aspect| {
+        let slot = aspect * height + 2.0 * BRONZE_RIM + slack;
+        let image = egui::Rect::from_min_size(
+            egui::pos2(
+                left_edge + BRONZE_RIM + slack * 0.5,
+                arena.top() + BRONZE_RIM,
+            ),
+            egui::vec2(aspect * height, height),
+        );
+        left_edge += slot + gap;
+        let frame = image.expand(BRONZE_RIM);
+        ComparisonLayout {
+            image,
+            frame,
+            panel: egui::Rect::from_min_size(
+                frame.left_bottom(),
+                egui::vec2(frame.width(), DUEL_PANEL_HEIGHT),
+            ),
+        }
+    })
 }
 
 fn comparison_image(
@@ -1434,34 +1458,6 @@ fn command_plate(ui: &mut egui::Ui, edict: Edict) -> (egui::Response, bool) {
     let response = command.into_response();
     chrome::tension(ui, &response);
     (response, activated)
-}
-
-fn optimal_pair_partition(
-    arena: egui::Rect,
-    left_image: egui::Vec2,
-    right_image: egui::Vec2,
-    gap: f32,
-) -> [egui::Rect; 2] {
-    let gap = gap.clamp(0.0, arena.width());
-    let width = (arena.width() - gap).max(2.0);
-    let height = arena.height().max(1.0);
-    let left_aspect = positive_aspect(left_image);
-    let right_aspect = positive_aspect(right_image);
-    let full_width = (left_aspect + right_aspect) * height;
-    let left_width = if width >= full_width {
-        left_aspect * height + (width - full_width) * 0.5
-    } else {
-        width * left_aspect / (left_aspect + right_aspect)
-    }
-    .clamp(1.0, width - 1.0);
-    let seam = arena.left() + left_width;
-    [
-        egui::Rect::from_min_max(arena.min, egui::pos2(seam, arena.bottom())),
-        egui::Rect::from_min_max(
-            egui::pos2(seam + gap, arena.top()),
-            egui::pos2(arena.left() + width + gap, arena.bottom()),
-        ),
-    ]
 }
 
 fn positive_aspect(image: egui::Vec2) -> f32 {
@@ -1648,16 +1644,6 @@ fn cover_uv(arena: egui::Vec2, image: egui::Vec2) -> egui::Rect {
         let inset = (1.0 - visible) * 0.5;
         egui::Rect::from_min_max(egui::pos2(0.0, inset), egui::pos2(1.0, 1.0 - inset))
     }
-}
-
-fn contain_top_centered(arena: egui::Rect, image: egui::Vec2) -> egui::Rect {
-    let image = image.max(egui::Vec2::splat(1.0));
-    let scale = (arena.width() / image.x).min(arena.height() / image.y);
-    let size = image * scale;
-    egui::Rect::from_min_size(
-        egui::pos2(arena.center().x - size.x * 0.5, arena.top()),
-        size,
-    )
 }
 
 fn plate(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
