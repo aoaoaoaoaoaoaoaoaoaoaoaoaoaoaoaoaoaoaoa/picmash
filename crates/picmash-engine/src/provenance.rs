@@ -139,6 +139,16 @@ impl Engine {
         tx.commit()?;
         Ok(attested)
     }
+
+    /// Retitles a stream that provenance already names. As when provenance
+    /// is inscribed, the newest title wins.
+    pub fn retitle(&self, source: &SourceId, stream: &Stream) -> Result<()> {
+        self.connection.lock().execute(
+            "UPDATE pm_streams SET title = ?3 WHERE source_id = ?1 AND id = ?2",
+            params![source.as_str(), stream.id.as_str(), stream.title],
+        )?;
+        Ok(())
+    }
 }
 
 /// Records that `asset` was admitted from `provenance`'s item. An item is

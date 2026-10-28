@@ -364,7 +364,7 @@ fn run(
         .map_err(anyhow::Error::from)
         .and_then(|engine| {
             let mut remote = Reactor::open(&paths, &remote_config)?;
-            remote.attest_promotions(&engine)?;
+            remote.reconcile_provenance(&engine)?;
             let archive = ArchiveLane::raise()?;
             for intent in remote.take_restored_promotions() {
                 reserve_promotion(&engine, &intent)?;

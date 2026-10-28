@@ -18,8 +18,9 @@ render identity, and atomically writing beneath `.picmash-imported/`.
 
 The archive admits that occurrence with its provenance (source, stream, item,
 and origin) in one engine transaction, so Browse can narrow to its board,
-thread, directory, or folder. Archives promoted before provenance was recorded
-are attested from their durable promotion records when the worker starts.
+thread, directory, or folder. When the worker starts, it attests archives
+promoted before provenance was recorded from their durable promotion records,
+and gives promoted streams the titles later harvests found.
 
 `not_x` promotes either winner of a remote comparison: choosing the local image
 still means the challenger was not rejected. `hearted` promotes only a remote

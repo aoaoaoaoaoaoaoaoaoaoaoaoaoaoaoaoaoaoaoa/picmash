@@ -296,9 +296,11 @@ impl Reactor {
         Ok(())
     }
 
-    /// Attests the provenance of promotions sealed before admissions recorded
-    /// it. A promotion whose occurrence no collection holds stays pending.
-    pub fn attest_promotions(&self, engine: &Engine) -> Result<()> {
+    /// Reconciles engine provenance with this store: attests promotions sealed
+    /// before admissions recorded provenance, then gives promoted streams the
+    /// titles harvests last found. A promotion whose occurrence no collection
+    /// holds stays pending.
+    pub fn reconcile_provenance(&self, engine: &Engine) -> Result<()> {
         for pending in self.store.unattested()? {
             if engine.attest(
                 &pending.archive,
@@ -307,6 +309,9 @@ impl Reactor {
             )? {
                 self.store.attested(&pending.provenance.item)?;
             }
+        }
+        for (source, stream) in self.store.promoted_streams()? {
+            engine.retitle(&source, &stream)?;
         }
         Ok(())
     }

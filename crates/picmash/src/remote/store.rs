@@ -14,7 +14,7 @@ use super::{
     Discovery, DuelVictor, FileStamp, Harvest, ItemId, OriginSnapshot, Prepared, PromotionIntent,
     PromotionJudgment, SourceIx, StreamId,
 };
-use picmash_engine::{Provenance, Source, Stream};
+use picmash_engine::{Provenance, Source, SourceId, Stream};
 
 use crate::configuration::{ImportPolicy, RemoteConfig, SourceConfig};
 
@@ -358,6 +358,31 @@ impl RemoteStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter().map(UnattestedRow::finish).collect()
+    }
+
+    /// Promoted items' streams, under the titles harvests last gave them.
+    pub fn promoted_streams(&self) -> Result<Vec<(SourceId, Stream)>> {
+        let rows = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT st.source_id, st.stream_id, st.title
+                 FROM pr_streams st
+                 JOIN pr_items i ON i.source_id = st.source_id AND i.stream_id = st.stream_id
+                 WHERE i.state = 'promoted'",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String, String)>>>()?;
+        rows.into_iter()
+            .map(|(source, stream, title)| {
+                Ok((
+                    SourceId::parse(source)?,
+                    Stream {
+                        id: StreamId::parse(stream)?,
+                        title,
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub fn attested(&self, item: &ItemId) -> Result<()> {
