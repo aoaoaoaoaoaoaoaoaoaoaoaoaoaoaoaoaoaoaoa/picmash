@@ -461,14 +461,18 @@ impl Picmash {
                 }
                 if let Some(evaluation) = summary.evaluation {
                     ui.add_space(4.0);
-                    let _label = ui.label(chrome::eyebrow("CHRONOLOGICAL HOLDOUT"));
+                    let _term = glossary(
+                        ui.label(chrome::eyebrow("CHRONOLOGICAL HOLDOUT")),
+                        "CHRONOLOGICAL HOLDOUT",
+                        "How well an order fit to your older duels predicts the newest fifth. \
+                         It diagnoses the model; it does not grade the images.",
+                    );
                     datum(
                         ui,
                         "ACCURACY",
                         format!("{:.0}%", evaluation.accuracy * 100.0),
                     );
                     datum(ui, "LOG LOSS", format!("{:.3}", evaluation.log_loss));
-                    let _caution = ui.label(chrome::muted("DIAGNOSTIC, NOT QUALITY"));
                 }
             }
             if self.remote_summary.enabled_sources > 0 || self.remote_summary.promoting > 0 {
@@ -2022,6 +2026,17 @@ fn plate_enabled(ui: &mut egui::Ui, enabled: bool, label: &str, selected: bool) 
     let response = ui.add_enabled(enabled, button);
     chrome::tension(ui, &response);
     response
+}
+
+/// Attaches a glossary card to a domain term: one short title and one direct
+/// definition, offered under the platform Help cursor.
+fn glossary(term: egui::Response, title: &str, definition: &str) -> egui::Response {
+    term.on_hover_cursor(egui::CursorIcon::Help)
+        .on_hover_ui(|ui| {
+            ui.set_max_width(280.0);
+            let _title = ui.label(chrome::section_title(title));
+            let _definition = ui.label(chrome::muted(definition));
+        })
 }
 
 fn datum(ui: &mut egui::Ui, label: &str, value: String) {
