@@ -14,7 +14,8 @@ The product exposes only the evidence-bearing local workflow:
 - correct display rotation;
 - browse the visible collection in preference order, narrowed by source and
   stream;
-- optionally compare bounded remote challengers and promote accepted images.
+- optionally compare bounded remote challengers, hold the comparison to one
+  remote stream, and promote accepted images.
 
 Faces, embeddings, triads, and the former unified-quality models were rejected
 rather than transplanted from the web application.
@@ -104,7 +105,8 @@ scripts/test-acceptance /tmp/picmash-acceptance
 
 The canonical gate formats, lints, and tests the workspace. The hermetic native
 story proves favorite, rotation, voting, hiding, browsing, restart persistence,
-a bounded local-source reservoir, nonblocking durable archive resumption,
+a bounded local-source reservoir, a stream lock released by exhaustion,
+nonblocking durable archive resumption,
 canonical remote promotion, and source and stream narrowing without network
 access.
 

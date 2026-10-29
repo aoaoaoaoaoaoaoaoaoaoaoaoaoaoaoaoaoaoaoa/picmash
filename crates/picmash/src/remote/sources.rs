@@ -66,11 +66,14 @@ impl Harvester {
         source: SourceIx,
         config: &SourceConfig,
         ordinal: u64,
+        focus: Option<&StreamId>,
     ) -> Result<Harvest> {
         match &config.upstream {
-            Upstream::FourChanBoard(board) => self.catalog_4chan(source, config, board, ordinal),
+            Upstream::FourChanBoard(board) => {
+                self.catalog_4chan(source, config, board, ordinal, focus)
+            }
             Upstream::LocalDirectory(directory) => {
-                self.catalog_directory(source, config, directory, ordinal)
+                self.catalog_directory(source, config, directory, ordinal, focus)
             }
         }
     }
@@ -155,109 +158,57 @@ impl Harvester {
         config: &SourceConfig,
         board: &FourChanBoard,
         ordinal: u64,
+        focus: Option<&StreamId>,
     ) -> Result<Harvest> {
-        let url = format!("{API_ROOT}/{}/catalog.json", board.board);
-        let mut response = self
-            .agent
-            .get(&url)
-            .call()
-            .with_context(|| format!("fetch 4chan catalog {url}"))?;
-        let bytes = response
-            .body_mut()
-            .with_config()
-            .limit(JSON_LIMIT)
-            .read_to_vec()
-            .with_context(|| format!("read 4chan catalog {url}"))?;
-        let mut threads = serde_json::from_slice::<Vec<CatalogPage>>(&bytes)
-            .with_context(|| format!("decode 4chan catalog {url}"))?
-            .into_iter()
-            .flat_map(|page| page.threads)
-            .filter(|thread| {
-                thread.no > 0
-                    && thread.images > 0
-                    && thread.replies > 0
-                    && !thread.closed
-                    && !thread.sticky
-            })
-            .collect::<Vec<_>>();
-        threads.sort_by_key(|thread| Reverse((thread.last_modified, thread.images, thread.no)));
-        threads.truncate(usize::from(board.harvest.catalog_threads.get()));
-        let fetches = usize::from(board.harvest.thread_fetches_per_scan.get()).min(threads.len());
-        let start = if threads.is_empty() {
-            0
-        } else {
-            usize::try_from(ordinal % u64::try_from(threads.len())?)?
-        };
-        let upstream = config.source();
         let mut discoveries = Vec::new();
-        for thread in threads.iter().cycle().skip(start).take(fetches) {
-            let url = format!("{API_ROOT}/{}/thread/{}.json", board.board, thread.no);
+        if let Some(stream) = focus {
+            let thread = stream.thread_of(&board.board).with_context(|| {
+                format!(
+                    "stream {} is not a /{}/ thread",
+                    stream.as_str(),
+                    board.board
+                )
+            })?;
+            self.harvest_thread(source, config, board, thread, &mut discoveries)?;
+        } else {
+            let url = format!("{API_ROOT}/{}/catalog.json", board.board);
             let mut response = self
                 .agent
                 .get(&url)
                 .call()
-                .with_context(|| format!("fetch 4chan thread {url}"))?;
+                .with_context(|| format!("fetch 4chan catalog {url}"))?;
             let bytes = response
                 .body_mut()
                 .with_config()
                 .limit(JSON_LIMIT)
                 .read_to_vec()
-                .with_context(|| format!("read 4chan thread {url}"))?;
-            let thread = serde_json::from_slice::<Thread>(&bytes)
-                .with_context(|| format!("decode 4chan thread {url}"))?;
-            let stream_title = thread
-                .posts
-                .first()
-                .map(thread_title)
-                .unwrap_or_else(|| "UNTITLED THREAD".to_owned());
-            for post in thread.posts.into_iter().rev() {
-                let Some(extension) = post.extension.as_deref().and_then(image_extension) else {
-                    continue;
-                };
-                let (Some(timestamp), Some(md5)) = (post.timestamp, post.md5.clone()) else {
-                    continue;
-                };
-                let (Ok(width), Ok(height), Ok(byte_len)) = (
-                    u32::try_from(post.width),
-                    u32::try_from(post.height),
-                    u64::try_from(post.byte_len),
-                ) else {
-                    continue;
-                };
-                if width.min(height) < board.filters.min_shortest_edge.get()
-                    || post.no <= 0
-                    || timestamp <= 0
-                    || byte_len == 0
-                    || byte_len > board.filters.max_download_bytes.get()
-                    || u64::from(width).saturating_mul(u64::from(height))
-                        > board.filters.max_pixels.get()
-                {
-                    continue;
-                }
-                discoveries.push(Discovery {
-                    source,
-                    upstream: upstream.clone(),
-                    import_policy: config.import_policy,
-                    stream_id: StreamId::thread(&board.board, thread_no(&post)),
-                    stream_title: stream_title.clone(),
-                    item_id: ItemId::post(&board.board, post.no),
-                    title: post_title(&post),
-                    origin: OriginSnapshot::Network {
-                        url: format!("{IMAGE_ROOT}/{}/{}.{extension}", board.board, timestamp),
-                        expected_md5: Some(md5),
-                    },
-                    extension: extension.to_owned(),
-                    width,
-                    height,
-                    byte_len,
-                    max_pixels: board.filters.max_pixels.get(),
-                });
+                .with_context(|| format!("read 4chan catalog {url}"))?;
+            let mut threads = serde_json::from_slice::<Vec<CatalogPage>>(&bytes)
+                .with_context(|| format!("decode 4chan catalog {url}"))?
+                .into_iter()
+                .flat_map(|page| page.threads)
+                .filter(|thread| {
+                    thread.no > 0
+                        && thread.images > 0
+                        && thread.replies > 0
+                        && !thread.closed
+                        && !thread.sticky
+                })
+                .collect::<Vec<_>>();
+            threads.sort_by_key(|thread| Reverse((thread.last_modified, thread.images, thread.no)));
+            threads.truncate(usize::from(board.harvest.catalog_threads.get()));
+            let fetches =
+                usize::from(board.harvest.thread_fetches_per_scan.get()).min(threads.len());
+            let start = if threads.is_empty() {
+                0
+            } else {
+                usize::try_from(ordinal % u64::try_from(threads.len())?)?
+            };
+            for thread in threads.iter().cycle().skip(start).take(fetches) {
                 if discoveries.len() == MAX_DISCOVERIES_PER_HARVEST {
                     break;
                 }
-            }
-            if discoveries.len() == MAX_DISCOVERIES_PER_HARVEST {
-                break;
+                self.harvest_thread(source, config, board, thread.no, &mut discoveries)?;
             }
         }
         Ok(Harvest {
@@ -267,12 +218,92 @@ impl Harvester {
         })
     }
 
+    /// Appends thread `no`'s admissible images until the harvest is full. A
+    /// thread 4chan no longer serves contributes nothing.
+    fn harvest_thread(
+        &self,
+        source: SourceIx,
+        config: &SourceConfig,
+        board: &FourChanBoard,
+        no: i64,
+        discoveries: &mut Vec<Discovery>,
+    ) -> Result<()> {
+        let url = format!("{API_ROOT}/{}/thread/{no}.json", board.board);
+        let mut response = match self.agent.get(&url).call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(404)) => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("fetch 4chan thread {url}")),
+        };
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(JSON_LIMIT)
+            .read_to_vec()
+            .with_context(|| format!("read 4chan thread {url}"))?;
+        let thread = serde_json::from_slice::<Thread>(&bytes)
+            .with_context(|| format!("decode 4chan thread {url}"))?;
+        let stream_title = thread
+            .posts
+            .first()
+            .map(thread_title)
+            .unwrap_or_else(|| "UNTITLED THREAD".to_owned());
+        let upstream = config.source();
+        for post in thread.posts.into_iter().rev() {
+            if discoveries.len() == MAX_DISCOVERIES_PER_HARVEST {
+                break;
+            }
+            let Some(extension) = post.extension.as_deref().and_then(image_extension) else {
+                continue;
+            };
+            let (Some(timestamp), Some(md5)) = (post.timestamp, post.md5.clone()) else {
+                continue;
+            };
+            let (Ok(width), Ok(height), Ok(byte_len)) = (
+                u32::try_from(post.width),
+                u32::try_from(post.height),
+                u64::try_from(post.byte_len),
+            ) else {
+                continue;
+            };
+            if width.min(height) < board.filters.min_shortest_edge.get()
+                || post.no <= 0
+                || timestamp <= 0
+                || byte_len == 0
+                || byte_len > board.filters.max_download_bytes.get()
+                || u64::from(width).saturating_mul(u64::from(height))
+                    > board.filters.max_pixels.get()
+            {
+                continue;
+            }
+            discoveries.push(Discovery {
+                source,
+                upstream: upstream.clone(),
+                import_policy: config.import_policy,
+                stream_id: StreamId::thread(&board.board, thread_no(&post)),
+                stream_title: stream_title.clone(),
+                item_id: ItemId::post(&board.board, post.no),
+                title: post_title(&post),
+                origin: OriginSnapshot::Network {
+                    url: format!("{IMAGE_ROOT}/{}/{}.{extension}", board.board, timestamp),
+                    expected_md5: Some(md5),
+                },
+                extension: extension.to_owned(),
+                width,
+                height,
+                byte_len,
+                max_pixels: board.filters.max_pixels.get(),
+            });
+        }
+        Ok(())
+    }
+
     fn catalog_directory(
         &self,
         source: SourceIx,
         config: &SourceConfig,
         directory: &LocalDirectory,
         ordinal: u64,
+        focus: Option<&StreamId>,
     ) -> Result<Harvest> {
         ensure!(
             directory.root.is_dir(),
@@ -290,6 +321,12 @@ impl Harvester {
             .filter(|entry| entry.file_type().is_file())
         {
             let path = entry.into_path();
+            if focus.is_some_and(|stream| {
+                let relative = path.strip_prefix(&directory.root).unwrap_or(&path);
+                StreamId::folder(relative.parent().unwrap_or_else(|| Path::new("."))) != *stream
+            }) {
+                continue;
+            }
             let Some(extension) = path
                 .extension()
                 .and_then(|extension| extension.to_str())

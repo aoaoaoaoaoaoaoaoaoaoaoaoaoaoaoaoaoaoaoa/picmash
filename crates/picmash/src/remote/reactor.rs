@@ -14,8 +14,8 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use picmash_engine::Engine;
 
 use super::{
-    CatalogIntent, Epoch, FetchIntent, FetchSettlement, Harvest, Harvester, ItemId, Machine,
-    Moment, Prepared, PromotionIntent, PromotionJudgment, RemoteStore, Summary,
+    CatalogIntent, Epoch, FetchIntent, FetchSettlement, Harvest, Harvester, ItemId, LockSummary,
+    Machine, Moment, Prepared, PromotionIntent, PromotionJudgment, RemoteStore, Summary,
 };
 use crate::{
     application_paths::{ApplicationPaths, PicmashPaths as _},
@@ -74,6 +74,7 @@ impl Reactor {
                             intent.source(),
                             intent.config(),
                             intent.ordinal(),
+                            intent.focus(),
                         )
                     }))
                     .map_or_else(
@@ -149,8 +150,10 @@ impl Reactor {
         &self.completions
     }
 
-    pub(crate) fn settle(&mut self, effect: Effect) -> Result<()> {
-        match effect {
+    /// Settles one effect, returning the lock a focused harvest found
+    /// exhausted.
+    pub(crate) fn settle(&mut self, effect: Effect) -> Result<Option<LockSummary>> {
+        let exhausted = match effect {
             Effect::Catalog { intent, result } => {
                 let result = if intent.epoch() == self.epoch {
                     result.and_then(|harvest| {
@@ -161,14 +164,21 @@ impl Reactor {
                 } else {
                     result
                 };
-                self.machine
+                let exhausted = self
+                    .machine
                     .settle_catalog(intent.complete(result), self.now())?;
+                if exhausted.is_some() {
+                    self.store.unlock()?;
+                }
+                exhausted
             }
             Effect::Fetch(effect) => {
                 self.settle_fetch(effect.intent, effect.result)?;
+                None
             }
-        }
-        self.drive()
+        };
+        self.drive()?;
+        Ok(exhausted)
     }
 
     pub fn drive(&mut self) -> Result<()> {
@@ -182,7 +192,7 @@ impl Reactor {
                 .context("remote catalog lane retired")?;
             if let Err(error) = lane.try_send(intent) {
                 let intent = recover(error);
-                self.machine.settle_catalog(
+                let _exhausted = self.machine.settle_catalog(
                     intent.complete(Err("remote catalog lane unavailable".to_owned())),
                     self.now(),
                 )?;
@@ -224,6 +234,31 @@ impl Reactor {
     /// `Machine::next_offer`.
     pub fn next_offer(&self, resolving: bool) -> Option<&Prepared> {
         self.machine.next_offer(resolving)
+    }
+
+    pub const fn locked(&self) -> bool {
+        self.machine.locked()
+    }
+
+    /// Holds the chamber to the displayed offer's stream, releasing the
+    /// payloads of other streams' prepared candidates.
+    pub fn lock(&mut self) -> Result<()> {
+        let candidate = self
+            .machine
+            .offered()
+            .cloned()
+            .context("there is no remote offer to lock")?;
+        self.store.lock(&candidate)?;
+        for released in self.machine.lock()? {
+            self.store.release(&released)?;
+        }
+        self.drive()
+    }
+
+    pub fn unlock(&mut self) -> Result<()> {
+        self.store.unlock()?;
+        let _held = self.machine.unlock();
+        self.drive()
     }
 
     pub fn take_restored_promotions(&mut self) -> Vec<PromotionIntent> {
@@ -279,7 +314,7 @@ impl Reactor {
     pub fn reject_offer_stream(&mut self) -> Result<()> {
         let candidate = self
             .machine
-            .offer()?
+            .offered()
             .cloned()
             .context("there is no remote offer to veto")?;
         let _retired = self.machine.retire_stream(
@@ -385,10 +420,16 @@ fn restore(
             .map(|intent| intent.candidate.clone()),
     )?;
     if !config.enabled {
+        store.unlock()?;
         for candidate in restored.prepared {
             store.release(&candidate)?;
         }
         return Ok(restored.promotions);
+    }
+    if let Some(lock) = restored.lock
+        && !machine.restore_lock(&lock.source, lock.stream, lock.title)
+    {
+        store.unlock()?;
     }
     let discarded = machine.restore_prepared(restored.prepared)?;
     let mut released = HashMap::new();
@@ -400,19 +441,24 @@ fn restore(
             .1
             .push(candidate.discovery);
     }
-    machine.restore_discovered(
-        restored
-            .harvests
+    // Each harvest replaces its source's partition: a source's released
+    // candidates join its restored discoveries, ahead of them.
+    let mut harvests = restored.harvests;
+    for harvest in &mut harvests {
+        if let Some((_, mut discoveries)) = released.remove(&harvest.source) {
+            discoveries.append(&mut harvest.discoveries);
+            harvest.discoveries = discoveries;
+        }
+    }
+    harvests.extend(
+        released
             .into_iter()
-            .chain(
-                released
-                    .into_iter()
-                    .map(|(source, (source_identity, discoveries))| Harvest {
-                        source,
-                        source_identity,
-                        discoveries,
-                    }),
-            ),
-    )?;
+            .map(|(source, (source_identity, discoveries))| Harvest {
+                source,
+                source_identity,
+                discoveries,
+            }),
+    );
+    machine.restore_discovered(harvests)?;
     Ok(restored.promotions)
 }

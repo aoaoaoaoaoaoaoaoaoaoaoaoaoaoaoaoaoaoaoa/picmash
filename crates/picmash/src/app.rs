@@ -1,6 +1,8 @@
 use anyhow::Result;
 use brass_poolrooms::{
-    chrome::{self, Checkbox, MechanismSize},
+    chrome::{
+        self, Checkbox, MechanismSize, Monoglyph, MonoglyphFinish, MonoglyphResponse, Symbol,
+    },
     water::{Domain, Floor, Surface, Wetness},
 };
 use crossbeam_channel::{Receiver, bounded};
@@ -8,12 +10,12 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 use eternalist_apps::{
     ApplicationHeader, Inspector, LivingWait, NativeWake,
     command_guide::CommandGuide,
-    commands::{CommandDispatch, CommandStatus},
+    commands::{CommandDispatch, CommandStatus, ShortcutKey, ShortcutModifiers},
     configuration::ConfigurationLedger,
     panel_navigation::PanelNavigator,
     settings::{SettingSpec, SettingsFile, SettingsSheet},
 };
-use picmash_contract::{Side, Target};
+use picmash_contract::{Side, Target, Turn};
 use picmash_engine::{AssetId, ScanProgress};
 use std::{
     collections::{HashMap, HashSet},
@@ -26,7 +28,7 @@ use crate::{
     application_paths::{self, PicmashPaths as _},
     commands::{self, Edict},
     configuration::{Configuration, Probability, ReservoirCapacity},
-    facets::{Facets, Scope},
+    facets::{Facets, Scope, source_label},
     remote::Summary as RemoteSummary,
     viewer::{Action as ViewerAction, Viewer},
     witness,
@@ -110,7 +112,9 @@ enum Action {
     Hide(Side),
     RejectRemote,
     RejectStream,
-    Rotate(Side),
+    /// Hold the chamber to the displayed stream, or release it.
+    LockStream(bool),
+    Rotate(Side, Turn),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -152,6 +156,10 @@ pub struct Picmash {
     choice: Option<Choice>,
     /// The chamber shows the worker's wait this frame.
     wait_shown: bool,
+    /// The chamber waits for the locked stream's next challenger.
+    awaiting: bool,
+    /// A stream lock state requested of the worker and not yet confirmed.
+    lock_pending: Option<bool>,
     scan_progress: Option<ScanProgress>,
     status: String,
     panels: PanelNavigator,
@@ -194,6 +202,8 @@ impl Picmash {
             mode: Mode::Compare,
             summary: None,
             remote_summary: RemoteSummary::default(),
+            awaiting: false,
+            lock_pending: None,
             pending_collection: None,
             cards: Vec::new(),
             browse_indices: Vec::new(),
@@ -388,6 +398,59 @@ impl Picmash {
             self.water.fold(view.wake);
         }
 
+        if self.mode == Mode::Compare
+            && let Some((source, title)) = self.held_stream()
+        {
+            let stream = panels.panel(ui, "stream", "STREAM", true, |ui| {
+                let _source = ui.label(
+                    chrome::TypeRole::Label
+                        .text(source)
+                        .strong()
+                        .color(chrome::HOT),
+                );
+                let _title = ui.label(chrome::TypeRole::Label.text(title).color(chrome::MUTED));
+                ui.add_space(5.0);
+                let held = self.stream_locked();
+                let mut latched = held;
+                let latch = ui
+                    .horizontal(|ui| {
+                        let latch = Monoglyph::symbol(Symbol::Lock)
+                            .size(MechanismSize::Medium)
+                            .show_latched(ui, &mut latched)
+                            .on_hover_text(if held {
+                                "Release this stream"
+                            } else {
+                                "Hold the comparison to this stream"
+                            });
+                        let _label =
+                            ui.label(chrome::section_title("LOCK STREAM").color(if held {
+                                chrome::HOT
+                            } else {
+                                chrome::TEXT
+                            }));
+                        latch
+                    })
+                    .inner;
+                self.water.monoglyph(&latch);
+                witness::response(ui, Target::StreamLock, &latch);
+                if latch.clicked() && !self.busy {
+                    self.apply_action(Action::LockStream(latched));
+                }
+                if self.awaiting {
+                    let _awaiting = ui.label(chrome::muted("AWAITING ITS NEXT IMAGE"));
+                }
+                if self.remote_shown() {
+                    ui.add_space(5.0);
+                    let (reject, activated) = command_plate(ui, Edict::RejectStream);
+                    witness::response(ui, Target::RejectStream, &reject);
+                    if activated && !self.busy {
+                        self.apply_action(Action::RejectStream);
+                    }
+                }
+            });
+            self.water.fold(stream.wake);
+        }
+
         let status = panels.panel(ui, "status", "STATUS", true, |ui| {
             if let Some(summary) = &self.summary {
                 datum(ui, "VISIBLE", summary.visible_assets.to_string());
@@ -438,8 +501,9 @@ impl Picmash {
     fn chamber(&mut self, ui: &mut egui::Ui) {
         let arena = ui.available_rect_before_wrap();
         self.water.begin(Domain::shelf(arena));
+        let awaiting = self.awaiting && self.mode == Mode::Compare;
         self.water
-            .set_floor(self.wait_shown.then_some(Floor::shallow(arena)));
+            .set_floor((self.wait_shown || awaiting).then_some(Floor::shallow(arena)));
         match (self.wait_shown, self.summary.is_some(), self.mode) {
             (true, _, _) => {
                 let _rect = match self.scan_progress {
@@ -451,6 +515,9 @@ impl Picmash {
                 };
             }
             (false, false, _) => self.first_contact(ui),
+            (false, true, Mode::Compare) if awaiting => {
+                let _rect = self.living_wait.bouncer_with(ui, arena, "AWAITING");
+            }
             (false, true, Mode::Compare) => self.comparison(ui),
             (false, true, Mode::Browse) => self.browser(ui),
         }
@@ -528,11 +595,21 @@ impl Picmash {
         ) {
             actions.push(action);
         }
-        actions.extend(comparison_panel(ui, Side::Left, &left.0, left_layout.panel));
+        let locked = self.stream_locked();
         actions.extend(comparison_panel(
             ui,
+            &mut self.water,
+            Side::Left,
+            &left.0,
+            locked,
+            left_layout.panel,
+        ));
+        actions.extend(comparison_panel(
+            ui,
+            &mut self.water,
             Side::Right,
             &right.0,
+            locked,
             right_layout.panel,
         ));
         // A judged pair holding the chamber through its grace is inert.
@@ -640,10 +717,7 @@ impl Picmash {
     }
 
     fn edict_status(&self, edict: Edict) -> CommandStatus<'static> {
-        let remote = self
-            .pair
-            .as_ref()
-            .is_some_and(|pair| pair.pair.right.remote().is_some());
+        let remote = self.remote_shown();
         match edict {
             Edict::ChooseLeft | Edict::ChooseRight if self.busy || self.pair.is_none() => {
                 CommandStatus::Disabled("no comparison is ready")
@@ -656,11 +730,18 @@ impl Picmash {
             Edict::RejectRemote | Edict::RejectStream if self.busy => {
                 CommandStatus::Disabled("no remote challenger is ready")
             }
+            Edict::LockStream if !remote && self.remote_summary.lock.is_none() => {
+                CommandStatus::Hidden
+            }
+            Edict::LockStream if self.busy || self.lock_pending.is_some() => {
+                CommandStatus::Disabled("the stream lock is changing")
+            }
             Edict::CopyViewer => CommandStatus::Hidden,
             Edict::ChooseLeft
             | Edict::ChooseRight
             | Edict::RejectRemote
             | Edict::RejectStream
+            | Edict::LockStream
             | Edict::OpenCollection
             | Edict::Rescan
             | Edict::Compare
@@ -681,6 +762,7 @@ impl Picmash {
             Edict::ChooseRight => self.apply_action(Action::Choose(Side::Right)),
             Edict::RejectRemote => self.apply_action(Action::RejectRemote),
             Edict::RejectStream => self.apply_action(Action::RejectStream),
+            Edict::LockStream => self.apply_action(Action::LockStream(!self.stream_locked())),
             Edict::CopyViewer => unreachable!("viewer commands are routed by the viewer"),
             Edict::OpenCollection => self.open_collection(ctx),
             Edict::Rescan => self.send(Command::Rescan, true, "SCANNING COLLECTION"),
@@ -698,11 +780,7 @@ impl Picmash {
         }
         match action {
             Action::Choose(side) => {
-                let status = if self
-                    .pair
-                    .as_ref()
-                    .is_some_and(|pair| pair.pair.right.remote().is_some())
-                {
+                let status = if self.remote_shown() {
                     "COMMITTING TO ARCHIVE"
                 } else {
                     "FORGING NEXT PAIR"
@@ -736,7 +814,29 @@ impl Picmash {
             Action::RejectStream => {
                 self.send(Command::RejectStream, true, "REJECTING REMOTE STREAM");
             }
-            Action::Rotate(side) => self.send(Command::Rotate(side), true, "TURNING IMAGE"),
+            Action::LockStream(lock) => {
+                if self.lock_pending.is_none()
+                    && self.dispatch(
+                        if lock {
+                            Command::LockStream
+                        } else {
+                            Command::UnlockStream
+                        },
+                        false,
+                    )
+                {
+                    self.lock_pending = Some(lock);
+                    if lock {
+                        "STREAM LOCKED"
+                    } else {
+                        "STREAM RELEASED"
+                    }
+                    .clone_into(&mut self.status);
+                }
+            }
+            Action::Rotate(side, turn) => {
+                self.send(Command::Rotate(side, turn), true, "TURNING IMAGE");
+            }
         }
     }
 
@@ -781,6 +881,31 @@ impl Picmash {
         choice.status.clone_into(&mut self.status);
         self.choice = None;
         true
+    }
+
+    /// The lock state the chamber shows: a requested state until the worker
+    /// confirms it.
+    fn stream_locked(&self) -> bool {
+        self.lock_pending
+            .unwrap_or_else(|| self.remote_summary.lock.is_some())
+    }
+
+    fn remote_shown(&self) -> bool {
+        self.pair
+            .as_ref()
+            .is_some_and(|pair| pair.pair.right.remote().is_some())
+    }
+
+    /// The source label and title of the stream the chamber is held to, else
+    /// of the displayed remote challenger's.
+    fn held_stream(&self) -> Option<(String, String)> {
+        if let Some(lock) = &self.remote_summary.lock {
+            return Some((source_label(&lock.source), lock.title.clone()));
+        }
+        self.pair
+            .as_ref()
+            .and_then(|pair| pair.pair.right.remote())
+            .map(|remote| (remote.source.clone(), remote.stream.clone()))
     }
 
     fn open_collection(&mut self, ctx: &egui::Context) {
@@ -877,6 +1002,7 @@ impl Picmash {
                 self.summary = Some(summary);
                 self.cards = cards;
                 self.pair = None;
+                self.awaiting = false;
                 self.thumbnails.clear();
                 self.thumbnails_inflight.clear();
                 self.thumbnails_faulted.clear();
@@ -903,27 +1029,46 @@ impl Picmash {
                     right_texture,
                 });
                 self.busy = false;
+                self.awaiting = false;
                 self.choice = None;
                 self.scan_progress = None;
-                if remote {
-                    "REMOTE CHALLENGER · CHOOSE, FAVORITE, REJECT, OR REJECT STREAM"
-                } else {
+                if !remote {
                     "CHOOSE THE STRONGER IMAGE"
+                } else if self.remote_summary.lock.is_some() {
+                    "LOCKED STREAM · CHOOSE THE STRONGER IMAGE"
+                } else {
+                    "REMOTE CHALLENGER · CHOOSE THE STRONGER IMAGE"
                 }
                 .clone_into(&mut self.status);
             }
             Event::Remote(summary) => {
+                if self.lock_pending == Some(summary.lock.is_some()) {
+                    self.lock_pending = None;
+                }
                 self.remote_summary = summary;
             }
             Event::RemoteFault(message) => {
+                self.lock_pending = None;
                 self.status = format!("REMOTE SUSPENDED · {message}");
             }
             Event::ArchiveFault(message) => {
                 self.status = format!("ARCHIVE PAUSED · {message}");
             }
+            Event::Awaiting => {
+                self.pair = None;
+                self.busy = false;
+                self.awaiting = true;
+                self.choice = None;
+                self.scan_progress = None;
+                "AWAITING THE LOCKED STREAM".clone_into(&mut self.status);
+            }
+            Event::Exhausted(title) => {
+                self.status = format!("STREAM EXHAUSTED · LOCK RELEASED · {title}");
+            }
             Event::NoComparison => {
                 self.pair = None;
                 self.busy = false;
+                self.awaiting = false;
                 self.scan_progress = None;
                 "TWO VISIBLE IMAGES ARE REQUIRED".clone_into(&mut self.status);
             }
@@ -991,6 +1136,7 @@ impl Picmash {
             }
             Event::Fault(message) => {
                 self.busy = false;
+                self.lock_pending = None;
                 self.pending_collection = None;
                 self.scan_progress = None;
                 self.status = format!("FAULT · {message}");
@@ -1336,6 +1482,8 @@ impl Picmash {
                 .is_some_and(|pair| pair.pair.right.remote().is_some()),
             remote_ready: self.remote_summary.prepared + usize::from(self.remote_summary.offered),
             remote_promoting: self.remote_summary.promoting,
+            stream_locked: self.remote_summary.lock.is_some(),
+            awaiting: self.awaiting,
             pair_rotations: self.pair.as_ref().map(|pair| {
                 [
                     pair.pair.left.rotation_quarters(),
@@ -1442,23 +1590,24 @@ fn comparison_image(
 
 fn comparison_panel(
     ui: &mut egui::Ui,
+    water: &mut Surface,
     side: Side,
     card: &PairCard,
+    locked: bool,
     rect: egui::Rect,
 ) -> Vec<Action> {
-    let mut actions = Vec::new();
     let mut panel = ui.new_child(
         egui::UiBuilder::new()
             .id_salt(("comparison-panel", side.wire()))
             .max_rect(rect),
     );
-    let _rail = egui::Frame::new()
+    egui::Frame::new()
         .fill(chrome::RAISED)
         .stroke(egui::Stroke::new(1.0, chrome::EDGE))
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(&mut panel, |ui| {
             ui.set_min_width(ui.available_width());
-            let _sides = egui::containers::Sides::new()
+            let (key, mut actions) = egui::containers::Sides::new()
                 .height(DUEL_CONTROL_HEIGHT)
                 .spacing(6.0)
                 .shrink_left()
@@ -1466,68 +1615,157 @@ fn comparison_panel(
                 .show(
                     ui,
                     |ui| comparison_identity(ui, side, card),
-                    |ui| comparison_actions(ui, side, card, &mut actions),
+                    |ui| comparison_actions(ui, water, side, card, locked),
                 );
-        });
-    actions
+            if let Some(key) = key {
+                water.monoglyph(&key);
+                if key.clicked() {
+                    actions.push(Action::Choose(side));
+                }
+            }
+            actions
+        })
+        .inner
 }
 
-fn comparison_identity(ui: &mut egui::Ui, side: Side, card: &PairCard) {
-    let side_label = match side {
-        Side::Left => "A LEFT",
-        Side::Right => "D RIGHT",
-    };
-    let _side = ui.label(chrome::section_title(side_label));
+/// The rail's left side: the keycap that chooses this image, then what the
+/// image is.
+fn comparison_identity(
+    ui: &mut egui::Ui,
+    side: Side,
+    card: &PairCard,
+) -> Option<MonoglyphResponse> {
+    let key = choice_key(side).map(|glyph| {
+        let key = Monoglyph::new(glyph)
+            .size(MechanismSize::Small)
+            .finish(MonoglyphFinish::Void)
+            .show(ui)
+            .on_hover_text("Choose this image");
+        witness::response(ui, Target::ChoiceKey(side), &key);
+        key
+    });
     let _meta = ui.label(
         chrome::TypeRole::Label
             .text(comparison_metadata(card))
             .strong()
             .color(chrome::MUTED),
     );
+    key
 }
 
-fn comparison_actions(ui: &mut egui::Ui, side: Side, card: &PairCard, actions: &mut Vec<Action>) {
-    if card.remote().is_some() {
-        let (stream, stream_activated) = command_plate(ui, Edict::RejectStream);
-        let stream = stream.on_hover_text("Reject this entire thread");
-        witness::response(ui, Target::RejectStream(side), &stream);
-        if stream_activated {
-            actions.push(Action::RejectStream);
-        }
-        let (reject, reject_activated) = command_plate(ui, Edict::RejectRemote);
-        let reject = reject.on_hover_text("Reject this remote image");
-        witness::response(ui, Target::Reject(side), &reject);
-        if reject_activated {
-            actions.push(Action::RejectRemote);
-        }
-    } else {
-        let hide = duel_plate(ui, "Hide").on_hover_text("Hide from this collection");
-        witness::response(ui, Target::Hide(side), &hide);
-        if hide.clicked() {
-            actions.push(Action::Hide(side));
-        }
-    }
-    let rotate = duel_plate(ui, "Rotate").on_hover_text("Rotate clockwise");
-    witness::response(ui, Target::Rotate(side), &rotate);
-    if rotate.clicked() {
-        actions.push(Action::Rotate(side));
-    }
-    let favorite_label = if card.favorite() {
-        "Unfavorite"
-    } else {
-        "Favorite"
+/// The bare key that chooses `side`, as its keycap is engraved.
+fn choice_key(side: Side) -> Option<char> {
+    let edict = match side {
+        Side::Left => Edict::ChooseLeft,
+        Side::Right => Edict::ChooseRight,
     };
-    let favorite = duel_plate(ui, favorite_label).on_hover_text(if card.remote().is_some() {
+    commands::canon()
+        .shortcuts(edict)
+        .iter()
+        .find_map(|shortcut| match shortcut.key() {
+            ShortcutKey::Character(glyph) if shortcut.modifiers() == ShortcutModifiers::NONE => {
+                Some(glyph.to_ascii_uppercase())
+            }
+            _ => None,
+        })
+}
+
+/// The rail's right side, laid out from the right edge: favorite, both
+/// quarter turns, then hide, or a remote challenger's reject and stream lock.
+fn comparison_actions(
+    ui: &mut egui::Ui,
+    water: &mut Surface,
+    side: Side,
+    card: &PairCard,
+    locked: bool,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let remote = card.remote().is_some();
+    let favorite = card.favorite();
+    let heart = Monoglyph::symbol(Symbol::Heart).finish(if favorite {
+        MonoglyphFinish::Love
+    } else {
+        MonoglyphFinish::BrightCut
+    });
+    let hint = if remote {
         "Promote and mark favorite"
-    } else if card.favorite() {
+    } else if favorite {
         "Withdraw favorite"
     } else {
         "Mark favorite"
-    });
-    witness::response(ui, Target::Favorite(side), &favorite);
-    if favorite.clicked() {
+    };
+    if rail_glyph(ui, water, heart, Target::Favorite(side), hint) {
         actions.push(Action::Favorite(side));
     }
+    for (glyph, turn, hint) in [
+        ('↷', Turn::Clockwise, "Rotate clockwise"),
+        ('↶', Turn::Counterclockwise, "Rotate counterclockwise"),
+    ] {
+        if rail_glyph(
+            ui,
+            water,
+            Monoglyph::new(glyph),
+            Target::Rotate(side, turn),
+            hint,
+        ) {
+            actions.push(Action::Rotate(side, turn));
+        }
+    }
+    if !remote {
+        let hide = Monoglyph::symbol(Symbol::Visibility);
+        if rail_glyph(
+            ui,
+            water,
+            hide,
+            Target::Hide(side),
+            "Hide from this collection",
+        ) {
+            actions.push(Action::Hide(side));
+        }
+        return actions;
+    }
+    let reject = Monoglyph::symbol(Symbol::Delete);
+    if rail_glyph(
+        ui,
+        water,
+        reject,
+        Target::Reject(side),
+        "Reject this remote image",
+    ) {
+        actions.push(Action::RejectRemote);
+    }
+    let mut latched = locked;
+    let latch = Monoglyph::symbol(Symbol::Lock)
+        .size(MechanismSize::Small)
+        .show_latched(ui, &mut latched)
+        .on_hover_text(if locked {
+            "Release this stream"
+        } else {
+            "Hold the comparison to this stream"
+        });
+    water.monoglyph(&latch);
+    witness::response(ui, Target::Lock(side), &latch);
+    if latch.clicked() {
+        actions.push(Action::LockStream(latched));
+    }
+    actions
+}
+
+/// One rail actuator; true when pressed.
+fn rail_glyph(
+    ui: &mut egui::Ui,
+    water: &mut Surface,
+    glyph: Monoglyph,
+    target: Target,
+    hint: &str,
+) -> bool {
+    let response = glyph
+        .size(MechanismSize::Small)
+        .show(ui)
+        .on_hover_text(hint);
+    water.monoglyph(&response);
+    witness::response(ui, target, &response);
+    response.clicked()
 }
 
 fn comparison_metadata(card: &PairCard) -> String {
@@ -1571,10 +1809,11 @@ fn paint_bronze_frame(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32) -> e
     inner
 }
 
+/// A full-width inspector plate for `edict`, its shortcut legend included.
 fn command_plate(ui: &mut egui::Ui, edict: Edict) -> (egui::Response, bool) {
-    let command = commands::canon().button_with(edict, ui, |button| {
-        button.min_size(egui::vec2(24.0, DUEL_CONTROL_HEIGHT))
-    });
+    let width = ui.available_width();
+    let command =
+        commands::canon().button_with(edict, ui, |button| button.min_size(egui::vec2(width, 28.0)));
     let activated = command.clicked();
     let response = command.into_response();
     chrome::tension(ui, &response);
@@ -1776,17 +2015,6 @@ fn plate(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     response
 }
 
-fn duel_plate(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let text = chrome::TypeRole::Label
-        .text(label)
-        .strong()
-        .color(chrome::TEXT);
-    let button = egui::Button::new(text).min_size(egui::vec2(24.0, DUEL_CONTROL_HEIGHT));
-    let response = ui.add(button);
-    chrome::tension(ui, &response);
-    response
-}
-
 fn plate_enabled(ui: &mut egui::Ui, enabled: bool, label: &str, selected: bool) -> egui::Response {
     let button = egui::Button::new(chrome::section_title(label))
         .selected(selected)
@@ -1857,6 +2085,8 @@ pub struct Observation {
     remote_pair: bool,
     remote_ready: usize,
     remote_promoting: usize,
+    stream_locked: bool,
+    awaiting: bool,
     pair_rotations: Option<[u8; 2]>,
     pair_files: Option<[String; 2]>,
     images_per_row: u16,

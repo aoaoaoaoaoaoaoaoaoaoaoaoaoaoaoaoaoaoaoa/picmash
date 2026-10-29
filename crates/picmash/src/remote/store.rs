@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use walkdir::WalkDir;
 
 use super::promotion::archive_path;
@@ -18,7 +18,7 @@ use picmash_engine::{Provenance, Source, SourceId, Stream};
 
 use crate::configuration::{ImportPolicy, RemoteConfig, SourceConfig};
 
-const SCHEMA: i64 = 5;
+const SCHEMA: i64 = 6;
 
 /// Every source this store has known, so a persisted item can be restored or
 /// attested after its source leaves the configuration; and the promotions
@@ -58,11 +58,27 @@ const PROMOTION_SCHEMA: &str = "CREATE TABLE pr_promotions(
                  AND victor IS NULL AND response_ms IS NULL)
          )
      ) STRICT, WITHOUT ROWID;";
+/// At most one stream holds the chamber; vetoing it or exhausting it
+/// releases the row.
+const LOCK_SCHEMA: &str = "CREATE TABLE pr_lock(
+         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+         source_id TEXT NOT NULL,
+         stream_id TEXT NOT NULL,
+         FOREIGN KEY(source_id, stream_id) REFERENCES pr_streams(source_id, stream_id)
+     ) STRICT;";
 
 pub struct Restoration {
     pub harvests: Vec<Harvest>,
     pub prepared: Vec<Prepared>,
     pub promotions: Vec<PromotionIntent>,
+    pub lock: Option<PersistedLock>,
+}
+
+/// The stream a persisted lock holds the chamber to.
+pub struct PersistedLock {
+    pub source: String,
+    pub stream: StreamId,
+    pub title: String,
 }
 
 pub struct RemoteStore {
@@ -314,6 +330,30 @@ impl RemoteStore {
             }
         }
         prune_retired(&self.connection)?;
+        let lock = self
+            .connection
+            .query_row(
+                "SELECT l.source_id, l.stream_id, s.title FROM pr_lock l
+                 JOIN pr_streams s ON s.source_id = l.source_id AND s.stream_id = l.stream_id
+                 WHERE s.vetoed = 0",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(source, stream, title)| -> Result<PersistedLock> {
+                Ok(PersistedLock {
+                    source,
+                    stream: StreamId::parse(stream)?,
+                    title,
+                })
+            })
+            .transpose()?;
         let harvests = discovered
             .into_iter()
             .map(|(source, discoveries)| Harvest {
@@ -326,6 +366,7 @@ impl RemoteStore {
             harvests,
             prepared,
             promotions,
+            lock,
         })
     }
 
@@ -520,6 +561,25 @@ impl RemoteStore {
         self.finish(candidate, "rejected", "rejected")
     }
 
+    /// Persists the lock on `candidate`'s stream in place of any other.
+    pub fn lock(&self, candidate: &Prepared) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO pr_lock(singleton, source_id, stream_id) VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 source_id = excluded.source_id, stream_id = excluded.stream_id",
+            params![
+                candidate.discovery.upstream.id().as_str(),
+                candidate.discovery.stream_id.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn unlock(&self) -> Result<()> {
+        self.connection.execute("DELETE FROM pr_lock", [])?;
+        Ok(())
+    }
+
     pub fn reject_stream(&self, candidate: &Prepared) -> Result<()> {
         let now = now_ns()?;
         let tx = self.connection.unchecked_transaction()?;
@@ -550,6 +610,13 @@ impl RemoteStore {
                 candidate.discovery.upstream.id().as_str(),
                 candidate.discovery.stream_id.as_str(),
                 now,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM pr_lock WHERE source_id = ?1 AND stream_id = ?2",
+            params![
+                candidate.discovery.upstream.id().as_str(),
+                candidate.discovery.stream_id.as_str(),
             ],
         )?;
         tx.execute(
@@ -683,6 +750,10 @@ fn prune_retired(connection: &Connection) -> Result<()> {
          WHERE vetoed = 0
            AND NOT EXISTS(
                SELECT 1 FROM pr_items
+               WHERE source_id = pr_streams.source_id AND stream_id = pr_streams.stream_id
+           )
+           AND NOT EXISTS(
+               SELECT 1 FROM pr_lock
                WHERE source_id = pr_streams.source_id AND stream_id = pr_streams.stream_id
            )",
         [],
@@ -999,6 +1070,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )?;
         tx.execute_batch(PROMOTION_SCHEMA)?;
         tx.execute_batch(ATTESTATION_SCHEMA)?;
+        tx.execute_batch(LOCK_SCHEMA)?;
         tx.execute(
             "INSERT INTO pr_schema(version, applied_at_ns) VALUES (?1, ?2)",
             params![SCHEMA, now_ns()?],
@@ -1042,6 +1114,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )?;
         tx.execute(
             "INSERT INTO pr_schema(version, applied_at_ns) VALUES (5, ?1)",
+            [now_ns()?],
+        )?;
+    }
+    if (1..=5).contains(&current) {
+        tx.execute_batch(LOCK_SCHEMA)?;
+        tx.execute(
+            "INSERT INTO pr_schema(version, applied_at_ns) VALUES (6, ?1)",
             [now_ns()?],
         )?;
     }

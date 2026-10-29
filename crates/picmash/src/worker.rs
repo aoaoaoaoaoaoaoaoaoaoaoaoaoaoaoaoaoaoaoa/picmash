@@ -3,7 +3,7 @@ use atomic_write_file::AtomicWriteFile;
 use crossbeam_channel::{Receiver, Sender, TrySendError, after, bounded, never, select};
 use eternalist_apps::NativeWake;
 use image::{RgbaImage, imageops};
-use picmash_contract::Side;
+use picmash_contract::{Side, Turn};
 use picmash_engine::{
     AssetId, AssetView, CollectionId, CommandId, ComparisonPrompt, Engine, PreferenceEvaluation,
     PresentedAsset, Provenance, ScanProgress, SessionId, canonical_image,
@@ -183,7 +183,9 @@ pub enum Command {
     Hide(Side),
     RejectRemote,
     RejectStream,
-    Rotate(Side),
+    LockStream,
+    UnlockStream,
+    Rotate(Side, Turn),
     ConfigureRemote(RemoteConfig),
     Thumbnail { asset_id: AssetId, bucket: u8 },
     Full { asset_id: AssetId, bound: [u32; 2] },
@@ -208,6 +210,11 @@ pub enum Event {
     RemoteFault(String),
     ArchiveFault(String),
     NoComparison,
+    /// The chamber waits for the locked stream's next challenger.
+    Awaiting,
+    /// A focused harvest found the locked stream, titled here, exhausted
+    /// and released it.
+    Exhausted(String),
     Favorite {
         asset_id: AssetId,
         active: bool,
@@ -465,7 +472,9 @@ fn conduct(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake, c
         Command::Hide(side) => hide(state, events, wake, side),
         Command::RejectRemote => reject_remote(state, events, wake),
         Command::RejectStream => reject_stream(state, events, wake),
-        Command::Rotate(side) => rotate(state, events, wake, side),
+        Command::LockStream => lock_stream(state, events, wake),
+        Command::UnlockStream => unlock_stream(state, events, wake),
+        Command::Rotate(side, turn) => rotate(state, events, wake, side, turn),
         Command::ConfigureRemote(config) => configure_remote(state, events, wake, &config),
         Command::Thumbnail { asset_id, bucket } => {
             let result = thumbnail(state, events, wake, &asset_id, bucket);
@@ -748,6 +757,7 @@ fn rotate(
     events: &Sender<Event>,
     wake: &NativeWake,
     side: Side,
+    turn: Turn,
 ) -> Result<()> {
     if side == Side::Right
         && let Some(LivePrompt::Remote {
@@ -757,7 +767,10 @@ fn rotate(
         }) = state.prompt.as_mut()
     {
         let candidate = candidate.clone();
-        *rotation_quarters = rotation_quarters.wrapping_add(1) % 4;
+        *rotation_quarters = match turn {
+            Turn::Clockwise => (*rotation_quarters + 1) % 4,
+            Turn::Counterclockwise => (*rotation_quarters + 3) % 4,
+        };
         return publish_remote_pair(state, events, wake, &candidate);
     }
     let occurrence = match state
@@ -772,7 +785,13 @@ fn rotate(
         LivePrompt::Remote { anchor, .. } => anchor.occurrence_id,
     };
     publish(events, wake, Event::Busy("TURNING IMAGE"));
-    let _rotation = state.engine.rotate_occurrence(occurrence, 1)?;
+    let _rotation = state.engine.rotate_occurrence(
+        occurrence,
+        match turn {
+            Turn::Clockwise => 1,
+            Turn::Counterclockwise => -1,
+        },
+    )?;
     state.prompt = None;
     publish_collection(state, events, wake)
 }
@@ -881,8 +900,9 @@ fn rebuild_collection(
 }
 
 fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake) -> Result<()> {
+    let locked = state.remote.locked();
     if !state.cards.is_empty()
-        && (state.cards.len() < 2 || state.remote_probability.draw(state.lottery.draw()))
+        && (locked || state.cards.len() < 2 || state.remote_probability.draw(state.lottery.draw()))
         && let Some(candidate) = state.remote.offer()?
     {
         let slot = state.remote_anchor_cursor % state.cards.len();
@@ -899,6 +919,11 @@ fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake
         });
         publish_remote_pair(state, events, wake, &candidate)?;
         publish(events, wake, Event::Remote(state.remote.summary()));
+        return Ok(());
+    }
+    if locked && !state.cards.is_empty() {
+        state.prompt = None;
+        publish(events, wake, Event::Awaiting);
         return Ok(());
     }
     if state.cards.len() < 2 {
@@ -929,13 +954,15 @@ fn forge_pair(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake
 }
 
 /// Orders from the armory the blades the next pair will show: the next offer
-/// and its anchor when the next draw falls to a remote challenger, else the
-/// pair the engine forecasts once the live prompt is judged.
+/// and its anchor when a lock holds or the next draw falls to a remote
+/// challenger, else the pair the engine forecasts once the live prompt is
+/// judged.
 fn provision(state: &mut EngineState) {
     let resolving = matches!(state.prompt, Some(LivePrompt::Remote { .. }));
+    let locked = state.remote.locked();
     let mut billets = Vec::new();
     if !state.cards.is_empty()
-        && (state.cards.len() < 2 || state.remote_probability.draw(state.lottery.peek()))
+        && (locked || state.cards.len() < 2 || state.remote_probability.draw(state.lottery.peek()))
         && let Some(candidate) = state.remote.next_offer(resolving)
     {
         billets.push(billet(
@@ -945,7 +972,8 @@ fn provision(state: &mut EngineState) {
             path: candidate.cache_path.clone(),
             rotation_quarters: 0,
         });
-    } else if state.cards.len() >= 2
+    } else if !locked
+        && state.cards.len() >= 2
         && let Some(session) = &state.session
     {
         let pending = if let Some(LivePrompt::Local { prompt, .. }) = &state.prompt {
@@ -1134,6 +1162,22 @@ fn reject_stream(state: &mut EngineState, events: &Sender<Event>, wake: &NativeW
     forge_pair(state, events, wake)
 }
 
+fn lock_stream(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake) -> Result<()> {
+    ensure_remote_prompt(state)?;
+    state.remote.lock()?;
+    publish(events, wake, Event::Remote(state.remote.summary()));
+    Ok(())
+}
+
+fn unlock_stream(state: &mut EngineState, events: &Sender<Event>, wake: &NativeWake) -> Result<()> {
+    state.remote.unlock()?;
+    publish(events, wake, Event::Remote(state.remote.summary()));
+    if state.prompt.is_none() && state.collection.is_some() {
+        forge_pair(state, events, wake)?;
+    }
+    Ok(())
+}
+
 fn configure_remote(
     state: &mut EngineState,
     events: &Sender<Event>,
@@ -1160,10 +1204,13 @@ fn service_remote(
 ) {
     let result = match completion {
         Some(completion) => state.remote.settle(completion),
-        None => state.remote.drive(),
+        None => state.remote.drive().map(|()| None),
     };
     match result {
-        Ok(()) => {
+        Ok(exhausted) => {
+            if let Some(lock) = exhausted {
+                publish(events, wake, Event::Exhausted(lock.title));
+            }
             publish_foreground(events, wake, Event::Remote(state.remote.summary()));
             if state.prompt.is_none()
                 && state.collection.is_some()
@@ -1229,7 +1276,7 @@ fn ensure_remote_prompt(state: &EngineState) -> Result<()> {
     if matches!(state.prompt.as_ref(), Some(LivePrompt::Remote { .. })) {
         Ok(())
     } else {
-        bail!("remote rejection requires the displayed remote challenger")
+        bail!("this command requires the displayed remote challenger")
     }
 }
 

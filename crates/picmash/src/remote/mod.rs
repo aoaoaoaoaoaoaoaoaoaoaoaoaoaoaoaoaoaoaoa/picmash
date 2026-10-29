@@ -160,7 +160,14 @@ pub struct Harvest {
     pub discoveries: Vec<Discovery>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The stream a lock holds the chamber to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockSummary {
+    pub source: Source,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Summary {
     pub enabled_sources: usize,
     pub cataloging: usize,
@@ -170,6 +177,7 @@ pub struct Summary {
     pub prepared: usize,
     pub offered: bool,
     pub promoting: usize,
+    pub lock: Option<LockSummary>,
 }
 
 fn slug(value: &str) -> String {

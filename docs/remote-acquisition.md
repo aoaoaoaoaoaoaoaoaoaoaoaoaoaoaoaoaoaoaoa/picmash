@@ -27,6 +27,13 @@ still means the challenger was not rejected. `hearted` promotes only a remote
 winner or an explicit favorite. Reject (`X`) retires one candidate. Reject
 Stream (`Alt+J`) retires its thread.
 
+A **lock** holds the chamber to the displayed challenger's stream (`L`, or the
+lock beneath it). Every pair then sets a local anchor against that stream's
+next candidate, whatever the sampling chance; while none is prepared, the
+chamber waits rather than falling back to local pairs. Releasing the lock,
+rejecting its stream, or exhausting it ends the hold. One lock persists across
+restarts.
+
 ## Configuration
 
 F2 exposes the acquisition switch, sampling chance, reservoir cap, and the
@@ -103,6 +110,19 @@ exit cancels the encoder but preserves both durable facts; startup reconciles
 and resubmits them. A stream veto cannot revoke an earlier promotion commitment.
 Terminal candidates are never resurrected by a later catalog scan.
 
+While a lock holds, only its stream is fetched and offered, and only its
+source is cataloged, each catalog **focused** on the stream alone: the locked
+4chan thread's document, or the locked folder's files. Locking returns other
+streams' prepared candidates to the frontier and releases their payloads, so
+the reservoir serves the lock alone; a fetch for another stream that completes
+under the lock is discarded. Once the stream has nothing left to fetch, its
+source rereads it ten seconds after its last harvest instead of waiting out the
+scan interval, the shortest refresh 4chan admits. A focused harvest that leaves
+the stream nothing discovered, fetching, prepared, or offered has found it
+exhausted and releases the lock; an unfocused harvest never does. The lock
+leaves every bound below unchanged: it narrows which members transitions
+select, never how many.
+
 Catalog, fetch, and offer selection use weighted least-service scheduling. For
 source `i`, the scheduler minimizes `servicesᵢ / weightᵢ`, comparing ratios by
 exact cross multiplication. Deterministic source order breaks ties. Before a
@@ -177,6 +197,11 @@ and offered infinitely often. No liveness claim attaches to one item whose
 origin disappears or whose later catalog replaces it. Unreachable sources do
 not obstruct reachable ones: their bounded catalog attempt releases the sole
 permit before entering finite backoff.
+
+A lock suspends this fairness by the user's choice. While it holds, its stream
+is reread at least every scan interval, so each new image the stream gains
+is eventually offered; a reachable stream is eventually found exhausted, and
+an unreachable one leaves the chamber waiting until the user releases it.
 
 The liveness claim excludes a user-held offer, a disabled or zero-weight source,
 an origin that changes after discovery, permanent external failure, and process

@@ -9,7 +9,7 @@ use egui_tester::{
 };
 use image::{ImageFormat, Rgba, RgbaImage};
 use picmash as _;
-use picmash_contract::{Side, Target, UI_FINGERPRINT};
+use picmash_contract::{Side, Target, Turn, UI_FINGERPRINT};
 use serde::Deserialize;
 use specimen::Specimen;
 use std::{
@@ -40,6 +40,7 @@ struct Observation {
     remote_pair: bool,
     remote_ready: usize,
     remote_promoting: usize,
+    stream_locked: bool,
     pair_rotations: Option<[u8; 2]>,
     pair_files: Option<[String; 2]>,
     images_per_row: u16,
@@ -246,7 +247,12 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
         frame.state.favorites == 1 && frame.state.pair_ready
     })?;
 
-    click(&session, &app, &mut probe, Target::Rotate(Side::Left))?;
+    click(
+        &session,
+        &app,
+        &mut probe,
+        Target::Rotate(Side::Left, Turn::Clockwise),
+    )?;
     let _rotated = probe.wait(&app, STARTUP, "rotated comparison", |frame| {
         !frame.state.busy
             && frame.state.pair_ready
@@ -256,7 +262,7 @@ fn first_session(testbed: &Testbed, binary: &Path, artifacts: Option<&Path>) -> 
                 .is_some_and(|rotations| rotations.contains(&1))
     })?;
 
-    click(&session, &app, &mut probe, Target::Choice(Side::Left))?;
+    click(&session, &app, &mut probe, Target::ChoiceKey(Side::Left))?;
     let _judged = probe.wait(&app, STARTUP, "recorded duel", |frame| {
         !frame.state.busy && frame.state.pair_ready && frame.state.duels == 1
     })?;
@@ -393,11 +399,24 @@ recurse = true
         challenger.state.remote_ready == 1,
         "displayed challenger escaped the reservoir bound",
     )?;
-    let _stream = probe.wait_anchor(&app, &Target::RejectStream(Side::Right).to_string(), WAIT)?;
-    let _rejected = session.key(Key::Character('x'))?;
-    let _retired = probe.wait(&app, WAIT, "image rejection", |frame| {
-        !frame.state.busy && frame.state.pair_ready && !frame.state.remote_pair
+    let _stream = probe.wait_anchor(&app, &Target::RejectStream.to_string(), WAIT)?;
+    let _lock = session.key(Key::Character('l'))?;
+    let _locked = probe.wait(&app, WAIT, "stream lock", |frame| {
+        frame.state.stream_locked && frame.state.remote_pair
     })?;
+    for _frame in 0..4 {
+        let _fresh = probe.wait_fresh(&app, WAIT)?;
+    }
+    capture(&session, artifacts, "picmash-locked.png")?;
+    // The locked thread holds one image: rejecting it leaves the chamber
+    // waiting until a focused rescan finds the thread exhausted.
+    let _rejected = session.key(Key::Character('x'))?;
+    let _released = probe.wait(
+        &app,
+        STARTUP,
+        "exhausted stream releasing its lock",
+        |frame| !frame.state.busy && frame.state.pair_ready && !frame.state.stream_locked,
+    )?;
     let next_ready = probe.wait(&app, STARTUP, "candidate after image rejection", |frame| {
         !frame.state.busy && frame.state.pair_ready && frame.state.remote_ready == 1
     })?;

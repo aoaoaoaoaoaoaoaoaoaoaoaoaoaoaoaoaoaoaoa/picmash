@@ -11,6 +11,7 @@ pub enum Edict {
     ChooseRight,
     RejectRemote,
     RejectStream,
+    LockStream,
     CopyViewer,
     OpenCollection,
     Rescan,
@@ -37,6 +38,10 @@ const REJECT_REMOTE: [Shortcut; 1] = [Shortcut::new(
     ShortcutModifiers::NONE,
     ShortcutKey::Character('X'),
 )];
+const LOCK_STREAM: [Shortcut; 1] = [Shortcut::new(
+    ShortcutModifiers::NONE,
+    ShortcutKey::Character('L'),
+)];
 const COPY_VIEWER: [Shortcut; 1] = [Shortcut::new(
     ShortcutModifiers::NONE,
     ShortcutKey::Character('C'),
@@ -52,7 +57,7 @@ const BROWSE: [Shortcut; 1] = [Shortcut::new(
     ShortcutKey::Character('2'),
 )];
 
-const EDICTS: [CommandSpec<Edict, Context>; 9] = [
+const EDICTS: [CommandSpec<Edict, Context>; 10] = [
     CommandSpec::new(
         Edict::ChooseLeft,
         "comparison.choose_left",
@@ -85,6 +90,17 @@ const EDICTS: [CommandSpec<Edict, Context>; 9] = [
     )
     .with_detail("Rejects this remote thread and every candidate it contains.")
     .with_mnemonic('J'),
+    CommandSpec::new(
+        Edict::LockStream,
+        "comparison.lock_stream",
+        "Lock Stream",
+        CommandScope::Context(Context::Compare),
+    )
+    .with_detail(
+        "Holds the comparison to the displayed remote stream until it is released, rejected, \
+         or exhausted; pressed again, releases it.",
+    )
+    .with_default_shortcuts(&LOCK_STREAM),
     CommandSpec::new(
         Edict::CopyViewer,
         "viewer.copy",
@@ -127,7 +143,7 @@ const EDICTS: [CommandSpec<Edict, Context>; 9] = [
     .with_default_shortcuts(&BROWSE),
 ];
 
-const COMPARISON_GESTURES: [GuideGesture; 4] = [
+const COMPARISON_GESTURES: [GuideGesture; 5] = [
     GuideGesture::new(
         "Choose a winner",
         "Click an image, or press A for left and D for right.",
@@ -140,13 +156,19 @@ const COMPARISON_GESTURES: [GuideGesture; 4] = [
     ),
     GuideGesture::new(
         "Rotate an image",
-        "Use Rotate beneath either image; the corrected presentation persists.",
+        "Use ↶ or ↷ beneath either image; the corrected presentation persists.",
         &[],
     ),
     GuideGesture::new(
         "Hide an image",
-        "Use Hide beneath a local image to withdraw it without deleting its file.",
+        "Use 👁 beneath a local image to withdraw it without deleting its file.",
         &[],
+    ),
+    GuideGesture::new(
+        "Lock a stream",
+        "Use 🔒 beneath a remote challenger to hold the comparison to its stream; \
+         Picmash waits for the stream's next image and releases the lock once it is exhausted.",
+        &LOCK_STREAM,
     ),
 ];
 const COLLECTION_GESTURES: [GuideGesture; 3] = [

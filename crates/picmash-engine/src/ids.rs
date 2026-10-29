@@ -120,6 +120,18 @@ impl StreamId {
         Self(format!("4chan:{board}:{thread}"))
     }
 
+    /// The number of `board`'s thread this stream is, inverting
+    /// [`Self::thread`].
+    #[must_use]
+    pub fn thread_of(&self, board: &str) -> Option<i64> {
+        self.0
+            .strip_prefix("4chan:")?
+            .strip_prefix(board)?
+            .strip_prefix(':')?
+            .parse()
+            .ok()
+    }
+
     /// A folder, relative to its directory source's root.
     #[must_use]
     pub fn folder(folder: &Path) -> Self {
