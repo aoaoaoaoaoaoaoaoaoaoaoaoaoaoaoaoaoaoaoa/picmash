@@ -41,7 +41,9 @@ const MIN_IMAGES_PER_ROW: u16 = 1;
 const MAX_IMAGES_PER_ROW: u16 = 12;
 const MIN_TILE_EDGE: f32 = 72.0;
 const TILE_GAP: f32 = 12.0;
-const DUEL_CONTROL_HEIGHT: f32 = MechanismSize::Small.side();
+/// The one gauge of every duel-rail actuator, keycaps included.
+const RAIL_GAUGE: MechanismSize = MechanismSize::Medium;
+const DUEL_CONTROL_HEIGHT: f32 = RAIL_GAUGE.side();
 const DUEL_PANEL_HEIGHT: f32 = DUEL_CONTROL_HEIGHT + 8.0;
 const DUEL_PANEL_BLEED: f32 = 2.0;
 const BRONZE_RIM: f32 = 4.0;
@@ -1641,7 +1643,7 @@ fn comparison_identity(
 ) -> Option<MonoglyphResponse> {
     let key = choice_key(side).map(|glyph| {
         let key = Monoglyph::new(glyph)
-            .size(MechanismSize::Small)
+            .size(RAIL_GAUGE)
             .finish(MonoglyphFinish::Void)
             .show(ui)
             .on_hover_text("Choose this image");
@@ -1740,7 +1742,7 @@ fn comparison_actions(
     }
     let mut latched = locked;
     let latch = Monoglyph::symbol(Symbol::Lock)
-        .size(MechanismSize::Small)
+        .size(RAIL_GAUGE)
         .show_latched(ui, &mut latched)
         .on_hover_text(if locked {
             "Release this stream"
@@ -1763,10 +1765,7 @@ fn rail_glyph(
     target: Target,
     hint: &str,
 ) -> bool {
-    let response = glyph
-        .size(MechanismSize::Small)
-        .show(ui)
-        .on_hover_text(hint);
+    let response = glyph.size(RAIL_GAUGE).show(ui).on_hover_text(hint);
     water.monoglyph(&response);
     witness::response(ui, target, &response);
     response.clicked()
