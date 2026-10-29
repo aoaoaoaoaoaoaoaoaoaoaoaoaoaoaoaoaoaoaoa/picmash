@@ -1634,6 +1634,7 @@ fn comparison_identity(
         let key = Monoglyph::new(glyph)
             .size(RAIL_GAUGE)
             .finish(MonoglyphFinish::Void)
+            .struck(commands::canon().take_routed(choice_edict(side), ui.ctx()))
             .show(ui)
             .on_hover_text("Choose this image");
         witness::response(ui, Target::ChoiceKey(side), &key);
@@ -1648,14 +1649,18 @@ fn comparison_identity(
     key
 }
 
-/// The bare key that chooses `side`, as its keycap is engraved.
-fn choice_key(side: Side) -> Option<char> {
-    let edict = match side {
+/// The command that chooses `side`.
+const fn choice_edict(side: Side) -> Edict {
+    match side {
         Side::Left => Edict::ChooseLeft,
         Side::Right => Edict::ChooseRight,
-    };
+    }
+}
+
+/// The bare key that chooses `side`, as its keycap is engraved.
+fn choice_key(side: Side) -> Option<char> {
     commands::canon()
-        .shortcuts(edict)
+        .shortcuts(choice_edict(side))
         .iter()
         .find_map(|shortcut| match shortcut.key() {
             ShortcutKey::Character(glyph) if shortcut.modifiers() == ShortcutModifiers::NONE => {
@@ -1720,7 +1725,8 @@ fn comparison_actions(
         }
         return actions;
     }
-    let reject = Monoglyph::symbol(Symbol::Delete);
+    let reject = Monoglyph::symbol(Symbol::Delete)
+        .struck(commands::canon().take_routed(Edict::RejectRemote, ui.ctx()));
     if rail_glyph(
         ui,
         water,
@@ -1733,6 +1739,7 @@ fn comparison_actions(
     let mut latched = locked;
     let latch = Monoglyph::symbol(Symbol::Lock)
         .size(RAIL_GAUGE)
+        .struck(commands::canon().take_routed(Edict::LockStream, ui.ctx()))
         .show_latched(ui, &mut latched)
         .on_hover_text(if locked {
             "Release this stream"
