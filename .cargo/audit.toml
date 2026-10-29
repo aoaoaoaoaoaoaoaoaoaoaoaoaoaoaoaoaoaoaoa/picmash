@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+  # ttf-parser 0.25 arrives only through Brass's glyph-audit feature, a dev
+  # dependency for the typeface gate; it never ships in a product binary.
+  # RUSTSEC-2026-0192 is maintenance status, not a vulnerability.
+  "RUSTSEC-2026-0192",
+]
