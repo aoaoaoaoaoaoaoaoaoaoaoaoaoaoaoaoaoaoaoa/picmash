@@ -76,8 +76,8 @@ pub enum Target {
     Lock(Side),
     /// The stream panel's latch holding the chamber to its stream.
     StreamLock,
-    /// Reject every candidate of the displayed remote stream.
-    RejectStream,
+    /// Reject every candidate belonging to a remote stream.
+    RejectStream(Side),
     /// Collection browser surface.
     Browser,
     /// Browse scope that admits every image.
@@ -125,7 +125,9 @@ impl Target {
             )),
             Self::Lock(side) => Cow::Owned(format!("picmash.comparison.lock/{}", side.wire())),
             Self::StreamLock => Cow::Borrowed("picmash.stream.lock"),
-            Self::RejectStream => Cow::Borrowed("picmash.stream.reject"),
+            Self::RejectStream(side) => {
+                Cow::Owned(format!("picmash.comparison.reject-stream/{}", side.wire()))
+            }
             Self::Browser => Cow::Borrowed("picmash.collection.browser"),
             Self::ScopeAll => Cow::Borrowed("picmash.collection.scope.all"),
             Self::ScopeUnsourced => Cow::Borrowed("picmash.collection.scope.unsourced"),

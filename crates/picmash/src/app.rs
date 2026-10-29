@@ -441,14 +441,6 @@ impl Picmash {
                 if self.awaiting {
                     let _awaiting = ui.label(chrome::muted("AWAITING ITS NEXT IMAGE"));
                 }
-                if self.remote_shown() {
-                    ui.add_space(5.0);
-                    let (reject, activated) = command_plate(ui, Edict::RejectStream);
-                    witness::response(ui, Target::RejectStream, &reject);
-                    if activated && !self.busy {
-                        self.apply_action(Action::RejectStream);
-                    }
-                }
             });
             self.water.fold(stream.wake);
         }
@@ -1677,7 +1669,8 @@ fn choice_key(side: Side) -> Option<char> {
 }
 
 /// The rail's right side, laid out from the right edge: favorite, both
-/// quarter turns, then hide, or a remote challenger's reject and stream lock.
+/// quarter turns, then hide, or a remote challenger's reject, stream lock,
+/// and stream rejection.
 fn comparison_actions(
     ui: &mut egui::Ui,
     water: &mut Surface,
@@ -1754,6 +1747,12 @@ fn comparison_actions(
     if latch.clicked() {
         actions.push(Action::LockStream(latched));
     }
+    let (stream, stream_activated) = command_plate(ui, Edict::RejectStream);
+    let stream = stream.on_hover_text("Reject every image of this stream");
+    witness::response(ui, Target::RejectStream(side), &stream);
+    if stream_activated {
+        actions.push(Action::RejectStream);
+    }
     actions
 }
 
@@ -1812,11 +1811,12 @@ fn paint_bronze_frame(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32) -> e
     inner
 }
 
-/// A full-width inspector plate for `edict`, its shortcut legend included.
+/// A rail plate for `edict`: its label, mnemonic underlined, and any shortcut
+/// legend.
 fn command_plate(ui: &mut egui::Ui, edict: Edict) -> (egui::Response, bool) {
-    let width = ui.available_width();
-    let command =
-        commands::canon().button_with(edict, ui, |button| button.min_size(egui::vec2(width, 28.0)));
+    let command = commands::canon().button_with(edict, ui, |button| {
+        button.min_size(egui::vec2(24.0, DUEL_CONTROL_HEIGHT))
+    });
     let activated = command.clicked();
     let response = command.into_response();
     chrome::tension(ui, &response);

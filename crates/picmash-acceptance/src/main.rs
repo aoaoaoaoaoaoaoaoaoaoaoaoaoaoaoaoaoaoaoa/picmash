@@ -399,7 +399,7 @@ recurse = true
         challenger.state.remote_ready == 1,
         "displayed challenger escaped the reservoir bound",
     )?;
-    let _stream = probe.wait_anchor(&app, &Target::RejectStream.to_string(), WAIT)?;
+    let _stream = probe.wait_anchor(&app, &Target::RejectStream(Side::Right).to_string(), WAIT)?;
     let _lock = session.key(Key::Character('l'))?;
     let _locked = probe.wait(&app, WAIT, "stream lock", |frame| {
         frame.state.stream_locked && frame.state.remote_pair
